@@ -1,11 +1,12 @@
 import threading
 import queue
 import socket
+import time
 from urllib.parse import urljoin, urlparse, parse_qs
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 
-from modules.utils import make_session, safe_get, normalize_url, same_domain, log, Colors
+from modules.utils import make_session, safe_get, same_domain, log, Colors
 
 
 class Recon:
@@ -24,14 +25,6 @@ class Recon:
     def __init__(self, config):
         """
         Initialize the Recon module.
-        
-        Args:
-            config (dict): Configuration dictionary with keys:
-                - target (str): Target domain/URL
-                - threads (int): Number of concurrent threads
-                - timeout (int): Request timeout in seconds
-                - verbose (bool): Enable verbose logging
-                - crawl_depth (int): Maximum crawl depth
         """
         self.target = config.get('target')
         self.threads = config.get('threads', 5)
@@ -50,17 +43,11 @@ class Recon:
         self.forms_lock = threading.Lock()
         self.params_lock = threading.Lock()
         self.subdomains_lock = threading.Lock()
+        self.crawl_lock = threading.Lock()  # Shared lock for visited and depth data
         
     def run(self):
         """
         Execute the reconnaissance process.
-        
-        Returns:
-            dict: Results containing:
-                - urls (list): Discovered URLs
-                - forms (list): Discovered forms with details
-                - params (list): Discovered parameters
-                - subdomains (list): Discovered subdomains
         """
         log(f"Starting reconnaissance on {self.target}", Colors.CYAN, self.verbose)
         
@@ -86,68 +73,70 @@ class Recon:
         to_visit = queue.Queue()
         depth_map = {}
         
-        # Start with the target
         start_url = self.target
         to_visit.put(start_url)
         depth_map[start_url] = 0
+        visited.add(start_url)
         
         with ThreadPoolExecutor(max_workers=self.threads) as executor:
             futures = {}
             
-            while not to_visit.empty() or futures:
-                # Submit new tasks from queue
-                while not to_visit.empty() and len(futures) < self.threads:
-                    url = to_visit.get()
-                    if url not in visited:
-                        visited.add(url)
-                        current_depth = depth_map.get(url, 0)
-                        
-                        if current_depth <= self.crawl_depth:
-                            future = executor.submit(
-                                self._process_url,
-                                url,
-                                current_depth,
-                                to_visit,
-                                depth_map,
-                                visited
-                            )
-                            futures[future] = url
-                
-                # Process completed futures
-                if futures:
+            while True:
+                # 1. Feed the pool up to capacity limits
+                while len(futures) < self.threads:
                     try:
-                        done, _ = as_completed(futures.keys(), timeout=1)
-                        for future in done:
-                            futures.pop(future, None)
-                            try:
-                                future.result()
-                            except Exception as e:
-                                if self.verbose:
-                                    log(f"Task error: {str(e)}", Colors.RED, self.verbose)
-                    except:
-                        pass
-    
+                        url = to_visit.get_nowait()
+                    except queue.Empty:
+                        break
+                    
+                    with self.crawl_lock:
+                        current_depth = depth_map.get(url, 0)
+                    
+                    if current_depth <= self.crawl_depth:
+                        future = executor.submit(
+                            self._process_url,
+                            url,
+                            current_depth,
+                            to_visit,
+                            depth_map,
+                            visited
+                        )
+                        futures[future] = url
+                
+                # 2. Break out entirely if there's no work queued and no background tasks running
+                if not futures and to_visit.empty():
+                    break
+                
+                # 3. Clean up any completed futures dynamically
+                completed_futures = [f for f in futures.keys() if f.done()]
+                for future in completed_futures:
+                    futures.pop(future, None)
+                    try:
+                        future.result()
+                    except Exception as e:
+                        if self.verbose:
+                            log(f"Task error: {str(e)}", Colors.RED, self.verbose)
+                
+                # 4. If nothing finished this loop and we are waiting on IO, yield execution cleanly
+                if not completed_futures and futures:
+                    # ---> LIVE TRACKING DEBUG LOGS <---
+                    if self.verbose:
+                        print(f"[DEBUG] Active Workers: {len(futures)} | Remaining Queue: {to_visit.qsize()} | Discovered URLs: {len(self.urls)}")
+                    time.sleep(0.02)
+                        
     def _process_url(self, url, depth, to_visit, depth_map, visited):
         """
         Process a single URL and extract links.
-        
-        Args:
-            url (str): URL to process
-            depth (int): Current crawl depth
-            to_visit (queue.Queue): Queue of URLs to visit
-            depth_map (dict): Map of URL depths
-            visited (set): Set of visited URLs
         """
         try:
             response = safe_get(self.session, url, self.timeout)
             if response is None:
                 return
             
-            # Add to discovered URLs
             with self.urls_lock:
                 self.urls.add(url)
             
-            # Extract parameters from URL
+            # Extract parameters from URL query strings
             parsed = urlparse(url)
             if parsed.query:
                 params = parse_qs(parsed.query)
@@ -155,7 +144,6 @@ class Recon:
                     for param_name in params.keys():
                         self.params.add(param_name)
             
-            # Parse HTML
             try:
                 soup = BeautifulSoup(response.text, 'html.parser')
             except Exception as e:
@@ -163,18 +151,20 @@ class Recon:
                     log(f"Failed to parse {url}: {str(e)}", Colors.RED, self.verbose)
                 return
             
-            # Extract forms
             self._extract_forms(url, soup)
             
-            # Extract links if not at max depth
+            # Extract links if we haven't reached max crawling depth boundaries
             if depth < self.crawl_depth:
                 for link in soup.find_all('a', href=True):
                     href = link['href']
                     abs_url = urljoin(url, href)
                     
-                    if abs_url and same_domain(url, abs_url) and abs_url not in visited:
-                        to_visit.put(abs_url)
-                        depth_map[normalized] = depth + 1
+                    if abs_url and same_domain(url, abs_url):
+                        with self.crawl_lock:
+                            if abs_url not in visited:
+                                visited.add(abs_url)
+                                depth_map[abs_url] = depth + 1  # Replaced broken 'normalized' reference
+                                to_visit.put(abs_url)
         
         except Exception as e:
             if self.verbose:
@@ -183,10 +173,6 @@ class Recon:
     def _extract_forms(self, url, soup):
         """
         Extract forms and their fields from HTML.
-        
-        Args:
-            url (str): Source URL
-            soup (BeautifulSoup): Parsed HTML soup
         """
         forms = soup.find_all('form')
         
@@ -198,7 +184,6 @@ class Recon:
                 'fields': []
             }
             
-            # Extract form fields
             inputs = form.find_all(['input', 'select', 'textarea'])
             for field in inputs:
                 field_info = {
@@ -208,7 +193,6 @@ class Recon:
                 }
                 form_data['fields'].append(field_info)
                 
-                # Add parameter name
                 if field.get('name'):
                     with self.params_lock:
                         self.params.add(field.get('name'))
@@ -219,9 +203,7 @@ class Recon:
     def _enumerate_subdomains(self):
         """
         Enumerate common subdomains via DNS resolution.
-        Tests a list of common subdomain prefixes to discover active hosts.
         """
-        # Extract domain from target
         parsed = urlparse(self.target if '://' in self.target else f'http://{self.target}')
         domain = parsed.netloc.split(':')[0]
         
@@ -233,6 +215,7 @@ class Recon:
                 for subdomain in self.COMMON_SUBDOMAINS
             ]
             
+            from concurrent.futures import as_completed
             for future in as_completed(futures):
                 try:
                     future.result()
@@ -243,10 +226,6 @@ class Recon:
     def _resolve_subdomain(self, subdomain, domain):
         """
         Attempt to resolve a subdomain via DNS.
-        
-        Args:
-            subdomain (str): Subdomain to test
-            domain (str): Base domain
         """
         full_domain = f"{subdomain}.{domain}"
         
