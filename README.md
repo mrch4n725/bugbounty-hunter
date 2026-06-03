@@ -53,7 +53,7 @@ python main.py --target https://example.com
 **Requirements:** Python 3.10+
 
 ```bash
-git clone https://github.com/youruser/bugbounty-hunter.git
+git clone https://github.com/mrch4n725/Bug_auto_bounty.git
 cd bugbounty-hunter
 pip install -r requirements.txt
 ```
