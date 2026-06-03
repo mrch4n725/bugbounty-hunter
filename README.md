@@ -66,8 +66,17 @@ git clone https://github.com/mrch4n725/bugbounty-hunter.git
 cd bugbounty-hunter
 python -m pip install -r requirements.txt
 ```
+### Specific Branch Installation
+```cmd
+git clone -b installer-tools --single-branch https://github.com/mrch4n725/bugbounty-hunter.git
+cd bugbounty-hunter
+python - pip install -r requirements.txt
+```
+* This specific Branch instillation is for users struggling to navigate the git clone. Use this command to clone the second branch, then it will be easier to run the software.
 
-> **Tip:** If `python` isn't recognised, try `py` instead (the Python Launcher for Windows).
+> **Tip:** If (on linux or cloning main branch without manual files) you receive: `ERROR: Could not open requirements file: [Errno 2] No such file or directory: 'requirements.txt'` You probably didn't unzip the file or cloned the wrong directory.
+ 
+> **Tip:** If `python` isn't recognised, try `py` or `python3` instead (the Python Launcher for Windows).
 
 > **Tip:** If you hit permission errors with pip, add `--user` flag: `pip install --user -r requirements.txt`
 
@@ -105,7 +114,7 @@ Keeps dependencies isolated from your system Python:
 
 ```bash
 # Create and activate
-python -m venv venv
+python -m venv .venv
 
 # Windows (Command Prompt)
 venv\Scripts\activate.bat
@@ -114,7 +123,7 @@ venv\Scripts\activate.bat
 venv\Scripts\Activate.ps1
 
 # macOS / Linux
-source venv/bin/activate
+source .venv/bin/activate
 
 # Install
 pip install -r requirements.txt
