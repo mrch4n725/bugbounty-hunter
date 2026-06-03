@@ -6,13 +6,14 @@
  |  _ \| | | |/ _` |  _ \ / _ \| | | | '_ \ __| | | |
  | |_) | |_| | (_| | |_) | (_) | |_| | | | | |_| |_| |
  |____/ \__,_|\__, |____/ \___/ \__,_|_| |_|\__|\__, |
-              |___/  Hunter                      |___/ 
+              |___/                             |___/ 
 ```
 
 **Automated vulnerability scanner for bug bounty programs**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)](README.md)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)](CONTRIBUTING.md)
 
 </div>
@@ -52,15 +53,97 @@ python main.py --target https://example.com
 
 **Requirements:** Python 3.10+
 
-```bash
-git clone https://github.com/mrch4n725/Bug_auto_bounty.git
+### Windows
+
+**1. Install Python** (if not already installed) — download from [python.org](https://www.python.org/downloads/windows/) and check **"Add Python to PATH"** during setup.
+
+**2. Install Git** — download from [git-scm.com](https://git-scm.com/download/win) (Git Bash is included and recommended).
+
+**3. Clone and install** — open **Command Prompt**, **PowerShell**, or **Git Bash**:
+
+```cmd
+git clone https://github.com/youruser/bugbounty-hunter.git
 cd bugbounty-hunter
+python -m pip install -r requirements.txt
+```
+
+> **Tip:** If `python` isn't recognised, try `py` instead (the Python Launcher for Windows).
+
+> **Tip:** If you hit permission errors with pip, add `--user` flag: `pip install --user -r requirements.txt`
+
+### macOS
+
+**1. Install Python** via [Homebrew](https://brew.sh) (recommended) or [python.org](https://python.org):
+
+```bash
+brew install python git
+```
+
+**2. Clone and install:**
+
+```bash
+git clone https://github.com/youruser/bugbounty-hunter.git
+cd bugbounty-hunter
+pip3 install -r requirements.txt
+```
+
+### Linux
+
+```bash
+sudo apt install python3 python3-pip git   # Debian/Ubuntu
+# or
+sudo dnf install python3 python3-pip git   # Fedora/RHEL
+
+git clone https://github.com/youruser/bugbounty-hunter.git
+cd bugbounty-hunter
+pip3 install -r requirements.txt
+```
+
+### Virtual environment (all platforms, recommended)
+
+Keeps dependencies isolated from your system Python:
+
+```bash
+# Create and activate
+python -m venv venv
+
+# Windows (Command Prompt)
+venv\Scripts\activate.bat
+
+# Windows (PowerShell)
+venv\Scripts\Activate.ps1
+
+# macOS / Linux
+source venv/bin/activate
+
+# Install
 pip install -r requirements.txt
 ```
 
 ---
 
 ## Usage
+
+### Windows (Command Prompt / PowerShell)
+
+```cmd
+# Full scan
+python main.py --target https://example.com
+
+# Passive mode
+python main.py --target https://example.com --passive
+
+# Specific modules
+python main.py --target https://example.com --modules xss sqli lfi
+
+# Authenticated scan (note: use double quotes on Windows)
+python main.py --target https://example.com --cookies "session=abc123; csrf=xyz" --headers "Authorization: Bearer <token>" --format json --threads 20
+
+# Deep crawl with verbose output
+python main.py --target https://example.com --crawl-depth 4 --verbose
+```
+
+### macOS / Linux
 
 ```bash
 # Full scan with HTML report (default)
