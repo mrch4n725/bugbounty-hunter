@@ -94,7 +94,7 @@ sudo apt install python3 python3-pip git   # Debian/Ubuntu
 # or
 sudo dnf install python3 python3-pip git   # Fedora/RHEL
 
-git clone https://github.com/mrch4ñ725/bugbounty-hunter.git
+git clone https://github.com/mrch4n725/bugbounty-hunter.git
 cd bugbounty-hunter
 pip3 install -r requirements.txt
 ```
