@@ -62,7 +62,7 @@ python main.py --target https://example.com
 **3. Clone and install** — open **Command Prompt**, **PowerShell**, or **Git Bash**:
 
 ```cmd
-git clone https://github.com/youruser/bugbounty-hunter.git
+git clone https://github.com/mrch4n725/bugbounty-hunter.git
 cd bugbounty-hunter
 python -m pip install -r requirements.txt
 ```
@@ -82,7 +82,7 @@ brew install python git
 **2. Clone and install:**
 
 ```bash
-git clone https://github.com/youruser/bugbounty-hunter.git
+git clone https://github.com/mrch4n725/bugbounty-hunter.git
 cd bugbounty-hunter
 pip3 install -r requirements.txt
 ```
@@ -94,7 +94,7 @@ sudo apt install python3 python3-pip git   # Debian/Ubuntu
 # or
 sudo dnf install python3 python3-pip git   # Fedora/RHEL
 
-git clone https://github.com/youruser/bugbounty-hunter.git
+git clone https://github.com/mrch4ñ725/bugbounty-hunter.git
 cd bugbounty-hunter
 pip3 install -r requirements.txt
 ```
