@@ -119,8 +119,11 @@ def make_session(config: Dict[str, Any]) -> requests.Session:
         Configured requests.Session object
     """
     session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    })
     
-    # Set headers
+    # Set headers (This will overwrite the default if you pass custom headers)
     if 'headers' in config:
         session.headers.update(config['headers'])
     
@@ -149,7 +152,6 @@ def make_session(config: Dict[str, Any]) -> requests.Session:
         warnings.filterwarnings('ignore', message='Unverified HTTPS request')
     
     return session
-
 
 def safe_get(
     session: requests.Session,
