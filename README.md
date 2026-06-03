@@ -70,7 +70,7 @@ python -m pip install -r requirements.txt
 ```cmd
 git clone -b installer-tools --single-branch https://github.com/mrch4n725/bugbounty-hunter.git
 cd bugbounty-hunter
-python - pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 * This specific Branch instillation is for users struggling to navigate the git clone. Use this command to clone the second branch, then it will be easier to run the software.
 
