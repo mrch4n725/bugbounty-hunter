@@ -41,7 +41,7 @@ def banner() -> None:
 ║                                                          ║
 ║              🔍 BugBounty Hunter 🔍                      ║
 ║                                                          ║
-║    Automated Security Reconnaissance & Vulnerability    ║
+║    Automated Security Reconnaissance & Vulnerability     ║
 ║                  Scanning Framework                      ║
 ║                                                          ║
 ╚══════════════════════════════════════════════════════════╝
