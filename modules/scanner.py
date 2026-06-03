@@ -393,6 +393,34 @@ class VulnScanner:
 
         # 3. Time-based blind SQL injection
         for url in self._urls_with_params():
+            try:
+                parsed = urlparse(url)
+                params = list(parse_qs(parsed.query).keys())
+                for param in params:
+                    for payload in ["' AND SLEEP(5)--", '" AND SLEEP(5)--', "1; WAITFOR DELAY '0:0:5'--"]:
+                        try:
+                            test_url = self._inject_param(url, param, payload)
+                            resp = safe_get(self.session, test_url, self.timeout + 5)
+                            if resp and resp.elapsed.total_seconds() >= 5:
+                                f = finding(
+                                    "Time-based Blind SQL Injection",
+                                    test_url,
+                                    "critical",
+                                    f"Parameter '{param}' appears vulnerable to time-based SQL injection.",
+                                    f"Payload: {payload}",
+                                    impact="This indicates the backend is executing SQL that can be timed to infer database behavior.",
+                                    recommendation="Use parameterized queries and avoid injecting user-controlled data into SQL statements."
+                                )
+                                self._add(f)
+                                findings.append(f)
+                                log(f"  [SQLi Time] {test_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
+                                break
+                        except Exception as e:
+                            log(f"  [SQLi Time] Error testing {param}: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
+                            continue
+            except Exception as e:
+                log(f"  [SQLi Time] Error processing URL: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
+                continue
 
     # ── LFI ──────────────────────────────────────────────────────────────
 
