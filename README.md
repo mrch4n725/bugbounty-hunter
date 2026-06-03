@@ -45,8 +45,14 @@ python main.py --target https://example.com
 | 📁 **LFI** | Path traversal with signature matching | Critical |
 | 🔄 **SSRF** | AWS/GCP metadata, localhost probe | Critical |
 | ↪️ **Open Redirect** | 16 common redirect parameter names | Medium |
-| 🛡️ **Headers** | Missing security headers, version disclosure | Low–High |
-
+| 🔐 **CSRF** | POST forms lacking anti-CSRF tokens | Medium |
+| 📂 **Directory Fuzzing** | Common admin paths and file locations | Medium |
+| 🕵️ **Sensitive Data** | Leaked secrets or tokens found in page content | High |
+| 🛡️ **Headers** | Missing security headers, CORS and cookie checks | Low–High |
+| 🧷 **Clickjacking** | Missing frame protection / CSP frame-ancestors | Medium |
+| 🧰 **HTTP Methods** | Dangerous methods revealed by Allow/CORS headers | Medium |
+| 🔐 **Insecure Forms** | HTTP form posting or password forms to foreign origins | High |
+| ☁️ **Subdomain Takeover** | Fingerprints of orphaned subdomains / takeover pages | High |
 ---
 
 ## Installation
@@ -148,9 +154,15 @@ python3 main.py --target https://example.com --modules xss sqli lfi
 # Authenticated scan (note: use double quotes on Windows)
 python3 main.py --target https://example.com --cookies "session=abc123; csrf=xyz" --headers "Authorization: Bearer <token>" --format json --threads 20
 
+# Basic auth / proxy scan
+python3 main.py --target https://example.com --auth user:pass --proxy http://127.0.0.1:8080 --format json
+
 # Deep crawl with verbose output
 python3 main.py --target https://example.com --crawl-depth 4 --verbose
-```
+
+# Customize module behavior and parameters
+python3 main.py --target https://example.com --modules all --disable-modules sqli --module-param csrf.token_names=csrfmiddlewaretoken,_token --module-param dirb.max_paths=50
+``` 
 
 ### macOS / Linux
 
@@ -172,8 +184,18 @@ python3 main.py \
   --format json \
   --threads 20
 
+# Basic auth / proxy scan
+python3 main.py \
+  --target https://example.com \
+  --auth user:pass \
+  --proxy http://127.0.0.1:8080 \
+  --format json
+
 # Deep crawl with verbose output
 python3 main.py --target https://example.com --crawl-depth 4 --verbose
+
+# Autosave interim results every minute
+python3 main.py --target https://example.com --autosave-interval 60
 ```
 
 ---
@@ -183,14 +205,24 @@ python3 main.py --target https://example.com --crawl-depth 4 --verbose
 | Flag | Default | Description |
 |---|---|---|
 | `--target` / `-t` | *required* | Target URL |
-| `--modules` / `-m` | `all` | Space-separated list: `recon xss sqli lfi ssrf open_redirect headers all` |
+| `--modules` / `-m` | `all` | Space-separated list: `recon xss sqli lfi ssrf open_redirect csrf dirb sensitive headers clickjacking http_methods insecure_forms subdomain_takeover all` |
 | `--output` / `-o` | `reports/` | Output directory |
 | `--format` / `-f` | `html` | Report format: `html` · `json` · `txt` |
 | `--threads` | `10` | Concurrent threads |
 | `--timeout` | `10` | Per-request timeout (seconds) |
 | `--cookies` / `-c` | — | Cookie string e.g. `"session=x; token=y"` |
 | `--headers` / `-H` | — | Custom header e.g. `"Authorization: Bearer ..."` (repeatable) |
+| `--auth` | — | Basic auth credentials `username:password` |
+| `--proxy` | — | Proxy URL for outgoing requests |
+| `--no-verify-ssl` | off | Disable SSL certificate verification |
 | `--crawl-depth` | `2` | Crawler recursion depth |
+| `--max-urls` | `200` | Maximum number of URLs to discover during crawl |
+| `--delay` | `0.0` | Delay between requests in seconds |
+| `--wordlist` | — | Optional directory fuzzing wordlist path |
+| `--disable-modules` | — | Disable specific modules when running all scans |
+| `--module-param` | — | Override module settings using `module.key=value` syntax |
+| `--retries` | `3` | HTTP retry attempts for transient failures |
+| `--autosave-interval` | `0` | Autosave interim report every N seconds |
 | `--passive` | off | Passive mode — no active fuzzing |
 | `--verbose` / `-v` | off | Print each request and finding as they occur |
 
@@ -199,6 +231,8 @@ python3 main.py --target https://example.com --crawl-depth 4 --verbose
 ## Reports
 
 Reports are saved to `reports/` (configurable via `--output`).
+
+If `--autosave-interval` is enabled, interim partial reports are written to the same output folder using the filename suffix `.partial`.
 
 The **HTML report** includes a dark-themed dashboard with:
 - Severity summary cards (Critical / High / Medium / Low)

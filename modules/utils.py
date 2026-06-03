@@ -73,7 +73,10 @@ def finding(
     url: str,
     severity: str,
     details: str,
-    evidence: Any
+    evidence: Any,
+    impact: str = "",
+    recommendation: str = "",
+    **extras
 ) -> Dict[str, Any]:
     """
     Create a standardized finding dictionary.
@@ -84,17 +87,40 @@ def finding(
         severity: Severity level (CRITICAL, HIGH, MEDIUM, LOW, INFO)
         details: Detailed description of the finding
         evidence: Evidence or proof of the vulnerability
+        impact: Optional impact summary of the finding
+        recommendation: Optional remediation guidance
+        **extras: Additional metadata fields
     
     Returns:
         Dictionary with standardized finding structure
     """
-    return {
+    finding_data = {
         'title': title,
         'url': url,
         'severity': severity,
         'details': details,
-        'evidence': evidence
+        'evidence': evidence,
+        'impact': impact,
+        'recommendation': recommendation,
     }
+    finding_data.update(extras)
+    return finding_data
+
+
+def parse_auth(auth_string: str):
+    """
+    Parse a basic auth credential string into a tuple.
+
+    Args:
+        auth_string: A string formatted as username:password
+
+    Returns:
+        Tuple[str, str] or None
+    """
+    if not auth_string or ':' not in auth_string:
+        return None
+    username, password = auth_string.split(':', 1)
+    return username.strip(), password.strip()
 
 
 def make_session(config: Dict[str, Any]) -> requests.Session:
@@ -106,6 +132,7 @@ def make_session(config: Dict[str, Any]) -> requests.Session:
     - Cookie jar if provided
     - Retry strategy for resilience
     - SSL verification settings
+    - Optional proxy support and basic auth
     
     Args:
         config: Configuration dictionary containing:
@@ -113,7 +140,8 @@ def make_session(config: Dict[str, Any]) -> requests.Session:
             - 'cookies': dict of cookies (optional)
             - 'verify_ssl': bool for SSL verification (default: True)
             - 'retries': int number of retries (default: 3)
-            - 'timeout': int timeout in seconds (default: 10)
+            - 'proxy': proxy URL (optional)
+            - 'auth': Basic auth credentials string username:password
     
     Returns:
         Configured requests.Session object
@@ -137,6 +165,19 @@ def make_session(config: Dict[str, Any]) -> requests.Session:
     # Set cookies if provided
     if 'cookies' in config and config['cookies']:
         session.cookies.update(config['cookies'])
+    
+    # Configure proxy support
+    proxy = config.get('proxy')
+    if proxy:
+        session.proxies.update({
+            'http': proxy,
+            'https': proxy
+        })
+    
+    # Set basic auth if provided
+    auth_info = parse_auth(config.get('auth', ''))
+    if auth_info:
+        session.auth = auth_info
     
     # Configure retry strategy
     retries = config.get('retries', 3)
@@ -162,7 +203,10 @@ def make_session(config: Dict[str, Any]) -> requests.Session:
 def safe_get(
     session: requests.Session,
     url: str,
-    timeout: int = 10
+    timeout: int = 10,
+    allow_redirects: bool = True,
+    raise_for_status: bool = True,
+    **kwargs
 ) -> Optional[requests.Response]:
     """
     Safely make an HTTP GET request with error handling.
@@ -171,13 +215,17 @@ def safe_get(
         session: requests.Session object
         url: URL to request
         timeout: Request timeout in seconds
+        allow_redirects: Follow redirects if True
+        raise_for_status: Raise an exception for non-success status codes
+        **kwargs: Additional request kwargs to pass to session.get
     
     Returns:
         requests.Response object or None if error occurred
     """
     try:
-        response = session.get(url, timeout=timeout, allow_redirects=True)
-        response.raise_for_status()
+        response = session.get(url, timeout=timeout, allow_redirects=allow_redirects, **kwargs)
+        if raise_for_status:
+            response.raise_for_status()
         return response
     except requests.exceptions.Timeout:
         log(f"[!] Timeout accessing {url}", Colors.YELLOW)
@@ -200,7 +248,10 @@ def safe_post(
     session: requests.Session,
     url: str,
     data: Dict[str, Any],
-    timeout: int = 10
+    timeout: int = 10,
+    allow_redirects: bool = True,
+    raise_for_status: bool = True,
+    **kwargs
 ) -> Optional[requests.Response]:
     """
     Safely make an HTTP POST request with error handling.
@@ -210,13 +261,17 @@ def safe_post(
         url: URL to request
         data: POST data dictionary
         timeout: Request timeout in seconds
+        allow_redirects: Follow redirects if True
+        raise_for_status: Raise an exception for non-success status codes
+        **kwargs: Additional request kwargs to pass to session.post
     
     Returns:
         requests.Response object or None if error occurred
     """
     try:
-        response = session.post(url, data=data, timeout=timeout, allow_redirects=True)
-        response.raise_for_status()
+        response = session.post(url, data=data, timeout=timeout, allow_redirects=allow_redirects, **kwargs)
+        if raise_for_status:
+            response.raise_for_status()
         return response
     except requests.exceptions.Timeout:
         log(f"[!] Timeout posting to {url}", Colors.YELLOW)

@@ -61,6 +61,12 @@ class Reporter:
         safe_target = safe_target.replace(':', '_').replace('?', '_').replace('&', '_')
         safe_target = safe_target.replace('.', '_').replace('#', '_')
         return safe_target
+
+    def _get_report_path(self, file_extension: str, suffix: str | None = None) -> str:
+        safe_target = self._sanitize_target()
+        suffix_part = f".{suffix}" if suffix else ""
+        filename = f"{safe_target}_{self.timestamp}{suffix_part}.{file_extension}"
+        return os.path.join(self.output_dir, filename)
     
     def _sort_findings(self) -> List[Dict[str, Any]]:
         """
@@ -71,6 +77,25 @@ class Reporter:
         """
         return sorted(self.findings, key=lambda x: self.SEVERITY_ORDER.get(x.get('severity', 'info').lower(), 4))
     
+    def _dedupe_findings(self) -> List[Dict[str, Any]]:
+        """
+        Remove obvious duplicate findings while preserving order.
+        """
+        seen = set()
+        deduped = []
+        for finding in self.findings:
+            key = (
+                finding.get('title', ''),
+                finding.get('url', ''),
+                finding.get('severity', ''),
+                finding.get('details', ''),
+                finding.get('evidence', ''),
+            )
+            if key not in seen:
+                seen.add(key)
+                deduped.append(finding)
+        return deduped
+
     def _get_severity_counts(self) -> Dict[str, int]:
         """
         Count findings by severity level.
@@ -101,11 +126,20 @@ class Reporter:
         rows = '<table><thead><tr><th>Title</th><th>URL</th><th>Severity</th><th>Details</th></tr></thead><tbody>'
         for finding in sorted_findings:
             severity = finding.get('severity', 'info').lower()
+            details = finding.get('details', 'N/A')
+            evidence = finding.get('evidence', '')
+            recommendation = finding.get('recommendation', '')
+            details_html = f"<div>{details}</div>"
+            if evidence:
+                details_html += f"<div><strong>Evidence:</strong> {evidence}</div>"
+            if recommendation:
+                details_html += f"<div><strong>Recommendation:</strong> {recommendation}</div>"
+
             rows += f'''<tr>
                     <td>{finding.get('title', 'N/A')}</td>
                     <td><span class="url">{finding.get('url', 'N/A')}</span></td>
                     <td><span class="severity-badge severity-{severity}">{severity.upper()}</span></td>
-                    <td><span class="detail-text">{finding.get('details', 'N/A')}</span></td>
+                    <td><div class="detail-text">{details_html}</div></td>
                 </tr>'''
         rows += '</tbody></table>'
         return rows
@@ -147,6 +181,27 @@ class Reporter:
             content += f'<li><span class="url">{url}</span></li>'
         content += '</ul></section>'
         return content
+
+    def _create_config_section_html(self) -> str:
+        """
+        Create HTML section for scan configuration.
+        """
+        modules = self.config.get('modules', [])
+        module_params = self.config.get('module_params', {})
+        config_items = [
+            f"Target: <strong>{self.target}</strong>",
+            f"Format: <strong>{self.report_format.upper()}</strong>",
+            f"Modules: <strong>{', '.join(modules)}</strong>",
+            f"Threads: <strong>{self.config.get('threads')}</strong>",
+            f"Timeout: <strong>{self.config.get('timeout')}s</strong>",
+            f"Crawl Depth: <strong>{self.config.get('crawl_depth')}</strong>",
+            f"Max URLs: <strong>{self.config.get('max_urls')}</strong>",
+            f"Retries: <strong>{self.config.get('retries')}</strong>",
+            f"Passive Mode: <strong>{self.config.get('passive')}</strong>",
+            f"Module Parameters: <strong>{module_params}</strong>",
+        ]
+        items = ''.join(f'<li>{item}</li>' for item in config_items)
+        return f'<section><h2>Scan Configuration</h2><ul>{items}</ul></section>'
     
     def _create_html_report(self) -> str:
         """
@@ -161,6 +216,7 @@ class Reporter:
         urls = self.recon_data.get('urls', [])
         
         findings_table = self._create_findings_table_html(sorted_findings)
+        config_section = self._create_config_section_html()
         subdomains_section = self._create_subdomains_section_html(subdomains)
         urls_section = self._create_urls_section_html(urls)
         
@@ -400,6 +456,7 @@ class Reporter:
             </div>
         </section>
         
+        {config_section}
         <section>
             <h2>Vulnerability Findings</h2>
             {findings_table}
@@ -434,6 +491,18 @@ class Reporter:
                 'report_date': datetime.now().isoformat(),
                 'total_findings': len(self.findings)
             },
+            'scan_config': {
+                'modules': self.config.get('modules', []),
+                'report_format': self.config.get('report_format'),
+                'threads': self.config.get('threads'),
+                'timeout': self.config.get('timeout'),
+                'crawl_depth': self.config.get('crawl_depth'),
+                'passive': self.config.get('passive'),
+                'verify_ssl': self.config.get('verify_ssl'),
+                'proxy': self.config.get('proxy'),
+                'retries': self.config.get('retries'),
+                'module_params': self.config.get('module_params', {})
+            },
             'summary': severity_counts,
             'findings': sorted_findings,
             'recon_data': {
@@ -464,6 +533,14 @@ BUG BOUNTY REPORT
 Target: {self.target}
 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Timestamp: {self.timestamp}
+Modules: {', '.join(self.config.get('modules', []))}
+Threads: {self.config.get('threads')}
+Timeout: {self.config.get('timeout')}s
+Retries: {self.config.get('retries')}
+Crawl Depth: {self.config.get('crawl_depth')}
+Max URLs: {self.config.get('max_urls')}
+Passive Mode: {self.config.get('passive')}
+Module Parameters: {self.config.get('module_params', {})}
 
 {'='*80}
 SUMMARY
@@ -493,6 +570,13 @@ VULNERABILITY FINDINGS
     URL: {finding.get('url', 'N/A')}
     Details: {finding.get('details', 'N/A')}
 """
+                if finding.get('evidence'):
+                    txt_content += f"    Evidence: {finding['evidence']}\n"
+                if finding.get('impact'):
+                    txt_content += f"    Impact: {finding['impact']}\n"
+                if finding.get('recommendation'):
+                    txt_content += f"    Recommendation: {finding['recommendation']}\n"
+                txt_content += "\n"
         
         if subdomains:
             txt_content += f"""
@@ -522,10 +606,13 @@ End of Report
         
         return txt_content
     
-    def generate(self) -> str:
+    def generate(self, suffix: str | None = None) -> str:
         """
         Generate report in specified format and save to file.
         
+        Args:
+            suffix: Optional suffix to append to the report filename.
+
         Returns:
             str: Path to generated report file
             
@@ -537,6 +624,7 @@ End of Report
             # Create output directory if it doesn't exist
             Path(self.output_dir).mkdir(parents=True, exist_ok=True)
             
+            self.findings = self._dedupe_findings()
             # Determine report format
             if self.report_format == 'html':
                 report_content = self._create_html_report()
@@ -551,9 +639,7 @@ End of Report
                 raise ValueError(f"Unsupported report format: {self.report_format}")
             
             # Generate filename
-            safe_target = self._sanitize_target()
-            filename = f"{safe_target}_{self.timestamp}.{file_extension}"
-            file_path = os.path.join(self.output_dir, filename)
+            file_path = self._get_report_path(file_extension, suffix)
             
             # Write report to file
             with open(file_path, 'w', encoding='utf-8') as f:

@@ -31,12 +31,17 @@ class Recon:
         self.timeout = config.get('timeout', 10)
         self.verbose = config.get('verbose', False)
         self.crawl_depth = config.get('crawl_depth', 2)
+        self.request_delay = config.get('delay', 0.0)
+        self.max_urls = config.get('max_urls', 250)
         
         self.session = make_session(config)
         self.urls = set()
         self.forms = []
         self.params = set()
         self.subdomains = set()
+        
+        parsed = urlparse(self.target if '://' in self.target else f'https://{self.target}')
+        self.base_url = f"{parsed.scheme}://{parsed.netloc}"
         
         # Thread-safe locks
         self.urls_lock = threading.Lock()
@@ -51,8 +56,10 @@ class Recon:
         """
         log(f"Starting reconnaissance on {self.target}", Colors.CYAN, self.verbose)
         
-        # Start with subdomain enumeration
+        # Start with subdomain enumeration and discover additional endpoints
         self._enumerate_subdomains()
+        self._discover_robots()
+        self._discover_sitemap()
         
         # Crawl the target
         self._crawl()
@@ -134,7 +141,12 @@ class Recon:
                 return
             
             with self.urls_lock:
+                if self.max_urls and len(self.urls) >= self.max_urls:
+                    return
                 self.urls.add(url)
+            
+            if self.request_delay:
+                time.sleep(self.request_delay)
             
             # Extract parameters from URL query strings
             parsed = urlparse(url)
@@ -157,14 +169,18 @@ class Recon:
             if depth < self.crawl_depth:
                 for link in soup.find_all('a', href=True):
                     href = link['href']
-                    abs_url = urljoin(url, href)
-                    
-                    if abs_url and same_domain(url, abs_url):
+                    candidate = urljoin(url, href)
+                    normalized = candidate.split('#')[0].rstrip('/')
+                    if not normalized:
+                        continue
+                    if self._should_skip_link(normalized):
+                        continue
+                    if same_domain(self.base_url, normalized):
                         with self.crawl_lock:
-                            if abs_url not in visited:
-                                visited.add(abs_url)
-                                depth_map[abs_url] = depth + 1  # Replaced broken 'normalized' reference
-                                to_visit.put(abs_url)
+                            if normalized not in visited and len(self.urls) < self.max_urls:
+                                visited.add(normalized)
+                                depth_map[normalized] = depth + 1
+                                to_visit.put(normalized)
         
         except Exception as e:
             if self.verbose:
@@ -222,7 +238,62 @@ class Recon:
                 except Exception as e:
                     if self.verbose:
                         log(f"Subdomain resolution error: {str(e)}", Colors.RED, self.verbose)
-    
+
+    def _discover_robots(self):
+        """
+        Discover endpoints listed in robots.txt.
+        """
+        try:
+            robots_url = urljoin(self.base_url, "/robots.txt")
+            response = safe_get(self.session, robots_url, self.timeout, raise_for_status=False)
+            if response and response.status_code == 200:
+                for line in response.text.splitlines():
+                    line = line.strip()
+                    if line.lower().startswith("disallow:"):
+                        path = line.split(":", 1)[1].strip()
+                        if path and path != "/":
+                            candidate = urljoin(self.base_url, path)
+                            if same_domain(self.base_url, candidate) and not self._should_skip_link(candidate):
+                                with self.urls_lock:
+                                    self.urls.add(candidate)
+                if self.verbose:
+                    log(f"Discovered robots.txt entries from {robots_url}", Colors.GREEN, self.verbose)
+        except Exception as e:
+            if self.verbose:
+                log(f"Error fetching robots.txt: {str(e)}", Colors.RED, self.verbose)
+
+    def _discover_sitemap(self):
+        """
+        Discover URLs from sitemap.xml.
+        """
+        for sitemap_path in ["/sitemap.xml", "/sitemap_index.xml"]:
+            try:
+                sitemap_url = urljoin(self.base_url, sitemap_path)
+                response = safe_get(self.session, sitemap_url, self.timeout, raise_for_status=False)
+                if response and response.status_code == 200:
+                    soup = BeautifulSoup(response.text, 'xml')
+                    for loc in soup.find_all('loc'):
+                        candidate = loc.text.strip()
+                        if same_domain(self.base_url, candidate):
+                            with self.urls_lock:
+                                self.urls.add(candidate)
+                    if self.verbose:
+                        log(f"Discovered sitemap entries from {sitemap_url}", Colors.GREEN, self.verbose)
+            except Exception as e:
+                if self.verbose:
+                    log(f"Error fetching sitemap: {str(e)}", Colors.RED, self.verbose)
+
+    def _should_skip_link(self, url: str) -> bool:
+        """
+        Determine whether a URL should be skipped during crawling.
+        """
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        for ext in self.EXCLUDED_EXTENSIONS:
+            if path.endswith(ext):
+                return True
+        return False
+
     def _resolve_subdomain(self, subdomain, domain):
         """
         Attempt to resolve a subdomain via DNS.

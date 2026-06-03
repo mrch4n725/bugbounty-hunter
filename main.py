@@ -7,6 +7,7 @@ Usage: python main.py --target https://example.com [options]
 import argparse
 import sys
 import os
+import threading
 from datetime import datetime
 
 from modules.recon import Recon
@@ -22,7 +23,7 @@ def parse_args():
     )
     parser.add_argument("--target", "-t", required=True, help="Target URL (e.g. https://example.com)")
     parser.add_argument("--modules", "-m", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "all"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "all"],
         default=["all"])
     parser.add_argument("--output", "-o", default="reports")
     parser.add_argument("--format", "-f", choices=["json", "html", "txt"], default="html")
@@ -30,10 +31,44 @@ def parse_args():
     parser.add_argument("--timeout", type=int, default=10)
     parser.add_argument("--cookies", "-c", default=None)
     parser.add_argument("--headers", "-H", nargs="+", default=[])
+    parser.add_argument("--auth", help="Basic auth credentials username:password")
+    parser.add_argument("--proxy", help="Proxy URL for outgoing requests")
+    parser.add_argument("--no-verify-ssl", action="store_false", dest="verify_ssl",
+        help="Disable SSL certificate verification")
     parser.add_argument("--crawl-depth", type=int, default=2)
+    parser.add_argument("--max-urls", type=int, default=200,
+        help="Maximum number of URLs to discover during reconnaissance")
+    parser.add_argument("--delay", type=float, default=0.0,
+        help="Delay between requests in seconds")
+    parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
+    parser.add_argument("--disable-modules", nargs="+",
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover"],
+        default=[], help="Disable specific modules when scanning all or default modules")
+    parser.add_argument("--module-param", action="append", default=[],
+        help="Override module settings using module.key=value")
+    parser.add_argument("--retries", type=int, default=3,
+        help="HTTP retry attempts for transient failures")
+    parser.add_argument("--autosave-interval", type=int, default=0,
+        help="Autosave interim report every N seconds (0 = disabled)")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--passive", action="store_true")
     return parser.parse_args()
+
+
+def _parse_param_value(value: str):
+    normalized = value.strip()
+    if normalized.lower() in ("true", "yes", "on"):
+        return True
+    if normalized.lower() in ("false", "no", "off"):
+        return False
+    if "," in normalized:
+        return [item.strip() for item in normalized.split(",") if item.strip()]
+    if normalized.isdigit():
+        return int(normalized)
+    try:
+        return float(normalized)
+    except ValueError:
+        return normalized
 
 
 def build_config(args):
@@ -51,16 +86,35 @@ def build_config(args):
                 k, v = part.split("=", 1)
                 cookies[k.strip()] = v.strip()
 
+    module_params = {}
+    for param in args.module_param:
+        if "=" not in param:
+            continue
+        key, value = param.split("=", 1)
+        if "." in key:
+            module_name, param_name = key.split(".", 1)
+            module_params.setdefault(module_name, {})[param_name] = _parse_param_value(value)
+
     return {
         "target": args.target.rstrip("/"),
         "modules": args.modules,
+        "disable_modules": args.disable_modules,
         "output_dir": args.output,
         "report_format": args.format,
         "threads": args.threads,
         "timeout": args.timeout,
         "cookies": cookies,
         "headers": custom_headers,
+        "auth": args.auth,
+        "proxy": args.proxy,
+        "verify_ssl": getattr(args, "verify_ssl", True),
         "crawl_depth": args.crawl_depth,
+        "max_urls": args.max_urls,
+        "delay": args.delay,
+        "wordlist": args.wordlist,
+        "retries": args.retries,
+        "autosave_interval": args.autosave_interval,
+        "module_params": module_params,
         "verbose": args.verbose,
         "passive": args.passive,
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
@@ -75,15 +129,24 @@ def main():
     os.makedirs(config["output_dir"], exist_ok=True)
 
     log(f"Target      : {config['target']}", Colors.CYAN)
-    log(f"Modules     : {', '.join(config['modules'])}", Colors.CYAN)
+    modules = config['modules']
+    if 'all' in modules:
+        modules = ['all']
+    log(f"Modules     : {', '.join(modules)}", Colors.CYAN)
+    if config.get('disable_modules'):
+        log(f"Disabled    : {', '.join(config['disable_modules'])}", Colors.CYAN)
     log(f"Threads     : {config['threads']}", Colors.CYAN)
+    log(f"Max URLs    : {config['max_urls']}", Colors.CYAN)
+    log(f"Delay       : {config['delay']}s", Colors.CYAN)
     log(f"Mode        : {'Passive' if config['passive'] else 'Active'}", Colors.CYAN)
     log(f"Report      : {config['report_format'].upper()}\n", Colors.CYAN)
 
     all_findings = []
     run_all = "all" in config["modules"]
+    disabled_modules = set(config.get("disable_modules", []))
+    run_recon = (run_all and "recon" not in disabled_modules) or "recon" in config["modules"]
 
-    if run_all or "recon" in config["modules"]:
+    if run_recon:
         log("[*] Starting Recon...", Colors.YELLOW)
         recon = Recon(config)
         recon_data = recon.run()
@@ -92,33 +155,74 @@ def main():
     else:
         recon_data = {"urls": [config["target"]], "subdomains": [], "forms": []}
 
+    autosave_interval = config.get("autosave_interval", 0)
+    all_findings_lock = threading.Lock()
+    stop_autosave = threading.Event()
+    autosave_thread = None
+
+    def _start_autosave():
+        reporter = Reporter(config, [], recon_data)
+        while not stop_autosave.wait(autosave_interval):
+            with all_findings_lock:
+                reporter.findings = list(all_findings)
+            try:
+                reporter.generate(suffix="partial")
+                log(f"[✓] Interim report autosaved", Colors.GREEN)
+            except Exception as e:
+                log(f"[!] Autosave failed: {e}", Colors.YELLOW)
+
+    if autosave_interval > 0:
+        autosave_thread = threading.Thread(target=_start_autosave, daemon=True)
+        autosave_thread.start()
+
     if config["passive"]:
         log("[*] Passive mode — skipping active fuzzing.", Colors.YELLOW)
     else:
         scanner = VulnScanner(config, recon_data)
 
         active_modules = {
-            "xss":           scanner.scan_xss,
-            "sqli":          scanner.scan_sqli,
-            "lfi":           scanner.scan_lfi,
-            "ssrf":          scanner.scan_ssrf,
-            "open_redirect": scanner.scan_open_redirect,
-            "headers":       scanner.scan_headers,
+            "xss":                  scanner.scan_xss,
+            "sqli":                 scanner.scan_sqli,
+            "lfi":                  scanner.scan_lfi,
+            "ssrf":                 scanner.scan_ssrf,
+            "open_redirect":        scanner.scan_open_redirect,
+            "headers":              scanner.scan_headers,
+            "csrf":                 scanner.scan_csrf,
+            "dirb":                 scanner.scan_directory_fuzz,
+            "sensitive":            scanner.scan_sensitive_data,
+            "clickjacking":         scanner.scan_clickjacking,
+            "http_methods":         scanner.scan_http_methods,
+            "insecure_forms":       scanner.scan_insecure_forms,
+            "subdomain_takeover":   scanner.scan_subdomain_takeover,
         }
 
+        disabled_modules = set(config.get("disable_modules", []))
         for mod_name, mod_fn in active_modules.items():
+            if mod_name in disabled_modules:
+                log(f"[-] Skipping disabled module {mod_name.upper()}", Colors.CYAN)
+                continue
             if run_all or mod_name in config["modules"]:
                 log(f"[*] Running {mod_name.upper()} scan...", Colors.YELLOW)
                 findings = mod_fn()
                 if findings:
                     log(f"[!] {len(findings)} finding(s) from {mod_name.upper()}", Colors.RED)
-                    all_findings.extend(findings)
+                    with all_findings_lock:
+                        all_findings.extend(findings)
                 else:
                     log(f"[+] {mod_name.upper()} — nothing found", Colors.GREEN)
 
+    if autosave_interval > 0:
+        stop_autosave.set()
+        if autosave_thread:
+            autosave_thread.join(timeout=2)
+
     reporter = Reporter(config, all_findings, recon_data)
-    report_path = reporter.generate()
-    log(f"\n[✓] Report saved → {report_path}", Colors.GREEN)
+    try:
+        report_path = reporter.generate()
+        log(f"\n[✓] Report saved → {report_path}", Colors.GREEN)
+    except Exception as e:
+        log(f"\n[✗] Failed to save report: {e}", Colors.RED)
+        return 1
 
     critical = [f for f in all_findings if f.get("severity") == "critical"]
     high     = [f for f in all_findings if f.get("severity") == "high"]
