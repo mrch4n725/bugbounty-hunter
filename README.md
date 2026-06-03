@@ -59,7 +59,7 @@ python main.py --target https://example.com
 
 **2. Install Git** — download from [git-scm.com](https://git-scm.com/download/win) (Git Bash is included and recommended).
 
-**3. Clone and install** — open **Command Prompt**, **PowerShell**, or **Git Bash**:
+**3. Clone and install-However, I reccomend virtual enviroment first** — open **Command Prompt**, **PowerShell**, **Git Bash** or **Terminal**:
 
 ```cmd
 git clone https://github.com/mrch4n725/bugbounty-hunter.git
@@ -72,9 +72,9 @@ git clone -b installer-tools --single-branch https://github.com/mrch4n725/bugbou
 cd bugbounty-hunter
 python -m pip install -r requirements.txt
 ```
-* This specific Branch instillation is for users struggling to navigate the git clone. Use this command to clone the second branch, then it will be easier to run the software.
+* This specific Branch installation is for users struggling to navigate the git clone. Use this command to clone the branch, then it will be easier to run the software. ! UPDATE: No longer second branch, if in future specific branch created then use this !
 
-> **Tip:** If (on linux or cloning main branch without manual files) you receive: `ERROR: Could not open requirements file: [Errno 2] No such file or directory: 'requirements.txt'` You probably didn't unzip the file or cloned the wrong directory.
+> **Tip:** If (on linux or cloning main branch without manual files) you receive: `ERROR: Could not open requirements file: [Errno 2] No such file or directory: 'requirements.txt'` You probably use correct file or cloned the wrong directory.
  
 > **Tip:** If `python` isn't recognised, try `py` or `python3` instead (the Python Launcher for Windows).
 
@@ -137,35 +137,35 @@ pip install -r requirements.txt
 
 ```cmd
 # Full scan
-python main.py --target https://example.com
+python3 main.py --target https://example.com
 
 # Passive mode
-python main.py --target https://example.com --passive
+python3 main.py --target https://example.com --passive
 
 # Specific modules
-python main.py --target https://example.com --modules xss sqli lfi
+python3 main.py --target https://example.com --modules xss sqli lfi
 
 # Authenticated scan (note: use double quotes on Windows)
-python main.py --target https://example.com --cookies "session=abc123; csrf=xyz" --headers "Authorization: Bearer <token>" --format json --threads 20
+python3 main.py --target https://example.com --cookies "session=abc123; csrf=xyz" --headers "Authorization: Bearer <token>" --format json --threads 20
 
 # Deep crawl with verbose output
-python main.py --target https://example.com --crawl-depth 4 --verbose
+python3 main.py --target https://example.com --crawl-depth 4 --verbose
 ```
 
 ### macOS / Linux
 
 ```bash
 # Full scan with HTML report (default)
-python main.py --target https://example.com
+python3 main.py --target https://example.com
 
 # Passive mode — recon and headers only, no active fuzzing
-python main.py --target https://example.com --passive
+python3 main.py --target https://example.com --passive
 
 # Run specific modules
-python main.py --target https://example.com --modules xss sqli lfi
+python3 main.py --target https://example.com --modules xss sqli lfi
 
 # Authenticated scan with cookies and custom headers
-python main.py \
+python3 main.py \
   --target https://example.com \
   --cookies "session=abc123; csrf=xyz" \
   --headers "Authorization: Bearer <token>" \
@@ -173,7 +173,7 @@ python main.py \
   --threads 20
 
 # Deep crawl with verbose output
-python main.py --target https://example.com --crawl-depth 4 --verbose
+python3 main.py --target https://example.com --crawl-depth 4 --verbose
 ```
 
 ---
