@@ -102,7 +102,7 @@ def make_session(config: Dict[str, Any]) -> requests.Session:
     Create a requests Session with custom configuration.
     
     Configures the session with:
-    - Custom headers (User-Agent, etc.)
+    - Custom headers (User-Agent, Accept, etc. to prevent 406 errors)
     - Cookie jar if provided
     - Retry strategy for resilience
     - SSL verification settings
@@ -119,8 +119,15 @@ def make_session(config: Dict[str, Any]) -> requests.Session:
         Configured requests.Session object
     """
     session = requests.Session()
+    
+    # Expanded headers to satisfy the target server's content negotiation rules
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1"
     })
     
     # Set headers (This will overwrite the default if you pass custom headers)
