@@ -8,6 +8,7 @@ import argparse
 import sys
 import os
 import threading
+import yaml
 from datetime import datetime
 
 from modules.recon import Recon
@@ -21,9 +22,10 @@ def parse_args():
         description="BugBounty Hunter - Automated vulnerability detector",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("--target", "-t", required=True, help="Target URL (e.g. https://example.com)")
+    parser.add_argument("--config", "-C", help="Path to YAML configuration file")
+    parser.add_argument("--target", "-t", help="Target URL (e.g. https://example.com)")
     parser.add_argument("--modules", "-m", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "all"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "all"],
         default=["all"])
     parser.add_argument("--output", "-o", default="reports")
     parser.add_argument("--format", "-f", choices=["json", "html", "txt"], default="html")
@@ -42,7 +44,7 @@ def parse_args():
         help="Delay between requests in seconds")
     parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
     parser.add_argument("--disable-modules", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover"],
         default=[], help="Disable specific modules when scanning all or default modules")
     parser.add_argument("--module-param", action="append", default=[],
         help="Override module settings using module.key=value")
@@ -53,6 +55,102 @@ def parse_args():
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--passive", action="store_true")
     return parser.parse_args()
+
+
+def load_config_file(config_path: str) -> dict:
+    """
+    Load configuration from a YAML file.
+    
+    Args:
+        config_path: Path to YAML configuration file
+    
+    Returns:
+        Dictionary with configuration options
+    """
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+            return config if config else {}
+    except FileNotFoundError:
+        log(f"[!] Config file not found: {config_path}", Colors.RED)
+        sys.exit(1)
+    except yaml.YAMLError as e:
+        log(f"[!] Error parsing YAML config: {e}", Colors.RED)
+        sys.exit(1)
+    except Exception as e:
+        log(f"[!] Error loading config file: {e}", Colors.RED)
+        sys.exit(1)
+
+
+def merge_configs(cli_args, config_file: dict) -> argparse.Namespace:
+    """
+    Merge YAML config file with CLI arguments.
+    CLI arguments take precedence over config file values.
+    
+    Args:
+        cli_args: Parsed CLI arguments
+        config_file: Dictionary from YAML config file
+    
+    Returns:
+        Updated argparse.Namespace with merged values
+    """
+    if not config_file:
+        return cli_args
+    
+    # Map YAML config keys to argument names
+    yaml_to_arg = {
+        'target': 'target',
+        'output': 'output',
+        'format': 'format',
+        'threads': 'threads',
+        'timeout': 'timeout',
+        'cookies': 'cookies',
+        'auth': 'auth',
+        'proxy': 'proxy',
+        'verify_ssl': 'verify_ssl',
+        'crawl_depth': 'crawl_depth',
+        'max_urls': 'max_urls',
+        'delay': 'delay',
+        'wordlist': 'wordlist',
+        'retries': 'retries',
+        'verbose': 'verbose',
+        'passive': 'passive',
+        'autosave_interval': 'autosave_interval',
+    }
+    
+    # Apply config file values only if CLI arg was not explicitly set
+    for yaml_key, arg_key in yaml_to_arg.items():
+        if yaml_key in config_file:
+            cli_value = getattr(cli_args, arg_key, None)
+            # Only override if CLI didn't explicitly set it (check for defaults)
+            if cli_value is None or (arg_key in ('threads', 'timeout', 'retries', 'crawl_depth', 'autosave_interval') and cli_value in (10, 2, 3, 0)):
+                setattr(cli_args, arg_key, config_file[yaml_key])
+    
+    # Handle module-specific configuration
+    if 'modules' in config_file:
+        if isinstance(config_file['modules'], list):
+            cli_args.modules = config_file['modules']
+    
+    if 'disable_modules' in config_file:
+        if isinstance(config_file['disable_modules'], list):
+            cli_args.disable_modules = config_file['disable_modules']
+    
+    # Handle headers from config (merge with CLI headers)
+    if 'headers' in config_file and isinstance(config_file['headers'], dict):
+        config_headers = [f"{k}:{v}" for k, v in config_file['headers'].items()]
+        if cli_args.headers:
+            cli_args.headers.extend(config_headers)
+        else:
+            cli_args.headers = config_headers
+    
+    # Handle module parameters
+    if 'module_params' in config_file and isinstance(config_file['module_params'], dict):
+        for module_name, params in config_file['module_params'].items():
+            if isinstance(params, dict):
+                for param_key, param_value in params.items():
+                    cli_args.module_param.append(f"{module_name}.{param_key}={param_value}")
+    
+    return cli_args
 
 
 def _parse_param_value(value: str):
@@ -124,6 +222,18 @@ def build_config(args):
 def main():
     banner()
     args = parse_args()
+    
+    # Load YAML config file if provided
+    if args.config:
+        log(f"Loading configuration from {args.config}", Colors.CYAN)
+        config_file = load_config_file(args.config)
+        args = merge_configs(args, config_file)
+    
+    # Validate that target is provided
+    if not args.target:
+        log("[!] Error: --target is required (or specify via --config file)", Colors.RED)
+        sys.exit(1)
+    
     config = build_config(args)
 
     os.makedirs(config["output_dir"], exist_ok=True)
@@ -190,6 +300,7 @@ def main():
             "csrf":                 scanner.scan_csrf,
             "dirb":                 scanner.scan_directory_fuzz,
             "sensitive":            scanner.scan_sensitive_data,
+            "exposed_files":        scanner.scan_exposed_files,
             "clickjacking":         scanner.scan_clickjacking,
             "http_methods":         scanner.scan_http_methods,
             "insecure_forms":       scanner.scan_insecure_forms,

@@ -1,0 +1,89 @@
+# BugBounty Hunter - Example Configuration File
+# 
+# This YAML configuration file allows you to define scan parameters without
+# using command-line arguments. CLI flags override config file values.
+#
+# Usage: python main.py --config config.yaml
+
+# Target to scan
+target: https://example.com
+
+# Output directory for reports
+output: reports
+
+# Report format (json, html, or txt)
+format: html
+
+# Number of concurrent threads for scanning
+threads: 10
+
+# Request timeout in seconds
+timeout: 10
+
+# Crawling depth (0 = only target, 1 = target + first-level links, etc.)
+crawl_depth: 2
+
+# Maximum number of URLs to discover
+max_urls: 200
+
+# Delay between requests in seconds (politeness)
+delay: 0.1
+
+# Number of HTTP retry attempts
+retries: 3
+
+# Autosave interval in seconds (0 = disabled)
+autosave_interval: 0
+
+# SSL certificate verification (true or false)
+verify_ssl: true
+
+# Verbose logging output
+verbose: false
+
+# Passive scanning only (no active fuzzing)
+passive: false
+
+# Modules to run (leave commented to run all)
+# modules:
+#   - recon
+#   - xss
+#   - sqli
+#   - lfi
+#   - ssrf
+#   - open_redirect
+#   - headers
+#   - csrf
+#   - exposed_files
+
+# Modules to disable
+# disable_modules:
+#   - sensitive
+#   - subdomain_takeover
+
+# Custom HTTP headers (as key-value pairs)
+headers:
+  User-Agent: "Custom User-Agent String"
+  Accept-Language: "en-US,en;q=0.9"
+  Authorization: "Bearer token_here"
+
+# Module-specific parameters for fine-tuning
+module_params:
+  sqli:
+    time_threshold: 5
+    error_threshold: 3
+  ssrf:
+    require_multiple_sigs: true
+  lfi:
+    payload_count: 5
+  xss:
+    encode_payloads: true
+
+# Optional: wordlist for directory fuzzing
+# wordlist: /path/to/wordlist.txt
+
+# Optional: proxy for requests
+# proxy: http://proxy.example.com:8080
+
+# Optional: basic authentication (username:password)
+# auth: user:password

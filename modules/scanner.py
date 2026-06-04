@@ -170,12 +170,19 @@ class VulnScanner:
         self.session   = make_session(config)
         self.findings  : list[dict] = []
         self._lock     = threading.Lock()
+        self.seen_fingerprints: set = set()  # Track deduplicated findings by fingerprint
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
     def _add(self, f: dict):
-        """Thread-safe addition of findings."""
+        """Thread-safe addition of findings with deduplication by fingerprint."""
         with self._lock:
+            # Skip if we've already seen this exact finding (same type + url + evidence)
+            fingerprint = f.get('fingerprint')
+            if fingerprint and fingerprint in self.seen_fingerprints:
+                return
+            if fingerprint:
+                self.seen_fingerprints.add(fingerprint)
             self.findings.append(f)
 
     def _inject_param(self, url: str, param: str, payload: str) -> str:
@@ -212,6 +219,73 @@ class VulnScanner:
         target = urlparse(self.config.get("target", ""))
         action = urlparse(action_url)
         return action.netloc == "" or action.netloc == target.netloc
+
+    def _in_scope(self, url: str) -> bool:
+        """Check if URL is within scan scope based on include/exclude patterns."""
+        parsed = urlparse(url)
+        path = parsed.path + ("?" + parsed.query if parsed.query else "")
+        
+        # Check exclude patterns first (regex list)
+        exclude_patterns = self.config.get("exclude_patterns", [])
+        for pattern in exclude_patterns:
+            try:
+                if re.search(pattern, url, re.IGNORECASE):
+                    return False
+            except Exception:
+                continue
+        
+        # Check include paths (if specified, only include matching paths)
+        include_paths = self.config.get("include_paths", [])
+        if include_paths:
+            for pattern in include_paths:
+                try:
+                    if re.search(pattern, path, re.IGNORECASE):
+                        return True
+                except Exception:
+                    continue
+            return False  # If include_paths specified but no match, exclude
+        
+        # Default: in scope
+        return True
+    
+    def _deduplicate(self, findings: list[dict]) -> list[dict]:
+        """
+        Deduplicate findings by grouping similar ones.
+        If 5+ findings of same type on different URLs, collapse into one with URL list.
+        """
+        if not findings:
+            return findings
+        
+        # Group by (type, extracted_param)
+        groups = {}
+        for f in findings:
+            vuln_type = f.get('type', f.get('title', 'Unknown'))
+            # Extract parameter name from evidence if possible
+            evidence = f.get('evidence', '')
+            param = ''
+            if "Parameter '" in evidence:
+                param = evidence.split("Parameter '")[1].split("'")[0]
+            
+            key = (vuln_type, param)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(f)
+        
+        # Collapse groups with 5+ entries
+        deduped = []
+        for (vuln_type, param), group in groups.items():
+            if len(group) >= 5:
+                # Keep first finding, add grouped_urls field
+                first = group[0].copy()
+                grouped_urls = [f.get('url', '') for f in group]
+                first['grouped_urls'] = grouped_urls
+                first['details'] = f"Found on {len(group)} URLs with similar patterns"
+                deduped.append(first)
+            else:
+                # Keep all individual findings
+                deduped.extend(group)
+        
+        return deduped
 
     def _run_threaded(self, fn, items):
         """Execute function on items using thread pool."""
@@ -251,6 +325,8 @@ class VulnScanner:
 
         # 1. Reflected XSS via URL query parameters
         for url in self._urls_with_params():
+            if not self._in_scope(url):
+                continue
             try:
                 parsed = urlparse(url)
                 params = list(parse_qs(parsed.query).keys())
@@ -260,12 +336,15 @@ class VulnScanner:
                             test_url = self._inject_param(url, param, payload)
                             resp = safe_get(self.session, test_url, self.timeout)
                             if resp and payload in resp.text:
+                                # If payload is reflected verbatim, mark as confirmed
+                                confidence = "confirmed" if payload in resp.text else "probable"
                                 f = finding(
                                     "Reflected XSS",
                                     test_url,
                                     "high",
                                     f"Parameter '{param}' reflects unsanitised payload",
-                                    f"Payload: {payload[:100]}"
+                                    f"Payload: {payload[:100]}",
+                                    confidence=confidence
                                 )
                                 self._add(f)
                                 findings.append(f)
@@ -281,6 +360,10 @@ class VulnScanner:
         # 2. XSS via HTML form fields
         for form in self.recon.get("forms", []):
             try:
+                form_action = form.get("action", "")
+                if form_action and not self._in_scope(form_action):
+                    continue
+                    
                 for field in form.get("fields", []):
                     if field.get("type") in ("hidden", "submit", "button"):
                         continue
@@ -296,12 +379,14 @@ class VulnScanner:
                                 resp = safe_get(self.session, form_url, self.timeout)
                             
                             if resp and payload in resp.text:
+                                confidence = "confirmed" if payload in resp.text else "probable"
                                 f = finding(
                                     "Reflected XSS (Form)",
                                     form.get("action", ""),
                                     "high",
                                     f"Form field '{field['name']}' reflects unsanitised payload",
-                                    f"Payload: {payload[:100]}"
+                                    f"Payload: {payload[:100]}",
+                                    confidence=confidence
                                 )
                                 self._add(f)
                                 findings.append(f)
@@ -323,6 +408,8 @@ class VulnScanner:
 
         # 1. Error-based SQL injection
         for url in self._urls_with_params():
+            if not self._in_scope(url):
+                continue
             try:
                 parsed = urlparse(url)
                 params = list(parse_qs(parsed.query).keys())
@@ -335,12 +422,15 @@ class VulnScanner:
                                 lower_body = resp.text.lower()
                                 matched = [err for err in SQLI_ERRORS if err in lower_body]
                                 if matched:
+                                    # Error-based SQLi with 2+ error signatures = confirmed
+                                    confidence = "confirmed" if len(matched) >= 2 else "probable"
                                     f = finding(
                                         "SQL Injection",
                                         test_url,
                                         "critical",
                                         f"Parameter '{param}' triggers SQL error: {matched[0]}",
-                                        f"Payload: {payload[:100]}"
+                                        f"Payload: {payload[:100]}",
+                                        confidence=confidence
                                     )
                                     self._add(f)
                                     findings.append(f)
@@ -355,6 +445,8 @@ class VulnScanner:
 
         # 2. Boolean-based SQL injection
         for url in self._urls_with_params():
+            if not self._in_scope(url):
+                continue
             try:
                 parsed = urlparse(url)
                 params = list(parse_qs(parsed.query).keys())
@@ -378,8 +470,7 @@ class VulnScanner:
                                     "critical",
                                     f"Parameter '{param}' returned significantly different responses for boolean payloads.",
                                     f"True payload: {true_payload}, False payload: {false_payload}",
-                                    impact="SQL injection may allow data extraction or bypass of authentication.",
-                                    recommendation="Validate and parameterize SQL queries, and avoid concatenating user input."
+                                    confidence="probable"
                                 )
                                 self._add(f)
                                 findings.append(f)
@@ -429,6 +520,8 @@ class VulnScanner:
         findings = []
 
         for url in self._urls_with_params():
+            if not self._in_scope(url):
+                continue
             try:
                 parsed = urlparse(url)
                 params = list(parse_qs(parsed.query).keys())
@@ -446,7 +539,8 @@ class VulnScanner:
                                             test_url,
                                             "critical",
                                             f"Parameter '{param}' includes local file (signature: {sig!r})",
-                                            f"Payload: {payload}"
+                                            f"Payload: {payload}",
+                                            confidence="confirmed"
                                         )
                                         self._add(f)
                                         findings.append(f)
@@ -464,36 +558,64 @@ class VulnScanner:
     # ── SSRF ─────────────────────────────────────────────────────────────
 
     def scan_ssrf(self) -> list[dict]:
-        """Scan for Server-Side Request Forgery (AWS/GCP metadata, localhost)."""
+        """
+        Scan for Server-Side Request Forgery (AWS/GCP metadata, localhost).
+        Uses multi-signature matching and response code validation to reduce false positives.
+        """
         findings = []
+        import hashlib
 
         for url in self._urls_with_params():
+            if not self._in_scope(url):
+                continue
             try:
                 parsed = urlparse(url)
                 params = list(parse_qs(parsed.query).keys())
+                
+                # Get baseline response
+                baseline_resp = safe_get(self.session, url, self.timeout)
+                baseline_hash = hashlib.md5(baseline_resp.text.encode()).hexdigest() if baseline_resp else None
+                baseline_len = len(baseline_resp.text) if baseline_resp else 0
+                
                 for param in params:
+                    found_ssrf = False
                     for payload in SSRF_PAYLOADS:
                         try:
                             test_url = self._inject_param(url, param, payload)
                             resp = safe_get(self.session, test_url, self.timeout)
                             if resp:
                                 body = resp.text
-                                for sig in SSRF_SIGNATURES:
-                                    if sig in body:
-                                        f = finding(
-                                            "Server-Side Request Forgery (SSRF)",
-                                            test_url,
-                                            "critical",
-                                            f"Parameter '{param}' may be fetching internal resources (sig: {sig!r})",
-                                            f"Payload: {payload}"
-                                        )
-                                        self._add(f)
-                                        findings.append(f)
-                                        log(f"  [SSRF] {test_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
-                                        break
+                                # Count matching signatures (require 2+ signatures for confirmation)
+                                matched_sigs = [sig for sig in SSRF_SIGNATURES if sig in body]
+                                
+                                # Check if response is meaningfully different from baseline
+                                resp_hash = hashlib.md5(body.encode()).hexdigest()
+                                resp_len = len(body)
+                                is_different = (baseline_hash != resp_hash) or (abs(resp_len - baseline_len) > 100)
+                                
+                                # SSRF confirmed if: 2+ signatures OR 200 status with different response
+                                if (len(matched_sigs) >= 2) or (resp.status_code == 200 and is_different and len(matched_sigs) >= 1):
+                                    # 2+ signatures = confirmed, 1 signature = probable
+                                    confidence = "confirmed" if len(matched_sigs) >= 2 else "probable"
+                                    f = finding(
+                                        "Server-Side Request Forgery (SSRF)",
+                                        test_url,
+                                        "critical",
+                                        f"Parameter '{param}' may fetch internal resources ({len(matched_sigs)} signature(s))",
+                                        f"Payload: {payload}, Signatures: {', '.join(matched_sigs[:3])}",
+                                        confidence=confidence
+                                    )
+                                    self._add(f)
+                                    findings.append(f)
+                                    log(f"  [SSRF] {test_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
+                                    found_ssrf = True
+                                    break
                         except Exception as e:
                             log(f"  [SSRF] Error testing {param}: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
                             continue
+                    
+                    if found_ssrf:
+                        break
             except Exception as e:
                 log(f"  [SSRF] Error processing URL: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
                 continue
@@ -503,21 +625,27 @@ class VulnScanner:
     # ── Open Redirect ─────────────────────────────────────────────────────
 
     def scan_open_redirect(self) -> list[dict]:
-        """Scan for Open Redirect vulnerabilities on 16 common redirect parameters."""
+        """
+        Scan for Open Redirect vulnerabilities.
+        Only tests parameters that are actually discovered in the URL.
+        """
         findings = []
         urls = self.recon.get("urls", [])
 
         for url in urls:
+            if not self._in_scope(url):
+                continue
             try:
                 parsed = urlparse(url)
                 params = list(parse_qs(parsed.query).keys())
                 
-                # Find redirect-like parameters in the URL
+                # FIX: Only test redirect-like parameters that actually exist in the URL
+                # Do NOT test hardcoded params on URLs that don't have them
                 redirect_params = [p for p in params if p.lower() in REDIRECT_PARAMS]
                 
-                # If no redirect params found, try common ones anyway
                 if not redirect_params:
-                    redirect_params = REDIRECT_PARAMS[:5]
+                    # No redirect params found in this URL, skip it
+                    continue
 
                 for param in redirect_params:
                     for payload in OPEN_REDIRECT_PAYLOADS:
@@ -535,7 +663,8 @@ class VulnScanner:
                                         test_url,
                                         "medium",
                                         f"Parameter '{param}' redirects to external domain",
-                                        f"Final URL: {final_url[:100]}"
+                                        f"Final URL: {final_url[:100]}",
+                                        confidence="confirmed"
                                     )
                                     self._add(f)
                                     findings.append(f)
@@ -552,7 +681,8 @@ class VulnScanner:
                                                 test_url,
                                                 "medium",
                                                 f"Parameter '{param}' redirects to external domain",
-                                                f"Redirect Location: {loc[:100]}"
+                                                f"Redirect Location: {loc[:100]}",
+                                                confidence="tentative"
                                             )
                                             self._add(f)
                                             findings.append(f)
@@ -575,6 +705,10 @@ class VulnScanner:
 
         for form in self.recon.get("forms", []):
             try:
+                form_action = form.get("action", form.get("url", ""))
+                if form_action and not self._in_scope(form_action):
+                    continue
+                    
                 if form.get("method", "GET").upper() != "POST":
                     continue
 
@@ -590,7 +724,8 @@ class VulnScanner:
                         action,
                         "medium",
                         "POST form does not contain a known anti-CSRF token field.",
-                        f"Form action: {action}"
+                        f"Form action: {action}",
+                        confidence="confirmed"
                     )
                     self._add(f)
                     findings.append(f)
@@ -655,6 +790,94 @@ class VulnScanner:
 
     # ── Sensitive Data Exposure ────────────────────────────────────────────
 
+    def scan_exposed_files(self) -> list[dict]:
+        """
+        Scan for commonly exposed sensitive files and configuration data.
+        Probes for .env, .git config, backup archives, phpinfo, etc.
+        """
+        findings = []
+        
+        EXPOSED_FILES = [
+            ".env",
+            ".env.local",
+            ".env.backup",
+            "/.git/config",
+            "/.gitignore",
+            "/backup.zip",
+            "/backup.tar.gz",
+            "/backup.sql",
+            "/phpinfo.php",
+            "/wp-config.php",
+            "/wp-config.php.bak",
+            "/.DS_Store",
+            "/web.config",
+            "/web.config.bak",
+            "/config.php",
+            "/config.xml",
+            "/.htaccess",
+            "/.htpasswd",
+            "/web.xml",
+            "/pom.xml",
+            "/.aws/credentials",
+            "/.ssh/id_rsa",
+            "/Dockerfile",
+            "/.dockerignore",
+            "/docker-compose.yml",
+            "/secrets.txt",
+            "/passwords.txt",
+            "/.env.example",
+        ]
+        
+        target_base = self.config.get("target", "").rstrip("/")
+        
+        for exposed_file in EXPOSED_FILES:
+            try:
+                file_url = target_base + exposed_file
+                if not self._in_scope(file_url):
+                    continue
+                    
+                resp = safe_get(self.session, file_url, self.timeout, raise_for_status=False)
+                
+                if resp and resp.status_code == 200:
+                    severity = "critical"
+                    details = f"Sensitive file is publicly accessible"
+                    
+                    # Assess severity based on file type
+                    if ".env" in exposed_file or "config" in exposed_file.lower():
+                        severity = "critical"
+                        details = f"Configuration file containing potential secrets is accessible"
+                    elif "backup" in exposed_file.lower():
+                        severity = "high"
+                        details = f"Backup archive is publicly accessible"
+                    elif ".git" in exposed_file or ".DS_Store" in exposed_file:
+                        severity = "high"
+                        details = f"Version control metadata is exposed"
+                    elif "phpinfo" in exposed_file:
+                        severity = "high"
+                        details = f"PHP information disclosure via phpinfo()"
+                    elif ".ssh" in exposed_file or ".aws" in exposed_file:
+                        severity = "critical"
+                        details = f"Credentials file is publicly accessible"
+                    
+                    f = finding(
+                        "Exposed Sensitive File",
+                        file_url,
+                        severity,
+                        details,
+                        f"HTTP {resp.status_code} - File size: {len(resp.text)} bytes",
+                        confidence="confirmed"
+                    )
+                    self._add(f)
+                    findings.append(f)
+                    log(f"  [EXPOSED] {file_url}", Colors.RED, verbose_only=True, verbose=self.verbose)
+            except Exception as e:
+                log(f"  [EXPOSED] Error checking {exposed_file}: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
+                continue
+
+        return findings
+
+    # ── Sensitive Data Exposure ────────────────────────────────────────────
+
     def scan_sensitive_data(self) -> list[dict]:
         """Scan discovered pages for leaked credentials and sensitive tokens."""
         findings = []
@@ -711,7 +934,8 @@ class VulnScanner:
                         target,
                         severity,
                         f"Response is missing the '{header}' header",
-                        f"Headers present: {', '.join(list(resp.headers.keys())[:5])}"
+                        f"Headers present: {', '.join(list(resp.headers.keys())[:5])}",
+                        confidence="confirmed"
                     )
                     self._add(f)
                     findings.append(f)
@@ -724,7 +948,8 @@ class VulnScanner:
                     target,
                     "low",
                     f"Server header reveals version: {server!r}",
-                    ""
+                    "",
+                    confidence="confirmed"
                 )
                 self._add(f)
                 findings.append(f)
@@ -738,7 +963,8 @@ class VulnScanner:
                     target,
                     "low",
                     f"X-Powered-By reveals tech stack: {x_powered!r}",
-                    ""
+                    "",
+                    confidence="confirmed"
                 )
                 self._add(f)
                 findings.append(f)
