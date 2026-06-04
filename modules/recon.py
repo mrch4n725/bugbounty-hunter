@@ -2,11 +2,24 @@ import threading
 import queue
 import socket
 import time
+import hashlib
+import re
 from urllib.parse import urljoin, urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 
-from modules.utils import make_session, safe_get, same_domain, log, Colors, url_in_scope
+from modules.utils import make_session, safe_get, same_domain, log, Colors, url_in_scope, finding
+
+
+JS_SECRET_PATTERNS = {
+    "AWS Access Key": re.compile(r"AKIA[0-9A-Z]{16}"),
+    "Generic API Key": re.compile(r'["\']([a-zA-Z0-9_\-]{32,45})["\']'),
+    "Bearer Token": re.compile(r"(?i)bearer\s+([a-zA-Z0-9\-_.]{20,})"),
+    "Internal Endpoint": re.compile(r'["\']/(?:internal|admin|debug|private)/[^"\']{3,}["\']'),
+    "nr-data Endpoint": re.compile(r"https?://[a-z0-9\-]+\.nr-data\.net[^\s\"']*"),
+    "Hardcoded Password": re.compile(r"(?i)password\s*[:=]\s*[\"']([^\"']{8,})[\"']"),
+    "Private IP": re.compile(r"(?:10\.|172\.1[6-9]\.|172\.2[0-9]\.|192\.168\.)\d+\.\d+"),
+}
 
 
 class Recon:
@@ -43,9 +56,14 @@ class Recon:
         
         self.session = make_session(config)
         self.urls = set()
+        self.js_urls = set()
         self.forms = []
         self.params = set()
         self.subdomains = set()
+        self.is_spa = False
+        self.spa_shell_size = 0
+        self.spa_shell_hash = ""
+        self.authenticated = False
         
         parsed = urlparse(self.target if '://' in self.target else f'https://{self.target}')
         self.base_url = f"{parsed.scheme}://{parsed.netloc}"
@@ -54,8 +72,11 @@ class Recon:
         self.urls_lock = threading.Lock()
         self.forms_lock = threading.Lock()
         self.params_lock = threading.Lock()
+        self.js_urls_lock = threading.Lock()
         self.subdomains_lock = threading.Lock()
         self.crawl_lock = threading.Lock()  # Shared lock for visited and depth data
+        self._fingerprint_shell()
+        self._validate_auth()
         
     def run(self):
         """
@@ -75,8 +96,80 @@ class Recon:
             'urls': sorted(list(self.urls)),
             'forms': self.forms,
             'params': sorted(list(self.params)),
-            'subdomains': sorted(list(self.subdomains))
+            'subdomains': sorted(list(self.subdomains)),
+            'js_urls': sorted(list(self.js_urls)),
+            'authenticated': self.authenticated,
         }
+
+    def _fingerprint_shell(self):
+        """Identify SPA shells so the crawler can ignore route fallback pages."""
+        try:
+            r = self.session.get(self.target, timeout=self.timeout)
+        except Exception:
+            return
+        content = r.text.lower()
+        spa_signals = [
+            '<div id="root"', '<div id="app"', 'bundle.js',
+            'chunk.js', '__next', 'ng-version', 'react', 'vue.js',
+            'ember', 'backbone', '__webpack'
+        ]
+        score = sum(1 for signal in spa_signals if signal in content)
+        if score >= 2:
+            self.is_spa = True
+            self.spa_shell_size = len(r.text)
+            self.spa_shell_hash = hashlib.md5(r.text.encode()).hexdigest()
+
+    def _is_real_page(self, response):
+        """Return False for identical or near-identical SPA shell responses."""
+        if not self.is_spa:
+            return True
+        size_diff = abs(len(response.text) - self.spa_shell_size)
+        content_hash = hashlib.md5(response.text.encode()).hexdigest()
+        if content_hash == self.spa_shell_hash:
+            return False
+        if size_diff < 512:
+            return False
+        return True
+
+    def _validate_auth(self):
+        """Best-effort check that supplied cookies or Authorization still work."""
+        if not self.session.cookies and not self.session.headers.get("Authorization"):
+            self.authenticated = False
+            return
+        probe_paths = ["/api/v1/user", "/api/v1/me", "/graphql", "/api/graphql"]
+        for path in probe_paths:
+            try:
+                r = self.session.get(urljoin(self.base_url, path), timeout=self.timeout)
+                if r.status_code in (200, 403) and r.status_code != 401:
+                    self.authenticated = True
+                    return
+            except Exception:
+                continue
+        self.authenticated = False
+        print("[!] WARNING: Session appears unauthenticated or expired.")
+
+    def _add_discovered_url(self, url, response=None):
+        """Add a crawled page only after SPA-shell filtering has accepted it."""
+        if self.max_urls and len(self.urls) >= self.max_urls:
+            return False
+        if urlparse(url).path.lower().endswith(".js"):
+            with self.js_urls_lock:
+                self.js_urls.add(url)
+            return False
+        if response is None:
+            response = safe_get(self.session, url, self.timeout, raise_for_status=False)
+        if response is None or not self._is_real_page(response):
+            return False
+        self.urls.add(url)
+        return True
+
+    def _extract_scripts(self, url, soup):
+        """Collect linked JavaScript bundles for passive endpoint/secret mining."""
+        for script in soup.find_all("script", src=True):
+            js_url = urljoin(url, script["src"]).split("#")[0]
+            if url_in_scope(js_url, self.config) and same_domain(self.base_url, js_url):
+                with self.js_urls_lock:
+                    self.js_urls.add(js_url)
     
     def _crawl(self):
         """
@@ -139,9 +232,6 @@ class Recon:
                     time.sleep(0.02)
                         
     def _process_url(self, url, depth, to_visit, depth_map, visited):
-        """
-        Process a single URL and extract links.
-        """
         try:
             response = safe_get(self.session, url, self.timeout)
             if response is None:
@@ -150,7 +240,7 @@ class Recon:
             with self.urls_lock:
                 if self.max_urls and len(self.urls) >= self.max_urls:
                     return
-                self.urls.add(url)
+                self._add_discovered_url(url, response)
             
             if self.request_delay:
                 time.sleep(self.request_delay)
@@ -171,6 +261,7 @@ class Recon:
                 return
             
             self._extract_forms(url, soup)
+            self._extract_scripts(url, soup)
             
             # Extract links if we haven't reached max crawling depth boundaries
             if depth < self.crawl_depth:
@@ -179,6 +270,10 @@ class Recon:
                     candidate = urljoin(url, href)
                     normalized = candidate.split('#')[0].rstrip('/')
                     if not normalized:
+                        continue
+                    if urlparse(normalized).path.lower().endswith(".js"):
+                        with self.js_urls_lock:
+                            self.js_urls.add(normalized)
                         continue
                     if self._should_skip_link(normalized):
                         continue
@@ -264,7 +359,7 @@ class Recon:
                             candidate = urljoin(self.base_url, path)
                             if same_domain(self.base_url, candidate) and not self._should_skip_link(candidate):
                                 with self.urls_lock:
-                                    self.urls.add(candidate)
+                                    self._add_discovered_url(candidate)
                 if self.verbose:
                     log(f"Discovered robots.txt entries from {robots_url}", Colors.GREEN, self.verbose)
         except Exception as e:
@@ -285,7 +380,7 @@ class Recon:
                         candidate = loc.text.strip()
                         if same_domain(self.base_url, candidate) and url_in_scope(candidate, self.config):
                             with self.urls_lock:
-                                self.urls.add(candidate)
+                                self._add_discovered_url(candidate)
                     if self.verbose:
                         log(f"Discovered sitemap entries from {sitemap_url}", Colors.GREEN, self.verbose)
             except Exception as e:
@@ -298,6 +393,39 @@ class Recon:
             return True
         path = urlparse(url).path.lower()
         return any(path.endswith(ext) for ext in self.EXCLUDED_EXTENSIONS)
+
+    def mine_js_bundles(self) -> list[dict]:
+        """Passively mine JavaScript bundles for secrets and hidden endpoints."""
+        findings = []
+        for js_url in sorted(self.js_urls):
+            try:
+                r = self.session.get(js_url, timeout=self.timeout)
+            except Exception:
+                continue
+            for label, pattern in JS_SECRET_PATTERNS.items():
+                matches = pattern.findall(r.text)
+                for match in list(set(matches))[:5]:
+                    if isinstance(match, tuple):
+                        match = next((part for part in match if part), "")
+                    evidence = str(match)[:120]
+                    if not self._confirm_js_evidence(js_url, evidence):
+                        continue
+                    f = finding(
+                        f"JS Secret: {label}", js_url, "high",
+                        f"Pattern '{label}' matched in JS bundle",
+                        evidence
+                    )
+                    if f:
+                        findings.append(f)
+        return findings
+
+    def _confirm_js_evidence(self, js_url: str, evidence: str) -> bool:
+        """Re-request a bundle before reporting stable passive JS evidence."""
+        try:
+            r = self.session.get(js_url, timeout=self.timeout)
+            return evidence in r.text
+        except Exception:
+            return False
 
     def _resolve_subdomain(self, subdomain, domain):
         """

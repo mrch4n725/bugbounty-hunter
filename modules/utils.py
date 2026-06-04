@@ -8,6 +8,7 @@ and standardized data structures used throughout the application.
 import hashlib
 import re
 import threading
+import time
 import warnings
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -38,6 +39,8 @@ except ImportError:
 _rich_console: Optional["Console"] = None
 _use_rich: bool = True
 _log_lock = threading.Lock()
+_seen_findings = set()
+_seen_findings_lock = threading.Lock()
 
 
 def set_rich_enabled(enabled: bool) -> None:
@@ -369,10 +372,16 @@ def finding(
     details: str,
     evidence: str = "",
     confidence: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """
     Build a standardized finding dict with CVSS metadata, fingerprint, and timestamp.
     """
+    dedupe_key = (vuln_type, url)
+    with _seen_findings_lock:
+        if dedupe_key in _seen_findings:
+            return None
+        _seen_findings.add(dedupe_key)
+
     canonical_type = _resolve_vuln_type(vuln_type)
     meta = VULN_METADATA.get(canonical_type, {})
 
@@ -386,6 +395,7 @@ def finding(
     ).hexdigest()
 
     result: Dict[str, Any] = {
+        "title": vuln_type,
         "type": vuln_type,
         "url": url,
         "severity": severity,
@@ -416,6 +426,25 @@ def parse_auth(auth_string: str):
         return None
     username, password = auth_string.split(":", 1)
     return username.strip(), password.strip()
+
+
+def _install_request_delay(session: requests.Session, delay: float) -> None:
+    """Wrap session.request with a thread-safe delay between requests."""
+    if delay <= 0:
+        return
+    original_request = session.request
+    delay_lock = threading.Lock()
+    last_request = {"at": 0.0}
+
+    def delayed_request(method, url, **kwargs):
+        with delay_lock:
+            elapsed = time.time() - last_request["at"]
+            if elapsed < delay:
+                time.sleep(delay - elapsed)
+            last_request["at"] = time.time()
+        return original_request(method, url, **kwargs)
+
+    session.request = delayed_request
 
 
 def make_session(config: Dict[str, Any]) -> requests.Session:
@@ -466,6 +495,7 @@ def make_session(config: Dict[str, Any]) -> requests.Session:
     if not session.verify:
         warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
+    _install_request_delay(session, float(config.get("delay", 0.0) or 0.0))
     return session
 
 

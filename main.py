@@ -25,7 +25,7 @@ def parse_args():
     parser.add_argument("--config", "-C", help="Path to YAML configuration file")
     parser.add_argument("--target", "-t", help="Target URL (e.g. https://example.com)")
     parser.add_argument("--modules", "-m", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "all"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "all"],
         default=["all"])
     parser.add_argument("--output", "-o", default="reports")
     parser.add_argument("--format", "-f", choices=["json", "html", "txt"], default="html")
@@ -42,9 +42,11 @@ def parse_args():
         help="Maximum number of URLs to discover during reconnaissance")
     parser.add_argument("--delay", type=float, default=0.0,
         help="Delay between requests in seconds")
+    parser.add_argument("--oob-host", default=None,
+        help="Out-of-band callback host for SSRF verification (e.g. Burp Collaborator or interactsh URL)")
     parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
     parser.add_argument("--disable-modules", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets"],
         default=[], help="Disable specific modules when scanning all or default modules")
     parser.add_argument("--module-param", action="append", default=[],
         help="Override module settings using module.key=value")
@@ -82,6 +84,48 @@ def load_config_file(config_path: str) -> dict:
         sys.exit(1)
 
 
+def _apply_scalar_config(cli_args, config_file: dict) -> None:
+    yaml_to_arg = {
+        'target': 'target', 'output': 'output', 'format': 'format',
+        'threads': 'threads', 'timeout': 'timeout', 'cookies': 'cookies',
+        'auth': 'auth', 'proxy': 'proxy', 'verify_ssl': 'verify_ssl',
+        'crawl_depth': 'crawl_depth', 'max_urls': 'max_urls',
+        'delay': 'delay', 'oob_host': 'oob_host', 'wordlist': 'wordlist',
+        'retries': 'retries', 'verbose': 'verbose', 'passive': 'passive',
+        'autosave_interval': 'autosave_interval',
+    }
+    defaulted = {'threads', 'timeout', 'retries', 'crawl_depth', 'autosave_interval'}
+    for yaml_key, arg_key in yaml_to_arg.items():
+        if yaml_key not in config_file:
+            continue
+        cli_value = getattr(cli_args, arg_key, None)
+        if cli_value is None or (arg_key in defaulted and cli_value in (10, 2, 3, 0)):
+            setattr(cli_args, arg_key, config_file[yaml_key])
+
+
+def _apply_list_config(cli_args, config_file: dict) -> None:
+    if isinstance(config_file.get('modules'), list):
+        cli_args.modules = config_file['modules']
+    if isinstance(config_file.get('disable_modules'), list):
+        cli_args.disable_modules = config_file['disable_modules']
+
+
+def _apply_header_config(cli_args, config_file: dict) -> None:
+    if not isinstance(config_file.get('headers'), dict):
+        return
+    config_headers = [f"{k}:{v}" for k, v in config_file['headers'].items()]
+    cli_args.headers.extend(config_headers) if cli_args.headers else setattr(cli_args, "headers", config_headers)
+
+
+def _apply_module_params(cli_args, config_file: dict) -> None:
+    if not isinstance(config_file.get('module_params'), dict):
+        return
+    for module_name, params in config_file['module_params'].items():
+        if isinstance(params, dict):
+            for param_key, param_value in params.items():
+                cli_args.module_param.append(f"{module_name}.{param_key}={param_value}")
+
+
 def merge_configs(cli_args, config_file: dict) -> argparse.Namespace:
     """
     Merge YAML config file with CLI arguments.
@@ -96,60 +140,10 @@ def merge_configs(cli_args, config_file: dict) -> argparse.Namespace:
     """
     if not config_file:
         return cli_args
-    
-    # Map YAML config keys to argument names
-    yaml_to_arg = {
-        'target': 'target',
-        'output': 'output',
-        'format': 'format',
-        'threads': 'threads',
-        'timeout': 'timeout',
-        'cookies': 'cookies',
-        'auth': 'auth',
-        'proxy': 'proxy',
-        'verify_ssl': 'verify_ssl',
-        'crawl_depth': 'crawl_depth',
-        'max_urls': 'max_urls',
-        'delay': 'delay',
-        'wordlist': 'wordlist',
-        'retries': 'retries',
-        'verbose': 'verbose',
-        'passive': 'passive',
-        'autosave_interval': 'autosave_interval',
-    }
-    
-    # Apply config file values only if CLI arg was not explicitly set
-    for yaml_key, arg_key in yaml_to_arg.items():
-        if yaml_key in config_file:
-            cli_value = getattr(cli_args, arg_key, None)
-            # Only override if CLI didn't explicitly set it (check for defaults)
-            if cli_value is None or (arg_key in ('threads', 'timeout', 'retries', 'crawl_depth', 'autosave_interval') and cli_value in (10, 2, 3, 0)):
-                setattr(cli_args, arg_key, config_file[yaml_key])
-    
-    # Handle module-specific configuration
-    if 'modules' in config_file:
-        if isinstance(config_file['modules'], list):
-            cli_args.modules = config_file['modules']
-    
-    if 'disable_modules' in config_file:
-        if isinstance(config_file['disable_modules'], list):
-            cli_args.disable_modules = config_file['disable_modules']
-    
-    # Handle headers from config (merge with CLI headers)
-    if 'headers' in config_file and isinstance(config_file['headers'], dict):
-        config_headers = [f"{k}:{v}" for k, v in config_file['headers'].items()]
-        if cli_args.headers:
-            cli_args.headers.extend(config_headers)
-        else:
-            cli_args.headers = config_headers
-    
-    # Handle module parameters
-    if 'module_params' in config_file and isinstance(config_file['module_params'], dict):
-        for module_name, params in config_file['module_params'].items():
-            if isinstance(params, dict):
-                for param_key, param_value in params.items():
-                    cli_args.module_param.append(f"{module_name}.{param_key}={param_value}")
-    
+    _apply_scalar_config(cli_args, config_file)
+    _apply_list_config(cli_args, config_file)
+    _apply_header_config(cli_args, config_file)
+    _apply_module_params(cli_args, config_file)
     return cli_args
 
 
@@ -209,6 +203,7 @@ def build_config(args):
         "crawl_depth": args.crawl_depth,
         "max_urls": args.max_urls,
         "delay": args.delay,
+        "oob_host": args.oob_host,
         "wordlist": args.wordlist,
         "retries": args.retries,
         "autosave_interval": args.autosave_interval,
@@ -219,29 +214,9 @@ def build_config(args):
     }
 
 
-def main():
-    banner()
-    args = parse_args()
-    
-    # Load YAML config file if provided
-    if args.config:
-        log(f"Loading configuration from {args.config}", Colors.CYAN)
-        config_file = load_config_file(args.config)
-        args = merge_configs(args, config_file)
-    
-    # Validate that target is provided
-    if not args.target:
-        log("[!] Error: --target is required (or specify via --config file)", Colors.RED)
-        sys.exit(1)
-    
-    config = build_config(args)
-
-    os.makedirs(config["output_dir"], exist_ok=True)
-
+def _log_startup(config: dict) -> None:
+    modules = ['all'] if 'all' in config['modules'] else config['modules']
     log(f"Target      : {config['target']}", Colors.CYAN)
-    modules = config['modules']
-    if 'all' in modules:
-        modules = ['all']
     log(f"Modules     : {', '.join(modules)}", Colors.CYAN)
     if config.get('disable_modules'):
         log(f"Disabled    : {', '.join(config['disable_modules'])}", Colors.CYAN)
@@ -251,28 +226,37 @@ def main():
     log(f"Mode        : {'Passive' if config['passive'] else 'Active'}", Colors.CYAN)
     log(f"Report      : {config['report_format'].upper()}\n", Colors.CYAN)
 
-    all_findings = []
-    run_all = "all" in config["modules"]
-    disabled_modules = set(config.get("disable_modules", []))
-    run_recon = (run_all and "recon" not in disabled_modules) or "recon" in config["modules"]
 
-    if run_recon:
-        log("[*] Starting Recon...", Colors.YELLOW)
-        recon = Recon(config)
-        recon_data = recon.run()
-        log(f"[+] Discovered {len(recon_data.get('urls', []))} URLs, "
-            f"{len(recon_data.get('subdomains', []))} subdomains", Colors.GREEN)
-    else:
-        recon_data = {"urls": [config["target"]], "subdomains": [], "forms": []}
+def _should_run_recon(config: dict, run_all: bool, disabled_modules: set) -> bool:
+    return (
+        (run_all and "recon" not in disabled_modules)
+        or "recon" in config["modules"]
+        or "js_secrets" in config["modules"]
+    )
 
-    autosave_interval = config.get("autosave_interval", 0)
-    all_findings_lock = threading.Lock()
-    stop_autosave = threading.Event()
-    autosave_thread = None
 
-    def _start_autosave():
+def _run_recon_if_needed(config: dict, run_recon: bool):
+    if not run_recon:
+        return None, {"urls": [config["target"]], "subdomains": [], "forms": [], "js_urls": [], "authenticated": False}
+    log("[*] Starting Recon...", Colors.YELLOW)
+    recon = Recon(config)
+    recon_data = recon.run()
+    if not recon.authenticated:
+        print("[!] Scanning unauthenticated. Pass --cookies or --headers for full coverage of authenticated attack surface.")
+    log(f"[+] Discovered {len(recon_data.get('urls', []))} URLs, "
+        f"{len(recon_data.get('subdomains', []))} subdomains", Colors.GREEN)
+    return recon, recon_data
+
+
+def _start_autosave(config, recon_data, all_findings, all_findings_lock):
+    interval = config.get("autosave_interval", 0)
+    stop_event = threading.Event()
+    if interval <= 0:
+        return stop_event, None
+
+    def worker():
         reporter = Reporter(config, [], recon_data)
-        while not stop_autosave.wait(autosave_interval):
+        while not stop_event.wait(interval):
             with all_findings_lock:
                 reporter.findings = list(all_findings)
             try:
@@ -281,76 +265,113 @@ def main():
             except Exception as e:
                 log(f"[!] Autosave failed: {e}", Colors.YELLOW)
 
-    if autosave_interval > 0:
-        autosave_thread = threading.Thread(target=_start_autosave, daemon=True)
-        autosave_thread.start()
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return stop_event, thread
 
+
+def _collect_module_findings(modules, config, run_all, disabled_modules, all_findings, lock):
+    for mod_name, mod_fn in modules.items():
+        if mod_name in disabled_modules:
+            log(f"[-] Skipping disabled module {mod_name.upper()}", Colors.CYAN)
+            continue
+        if not (run_all or mod_name in config["modules"]):
+            continue
+        log(f"[*] Running {mod_name.upper()} scan...", Colors.YELLOW)
+        findings = mod_fn()
+        if findings:
+            log(f"[!] {len(findings)} finding(s) from {mod_name.upper()}", Colors.RED)
+            with lock:
+                all_findings.extend(findings)
+        else:
+            log(f"[+] {mod_name.upper()} — nothing found", Colors.GREEN)
+
+
+def _active_module_map(scanner, recon):
+    modules = {
+        "xss": scanner.scan_xss, "sqli": scanner.scan_sqli,
+        "lfi": scanner.scan_lfi, "ssrf": scanner.scan_ssrf,
+        "open_redirect": scanner.scan_open_redirect,
+        "headers": scanner.scan_headers, "csrf": scanner.scan_csrf,
+        "dirb": scanner.scan_directory_fuzz,
+        "sensitive": scanner.scan_sensitive_data,
+        "exposed_files": scanner.scan_exposed_files,
+        "clickjacking": scanner.scan_clickjacking,
+        "http_methods": scanner.scan_http_methods,
+        "insecure_forms": scanner.scan_insecure_forms,
+        "subdomain_takeover": scanner.scan_subdomain_takeover,
+        "graphql": scanner.scan_graphql, "idor": scanner.scan_idor,
+    }
+    if recon is not None:
+        modules["js_secrets"] = recon.mine_js_bundles
+    return modules
+
+
+def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, lock):
     if config["passive"]:
         log("[*] Passive mode — skipping active fuzzing.", Colors.YELLOW)
+        scanner = VulnScanner(config, recon_data)
+        modules = {"headers": scanner.scan_headers}
+        if recon is not None:
+            modules["js_secrets"] = recon.mine_js_bundles
     else:
         scanner = VulnScanner(config, recon_data)
+        modules = _active_module_map(scanner, recon)
+    _collect_module_findings(modules, config, run_all, disabled_modules, all_findings, lock)
 
-        active_modules = {
-            "xss":                  scanner.scan_xss,
-            "sqli":                 scanner.scan_sqli,
-            "lfi":                  scanner.scan_lfi,
-            "ssrf":                 scanner.scan_ssrf,
-            "open_redirect":        scanner.scan_open_redirect,
-            "headers":              scanner.scan_headers,
-            "csrf":                 scanner.scan_csrf,
-            "dirb":                 scanner.scan_directory_fuzz,
-            "sensitive":            scanner.scan_sensitive_data,
-            "exposed_files":        scanner.scan_exposed_files,
-            "clickjacking":         scanner.scan_clickjacking,
-            "http_methods":         scanner.scan_http_methods,
-            "insecure_forms":       scanner.scan_insecure_forms,
-            "subdomain_takeover":   scanner.scan_subdomain_takeover,
-        }
 
-        disabled_modules = set(config.get("disable_modules", []))
-        for mod_name, mod_fn in active_modules.items():
-            if mod_name in disabled_modules:
-                log(f"[-] Skipping disabled module {mod_name.upper()}", Colors.CYAN)
-                continue
-            if run_all or mod_name in config["modules"]:
-                log(f"[*] Running {mod_name.upper()} scan...", Colors.YELLOW)
-                findings = mod_fn()
-                if findings:
-                    log(f"[!] {len(findings)} finding(s) from {mod_name.upper()}", Colors.RED)
-                    with all_findings_lock:
-                        all_findings.extend(findings)
-                else:
-                    log(f"[+] {mod_name.upper()} — nothing found", Colors.GREEN)
-
-    if autosave_interval > 0:
-        stop_autosave.set()
-        if autosave_thread:
-            autosave_thread.join(timeout=2)
-
-    reporter = Reporter(config, all_findings, recon_data)
+def _write_report_and_summary(config, all_findings, recon_data) -> int:
     try:
-        report_path = reporter.generate()
+        report_path = Reporter(config, all_findings, recon_data).generate()
         log(f"\n[✓] Report saved → {report_path}", Colors.GREEN)
     except Exception as e:
         log(f"\n[✗] Failed to save report: {e}", Colors.RED)
         return 1
-
     critical = [f for f in all_findings if f.get("severity") == "critical"]
-    high     = [f for f in all_findings if f.get("severity") == "high"]
-    medium   = [f for f in all_findings if f.get("severity") == "medium"]
-    low      = [f for f in all_findings if f.get("severity") == "low"]
-
+    high = [f for f in all_findings if f.get("severity") == "high"]
+    medium = [f for f in all_findings if f.get("severity") == "medium"]
+    low = [f for f in all_findings if f.get("severity") == "low"]
     log(f"\n{'─'*50}", Colors.CYAN)
-    log(f"  SCAN SUMMARY", Colors.BOLD)
+    log("  SCAN SUMMARY", Colors.BOLD)
     log(f"{'─'*50}", Colors.CYAN)
-    log(f"  Critical : {len(critical)}", Colors.RED   if critical else Colors.WHITE)
-    log(f"  High     : {len(high)}",     Colors.RED   if high     else Colors.WHITE)
-    log(f"  Medium   : {len(medium)}",   Colors.YELLOW if medium  else Colors.WHITE)
-    log(f"  Low      : {len(low)}",      Colors.CYAN  if low      else Colors.WHITE)
+    log(f"  Critical : {len(critical)}", Colors.RED if critical else Colors.WHITE)
+    log(f"  High     : {len(high)}", Colors.RED if high else Colors.WHITE)
+    log(f"  Medium   : {len(medium)}", Colors.YELLOW if medium else Colors.WHITE)
+    log(f"  Low      : {len(low)}", Colors.CYAN if low else Colors.WHITE)
     log(f"  Total    : {len(all_findings)}", Colors.BOLD)
     log(f"{'─'*50}\n", Colors.CYAN)
-
     return 0 if not critical and not high else 1
+
+
+def main():
+    banner()
+    args = parse_args()
+    if args.config:
+        log(f"Loading configuration from {args.config}", Colors.CYAN)
+        args = merge_configs(args, load_config_file(args.config))
+    if not args.target:
+        log("[!] Error: --target is required (or specify via --config file)", Colors.RED)
+        sys.exit(1)
+
+    config = build_config(args)
+    os.makedirs(config["output_dir"], exist_ok=True)
+    _log_startup(config)
+
+    all_findings = []
+    run_all = "all" in config["modules"]
+    disabled_modules = set(config.get("disable_modules", []))
+    recon, recon_data = _run_recon_if_needed(
+        config, _should_run_recon(config, run_all, disabled_modules)
+    )
+    all_findings_lock = threading.Lock()
+    stop_autosave, autosave_thread = _start_autosave(
+        config, recon_data, all_findings, all_findings_lock
+    )
+    _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, all_findings_lock)
+    if autosave_thread:
+        stop_autosave.set()
+        autosave_thread.join(timeout=2)
+    return _write_report_and_summary(config, all_findings, recon_data)
 
 
 if __name__ == "__main__":
