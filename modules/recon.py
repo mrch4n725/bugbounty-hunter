@@ -6,7 +6,7 @@ from urllib.parse import urljoin, urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 
-from modules.utils import make_session, safe_get, same_domain, log, Colors
+from modules.utils import make_session, safe_get, same_domain, log, Colors, url_in_scope
 
 
 class Recon:
@@ -15,6 +15,12 @@ class Recon:
     Performs multithreaded web crawling, subdomain enumeration, and form discovery.
     """
     
+    EXCLUDED_EXTENSIONS = (
+        ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico",
+        ".css", ".js", ".woff", ".woff2", ".ttf", ".eot", ".mp4",
+        ".mp3", ".pdf", ".zip", ".gz", ".tar", ".rar",
+    )
+
     COMMON_SUBDOMAINS = [
         'www', 'mail', 'ftp', 'dev', 'staging', 'test', 'api', 'admin',
         'beta', 'blog', 'shop', 'git', 'jenkins', 'vpn', 'remote', 'internal',
@@ -26,6 +32,7 @@ class Recon:
         """
         Initialize the Recon module.
         """
+        self.config = config
         self.target = config.get('target')
         self.threads = config.get('threads', 5)
         self.timeout = config.get('timeout', 10)
@@ -175,6 +182,8 @@ class Recon:
                         continue
                     if self._should_skip_link(normalized):
                         continue
+                    if not url_in_scope(normalized, self.config):
+                        continue
                     if same_domain(self.base_url, normalized):
                         with self.crawl_lock:
                             if normalized not in visited and len(self.urls) < self.max_urls:
@@ -274,7 +283,7 @@ class Recon:
                     soup = BeautifulSoup(response.text, 'xml')
                     for loc in soup.find_all('loc'):
                         candidate = loc.text.strip()
-                        if same_domain(self.base_url, candidate):
+                        if same_domain(self.base_url, candidate) and url_in_scope(candidate, self.config):
                             with self.urls_lock:
                                 self.urls.add(candidate)
                     if self.verbose:
@@ -284,15 +293,11 @@ class Recon:
                     log(f"Error fetching sitemap: {str(e)}", Colors.RED, self.verbose)
 
     def _should_skip_link(self, url: str) -> bool:
-        """
-        Determine whether a URL should be skipped during crawling.
-        """
-        parsed = urlparse(url)
-        path = parsed.path.lower()
-        for ext in self.EXCLUDED_EXTENSIONS:
-            if path.endswith(ext):
-                return True
-        return False
+        """Skip out-of-scope URLs, static assets, and excluded paths."""
+        if not url_in_scope(url, self.config):
+            return True
+        path = urlparse(url).path.lower()
+        return any(path.endswith(ext) for ext in self.EXCLUDED_EXTENSIONS)
 
     def _resolve_subdomain(self, subdomain, domain):
         """

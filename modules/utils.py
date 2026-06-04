@@ -5,14 +5,14 @@ Provides helper functions for HTTP requests, logging, URL handling,
 and standardized data structures used throughout the application.
 """
 
-import sys
+import hashlib
+import re
 import threading
 import warnings
-import hashlib
-from datetime import datetime
-from typing import Optional, Dict, Any, List
-from urllib.parse import urljoin, urlparse
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -20,276 +20,297 @@ from urllib3.util.retry import Retry
 
 try:
     from rich.console import Console
-    from rich.table import Table
-    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
     from rich.live import Live
-    from rich.panel import Panel
-    from rich.text import Text
+    from rich.progress import (
+        BarColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+    from rich.table import Table
+
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
 
-# Global rich console instance
-_rich_console = None
-
-def _get_console():
-    """Get or create the rich console instance."""
-    global _rich_console
-    if _rich_console is None and RICH_AVAILABLE:
-        _rich_console = Console()
-    return _rich_console
-
-class Colors:
-    """ANSI color codes for terminal output (legacy support)."""
-    
-    CYAN = '\033[96m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    GREEN = '\033[92m'
-    WHITE = '\033[97m'
-    BOLD = '\033[1m'
-    END = '\033[0m'
-
-
-# Vulnerability metadata: CVSS scores, descriptions, impact, remediation, references
-VULN_METADATA = {
-    "Reflected XSS": {
-        "cvss_score": 6.1,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
-        "what_is_it": "User input is reflected in the response without proper HTML escaping, allowing arbitrary JavaScript execution.",
-        "impact": "An attacker can inject malicious JavaScript that steals cookies, sessions, or credentials from other users visiting a crafted link.",
-        "remediation": "Use context-aware output encoding (HTML encode, JavaScript encode, or URL encode as appropriate). Implement Content Security Policy (CSP) headers. Use secure templating engines with auto-escaping enabled.",
-        "references": [
-            "https://owasp.org/www-community/attacks/xss/",
-            "https://developer.mozilla.org/en-US/docs/Glossary/Cross-site_scripting_XSS",
-            "https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html"
-        ],
-        "confidence": "probable"
-    },
-    
-    "Reflected XSS (Form)": {
-        "cvss_score": 6.1,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
-        "what_is_it": "A form field echoes user input back in the response without escaping, allowing XSS attacks.",
-        "impact": "Attackers can craft malicious form submissions that execute JavaScript in the context of the application.",
-        "remediation": "Sanitize and encode all form input before displaying. Use parameterized templates with auto-escaping. Implement strict CSP headers.",
-        "references": [
-            "https://owasp.org/www-community/attacks/xss/",
-            "https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html",
-            "https://portswigger.net/web-security/cross-site-scripting"
-        ],
-        "confidence": "probable"
-    },
-    
-    "SQL Injection": {
-        "cvss_score": 9.8,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-        "what_is_it": "User input is concatenated directly into SQL queries without parameterization, allowing arbitrary SQL execution.",
-        "impact": "An attacker can extract, modify, or delete database records, potentially compromising the entire application and all user data.",
-        "remediation": "Use parameterized queries (prepared statements) exclusively. Never concatenate user input into SQL strings. Implement least-privilege database accounts.",
-        "references": [
-            "https://owasp.org/www-community/attacks/SQL_Injection",
-            "https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html",
-            "https://portswigger.net/web-security/sql-injection"
-        ],
-        "confidence": "confirmed"
-    },
-    
-    "Boolean-based SQL Injection": {
-        "cvss_score": 9.8,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-        "what_is_it": "SQL injection vulnerability exploitable through boolean logic differences in response content or size.",
-        "impact": "Attackers can extract sensitive data bit-by-bit by observing differences in application responses.",
-        "remediation": "Use parameterized queries and prepared statements. Implement rate limiting and intrusion detection for suspicious query patterns.",
-        "references": [
-            "https://owasp.org/www-community/attacks/SQL_Injection",
-            "https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html",
-            "https://portswigger.net/web-security/sql-injection/blind"
-        ],
-        "confidence": "probable"
-    },
-    
-    "Time-based Blind SQL Injection": {
-        "cvss_score": 9.8,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-        "what_is_it": "SQL injection vulnerability exploitable by observing timing differences in query execution.",
-        "impact": "An attacker can extract database content byte-by-byte based on response times, achieving full database compromise.",
-        "remediation": "Use parameterized queries exclusively. Implement query timeouts and rate limiting. Monitor for suspicious timing patterns.",
-        "references": [
-            "https://owasp.org/www-community/attacks/SQL_Injection",
-            "https://portswigger.net/web-security/sql-injection/blind/time-based",
-            "https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html"
-        ],
-        "confidence": "probable"
-    },
-    
-    "Local File Inclusion": {
-        "cvss_score": 7.5,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
-        "what_is_it": "User input is used in file include statements without proper validation, allowing arbitrary local file access.",
-        "impact": "Attackers can read sensitive files like /etc/passwd, configuration files with credentials, or source code.",
-        "remediation": "Never pass user input directly to file inclusion functions. Use an allowlist of permitted files. Store includes outside web root.",
-        "references": [
-            "https://owasp.org/www-community/attacks/Path_Traversal",
-            "https://cheatsheetseries.owasp.org/cheatsheets/Path_Traversal_Cheat_Sheet.html",
-            "https://portswigger.net/web-security/file-path-traversal"
-        ],
-        "confidence": "confirmed"
-    },
-    
-    "Server-Side Request Forgery (SSRF)": {
-        "cvss_score": 8.6,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N",
-        "what_is_it": "Application accepts user-controlled URLs and makes requests to them, allowing access to internal services.",
-        "impact": "Attackers can access internal services (metadata endpoints, internal APIs), bypass firewalls, and compromise internal infrastructure.",
-        "remediation": "Validate and whitelist all user-supplied URLs. Disable HTTP redirects to internal IPs. Use network segmentation and firewall rules.",
-        "references": [
-            "https://owasp.org/www-community/attacks/Server_Side_Request_Forgery",
-            "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html",
-            "https://portswigger.net/web-security/ssrf"
-        ],
-        "confidence": "probable"
-    },
-    
-    "Open Redirect": {
-        "cvss_score": 6.1,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
-        "what_is_it": "Application redirects users to attacker-controlled URLs based on user input without validation.",
-        "impact": "Attackers can redirect users to phishing sites to steal credentials or perform social engineering attacks.",
-        "remediation": "Validate redirect URLs against a whitelist of safe destinations. Display a confirmation page before redirecting to external sites.",
-        "references": [
-            "https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html",
-            "https://owasp.org/www-community/attacks/Open_Redirect",
-            "https://portswigger.net/web-security/authentication/other-mechanisms/open-redirect"
-        ],
-        "confidence": "probable"
-    },
-    
-    "Missing Security Header": {
-        "cvss_score": 5.3,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
-        "what_is_it": "HTTP response is missing critical security headers that protect against various attacks.",
-        "impact": "Applications are vulnerable to clickjacking, man-in-the-middle attacks, MIME-sniffing attacks, and XSS.",
-        "remediation": "Implement security headers: Strict-Transport-Security, Content-Security-Policy, X-Frame-Options, X-Content-Type-Options, Referrer-Policy.",
-        "references": [
-            "https://owasp.org/www-project-secure-headers/",
-            "https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers",
-            "https://securityheaders.com/"
-        ],
-        "confidence": "confirmed"
-    },
-    
-    "Information Disclosure (Server Banner)": {
-        "cvss_score": 5.3,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
-        "what_is_it": "Server reveals its software name and version number in HTTP response headers.",
-        "impact": "Attackers can identify known vulnerabilities in specific versions and target them with automated exploits.",
-        "remediation": "Remove or obfuscate Server header. Use a reverse proxy to hide backend technology. Disable version disclosure.",
-        "references": [
-            "https://owasp.org/www-project-secure-headers/",
-            "https://cheatsheetseries.owasp.org/cheatsheets/Nodejs_Security_Cheat_Sheet.html",
-            "https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Server"
-        ],
-        "confidence": "confirmed"
-    },
-    
-    "Information Disclosure (X-Powered-By)": {
-        "cvss_score": 5.3,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
-        "what_is_it": "X-Powered-By header reveals the web framework or technology stack in use.",
-        "impact": "Attackers can identify framework versions and exploit known vulnerabilities specific to that framework.",
-        "remediation": "Remove X-Powered-By header entirely. Configure web server to not emit this header.",
-        "references": [
-            "https://owasp.org/www-project-secure-headers/",
-            "https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Powered-By",
-            "https://cheatsheetseries.owasp.org/cheatsheets/Nodejs_Security_Cheat_Sheet.html"
-        ],
-        "confidence": "confirmed"
-    },
-    
-    "Missing CSRF Protection": {
-        "cvss_score": 6.5,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N",
-        "what_is_it": "POST forms lack anti-CSRF tokens, allowing cross-site request forgery attacks.",
-        "impact": "Attackers can trick authenticated users into performing unintended actions (password changes, fund transfers, etc.).",
-        "remediation": "Implement CSRF tokens on all state-changing forms. Use SameSite cookie attribute. Verify Origin/Referer headers.",
-        "references": [
-            "https://owasp.org/www-community/attacks/csrf",
-            "https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html",
-            "https://portswigger.net/web-security/csrf"
-        ],
-        "confidence": "confirmed"
-    },
-    
-    "Exposed Sensitive File": {
-        "cvss_score": 7.5,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
-        "what_is_it": "Sensitive configuration or backup files are accessible through the web root.",
-        "impact": "Attackers can read environment variables, database credentials, source code, or private keys.",
-        "remediation": "Remove sensitive files from web root. Use .gitignore and .dockerignore. Implement proper access controls and authentication.",
-        "references": [
-            "https://owasp.org/www-community/attacks/Path_Traversal",
-            "https://cheatsheetseries.owasp.org/cheatsheets/Nodejs_Security_Cheat_Sheet.html",
-            "https://owasp.org/www-project-secrets-management/"
-        ],
-        "confidence": "confirmed"
-    },
-    
-    "Subdomain Takeover": {
-        "cvss_score": 4.3,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N",
-        "what_is_it": "A subdomain's DNS entry points to a service (S3, GitHub Pages, Heroku) that is no longer provisioned.",
-        "impact": "Attackers can register the service and respond to requests for the subdomain, hosting malicious content.",
-        "remediation": "Remove unused DNS entries. Provision all subdomains or use CNAME validation. Monitor DNS regularly.",
-        "references": [
-            "https://owasp.org/www-community/attacks/DNS_Spoofing",
-            "https://cheatsheetseries.owasp.org/cheatsheets/DNS_Spoofing_Prevention_Cheat_Sheet.html",
-            "https://labs.detectify.com/2014/10/21/hostile-subdomain-takeover-using-heroku-github-firebase-and-other-platforms/"
-        ],
-        "confidence": "probable"
-    },
-    
-    "Insecure Direct Object Reference (IDOR)": {
-        "cvss_score": 7.3,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:U/C:H/I:H/A:H",
-        "what_is_it": "Application uses predictable IDs to access resources without proper authorization checks.",
-        "impact": "Attackers can access, modify, or delete other users' data by manipulating object IDs in URLs or requests.",
-        "remediation": "Implement access control checks on every resource access. Use non-sequential IDs (UUIDs). Log access attempts.",
-        "references": [
-            "https://owasp.org/www-project-top-ten/2017/A5_2017-Broken_Access_Control",
-            "https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html",
-            "https://portswigger.net/web-security/access-control"
-        ],
-        "confidence": "probable"
-    },
-    
-    "JWT Vulnerability": {
-        "cvss_score": 7.5,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
-        "what_is_it": "JWT tokens are improperly validated, allowing signature bypass or algorithm confusion attacks.",
-        "impact": "Attackers can forge valid JWT tokens, impersonating any user without authentication.",
-        "remediation": "Always validate JWT signatures. Disallow 'none' algorithm. Use strong signing secrets. Implement token expiration and refresh.",
-        "references": [
-            "https://owasp.org/www-community/attacks/JWT_Vulnerabilities",
-            "https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html",
-            "https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/"
-        ],
-        "confidence": "probable"
-    },
-}
-
-
-
-# Thread lock for thread-safe logging
+_rich_console: Optional["Console"] = None
+_use_rich: bool = True
 _log_lock = threading.Lock()
 
 
+def set_rich_enabled(enabled: bool) -> None:
+    """Enable or disable Rich terminal output (e.g. --no-rich)."""
+    global _use_rich
+    _use_rich = enabled and RICH_AVAILABLE
+
+
+def _get_console() -> Optional["Console"]:
+    global _rich_console
+    if not _use_rich or not RICH_AVAILABLE:
+        return None
+    if _rich_console is None:
+        _rich_console = Console()
+    return _rich_console
+
+
+class Colors:
+    """ANSI color codes for terminal output (legacy / --no-rich fallback)."""
+
+    CYAN = "\033[96m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    WHITE = "\033[97m"
+    BOLD = "\033[1m"
+    END = "\033[0m"
+
+
+# CVSS v3 metadata keyed by vuln type strings used in scanner.py
+VULN_METADATA: Dict[str, Dict[str, Any]] = {
+    "Reflected XSS": {
+        "cvss_score": 6.1,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+        "what_is_it": "User-supplied input is echoed in the HTTP response without proper output encoding.",
+        "impact": "An attacker can run JavaScript in the victim's browser to steal session cookies, perform actions as the user, or deface the page.",
+        "remediation": "Apply context-aware output encoding (HTML, attribute, JS, URL). Enable a strict Content-Security-Policy and use frameworks with auto-escaping templates.",
+        "references": [
+            "https://owasp.org/www-community/attacks/xss/",
+            "https://developer.mozilla.org/en-US/docs/Glossary/Cross-site_scripting",
+            "https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html",
+        ],
+        "confidence": "probable",
+    },
+    "Reflected XSS (Form)": {
+        "cvss_score": 6.1,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+        "what_is_it": "A form submission causes user input to be reflected in the response without escaping.",
+        "impact": "Attackers can submit crafted form data that executes JavaScript when another user views the result.",
+        "remediation": "Encode all form output by context; validate input server-side; add CSRF tokens and CSP to limit script execution.",
+        "references": [
+            "https://owasp.org/www-community/attacks/xss/",
+            "https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html",
+            "https://portswigger.net/web-security/cross-site-scripting",
+        ],
+        "confidence": "probable",
+    },
+    "SQL Injection": {
+        "cvss_score": 9.8,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        "what_is_it": "Untrusted input is concatenated into SQL queries instead of using bound parameters.",
+        "impact": "Attackers can read, modify, or delete database rows and may escalate to OS command execution on misconfigured stacks.",
+        "remediation": "Use parameterized queries or ORM bindings exclusively; denylist is insufficient. Apply least-privilege DB accounts and disable verbose SQL errors in production.",
+        "references": [
+            "https://owasp.org/www-community/attacks/SQL_Injection",
+            "https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html",
+            "https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2021-44228",
+        ],
+        "confidence": "confirmed",
+    },
+    "Blind SQL Injection (Time-based)": {
+        "cvss_score": 9.8,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        "what_is_it": "SQL injection inferred when database delay payloads cause measurably slower HTTP responses.",
+        "impact": "Attackers can extract data bit-by-bit from the database using timing side channels.",
+        "remediation": "Parameterized queries only; set DB statement timeouts; rate-limit and monitor anomalous query latency per session.",
+        "references": [
+            "https://owasp.org/www-community/attacks/SQL_Injection",
+            "https://portswigger.net/web-security/sql-injection/blind/time-based",
+            "https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html",
+        ],
+        "confidence": "probable",
+    },
+    "Local File Inclusion": {
+        "cvss_score": 7.5,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+        "what_is_it": "User-controlled paths are passed to file read/include functions without validation.",
+        "impact": "Attackers can read sensitive files such as /etc/passwd, application config, or source code from the server.",
+        "remediation": "Use allowlists for include targets; map IDs to files internally; never pass raw user input to open(), include, or file APIs.",
+        "references": [
+            "https://owasp.org/www-community/attacks/Path_Traversal",
+            "https://cheatsheetseries.owasp.org/cheatsheets/Path_Traversal_Cheat_Sheet.html",
+            "https://portswigger.net/web-security/file-path-traversal",
+        ],
+        "confidence": "confirmed",
+    },
+    "Server-Side Request Forgery (SSRF)": {
+        "cvss_score": 8.6,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:L/A:N",
+        "what_is_it": "The server fetches a URL supplied by the user, including internal or cloud metadata endpoints.",
+        "impact": "Attackers can reach internal services, steal cloud credentials from metadata APIs, or port-scan the internal network.",
+        "remediation": "Block private/link-local IP ranges; disable redirects on outbound fetches; use URL allowlists and a dedicated egress proxy.",
+        "references": [
+            "https://owasp.org/www-community/attacks/Server_Side_Request_Forgery",
+            "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html",
+            "https://portswigger.net/web-security/ssrf",
+        ],
+        "confidence": "probable",
+    },
+    "Open Redirect": {
+        "cvss_score": 6.1,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+        "what_is_it": "The application redirects the browser to an attacker-controlled destination based on user input.",
+        "impact": "Enables phishing that inherits trust from your domain and can chain into OAuth token theft.",
+        "remediation": "Allow redirects only to relative paths or a fixed allowlist of hosts; reject protocol-relative and external URLs in redirect parameters.",
+        "references": [
+            "https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html",
+            "https://owasp.org/www-community/attacks/Unvalidated_Redirects_and_Forwards",
+            "https://portswigger.net/web-security/dom-based/open-redirection",
+        ],
+        "confidence": "probable",
+    },
+    "Missing Security Header": {
+        "cvss_score": 5.3,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+        "what_is_it": "Responses omit HTTP security headers that browsers rely on to block common attacks.",
+        "impact": "Increases risk of clickjacking, MIME sniffing, cleartext downgrade, and XSS when other controls fail.",
+        "remediation": "Set HSTS, CSP, X-Frame-Options or frame-ancestors, X-Content-Type-Options, and Referrer-Policy on all HTML responses.",
+        "references": [
+            "https://owasp.org/www-project-secure-headers/",
+            "https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers",
+            "https://securityheaders.com/",
+        ],
+        "confidence": "confirmed",
+    },
+    "Information Disclosure (Server)": {
+        "cvss_score": 5.3,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+        "what_is_it": "The Server response header reveals software name and version information.",
+        "impact": "Attackers can map your stack to known CVEs and tailor exploits before probing further.",
+        "remediation": "Strip or genericize the Server header at the reverse proxy; keep server software patched and disable version tokens.",
+        "references": [
+            "https://owasp.org/www-project-secure-headers/",
+            "https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Server",
+            "https://cheatsheetseries.owasp.org/cheatsheets/Nodejs_Security_Cheat_Sheet.html",
+        ],
+        "confidence": "confirmed",
+    },
+    "Information Disclosure (X-Powered-By)": {
+        "cvss_score": 5.3,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+        "what_is_it": "The X-Powered-By header exposes the application framework or runtime.",
+        "impact": "Reveals technology choices that shrink the attacker's search space for framework-specific bugs.",
+        "remediation": "Remove X-Powered-By in application and web server config (e.g. expose_php Off, removeServerHeader in Express).",
+        "references": [
+            "https://owasp.org/www-project-secure-headers/",
+            "https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Powered-By",
+            "https://cheatsheetseries.owasp.org/cheatsheets/Nodejs_Security_Cheat_Sheet.html",
+        ],
+        "confidence": "confirmed",
+    },
+    "Missing CSRF Protection": {
+        "cvss_score": 6.5,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N",
+        "what_is_it": "State-changing POST forms lack unpredictable anti-CSRF tokens tied to the user session.",
+        "impact": "A malicious site can submit authenticated requests that change passwords, settings, or perform transactions.",
+        "remediation": "Issue per-session CSRF tokens on all mutating forms; validate Origin/Referer; set SameSite=Lax or Strict on session cookies.",
+        "references": [
+            "https://owasp.org/www-community/attacks/csrf",
+            "https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html",
+            "https://portswigger.net/web-security/csrf",
+        ],
+        "confidence": "confirmed",
+    },
+    "Exposed Sensitive File": {
+        "cvss_score": 7.5,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+        "what_is_it": "Backup, config, or VCS files are reachable over HTTP without authentication.",
+        "impact": "Attackers may obtain credentials, API keys, source code, or .env secrets leading to full compromise.",
+        "remediation": "Deny web access to dotfiles and backups; deploy outside web root; block /.git and env paths at the WAF or reverse proxy.",
+        "references": [
+            "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information",
+            "https://owasp.org/www-community/attacks/Path_Traversal",
+            "https://cheatsheetseries.owasp.org/cheatsheets/Nodejs_Security_Cheat_Sheet.html",
+        ],
+        "confidence": "confirmed",
+    },
+    "Subdomain Takeover": {
+        "cvss_score": 4.3,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N",
+        "what_is_it": "DNS for a subdomain points to a third-party host that no longer serves your content.",
+        "impact": "Anyone who claims that external hostname can serve phishing or malware on your subdomain.",
+        "remediation": "Delete stale DNS records; verify CNAME targets before publishing; monitor subdomains for dangling CNAMEs to SaaS platforms.",
+        "references": [
+            "https://owasp.org/www-community/attacks/DNS_Spoofing",
+            "https://cheatsheetseries.owasp.org/cheatsheets/DNS_Security_Cheat_Sheet.html",
+            "https://labs.detectify.com/2014/10/21/hostile-subdomain-takeover-using-heroku-github-pages-bitbucket-and-more/",
+        ],
+        "confidence": "probable",
+    },
+    "IDOR": {
+        "cvss_score": 7.3,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N",
+        "what_is_it": "Object identifiers in URLs or APIs are used without verifying the requester owns that resource.",
+        "impact": "Attackers can read or modify other users' records by incrementing or guessing object IDs.",
+        "remediation": "Authorize every object access against the authenticated user; use opaque UUIDs; log and alert on cross-tenant access attempts.",
+        "references": [
+            "https://owasp.org/www-project-top-ten/2017/A5_2017-Broken_Access_Control",
+            "https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html",
+            "https://portswigger.net/web-security/access-control/idor",
+        ],
+        "confidence": "probable",
+    },
+    "JWT Vulnerability": {
+        "cvss_score": 7.5,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+        "what_is_it": "JSON Web Tokens are accepted without proper signature verification or with weak algorithms.",
+        "impact": "Attackers can forge tokens with arbitrary claims and impersonate any user including administrators.",
+        "remediation": "Verify signatures with a strong secret or asymmetric key; reject alg=none; pin allowed algorithms; use short expirations and rotation.",
+        "references": [
+            "https://owasp.org/www-community/vulnerabilities/JSON_Web_Token_(JWT)_Vulnerabilities",
+            "https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html",
+            "https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/",
+        ],
+        "confidence": "probable",
+    },
+}
+
+# Aliases for legacy scanner type strings until scanner.py is aligned (task 4)
+_VULN_ALIASES: Dict[str, str] = {
+    "Time-based Blind SQL Injection": "Blind SQL Injection (Time-based)",
+    "Boolean-based SQL Injection": "SQL Injection",
+    "Information Disclosure (Server Banner)": "Information Disclosure (Server)",
+    "Potential Subdomain Takeover": "Subdomain Takeover",
+    "Insecure Direct Object Reference (IDOR)": "IDOR",
+}
+
+
+def url_in_scope(url: str, config: dict) -> bool:
+    """
+    Return True if url is allowed by exclude_patterns and include_paths in config.
+    Used by the scanner and recon crawler.
+    """
+    parsed = urlparse(url)
+    path = parsed.path + ("?" + parsed.query if parsed.query else "")
+
+    for pattern in config.get("exclude_patterns", []) or []:
+        try:
+            if re.search(pattern, url, re.IGNORECASE):
+                return False
+        except re.error:
+            continue
+
+    include_paths = config.get("include_paths", []) or []
+    if include_paths:
+        for pattern in include_paths:
+            try:
+                if re.search(pattern, path, re.IGNORECASE):
+                    return True
+            except re.error:
+                continue
+        return False
+
+    return True
+
+
+def _resolve_vuln_type(vuln_type: str) -> str:
+    return _VULN_ALIASES.get(vuln_type, vuln_type)
+
+
 def banner() -> None:
-    """
-    Print the BugBounty Hunter ASCII art banner and introduction.
-    """
-    banner_text = f"""
-{Colors.CYAN}{Colors.BOLD}
+    """Print the BugBounty Hunter ASCII art banner."""
+    art = """
 ╔══════════════════════════════════════════════════════════╗
 ║                                                          ║
 ║              🔍 BugBounty Hunter 🔍                      ║
@@ -298,43 +319,47 @@ def banner() -> None:
 ║                  Scanning Framework                      ║
 ║                                                          ║
 ╚══════════════════════════════════════════════════════════╝
-{Colors.END}
-    """
-    print(banner_text)
+"""
+    console = _get_console()
+    if console is not None:
+        console.print(art, style="bold cyan")
+    else:
+        print(f"{Colors.CYAN}{Colors.BOLD}{art}{Colors.END}")
 
 
-def log(message: str, color: str = Colors.WHITE, verbose_only: bool = False, verbose: bool = False) -> None:
+def log(
+    message: str,
+    color: str = Colors.WHITE,
+    verbose_only: bool = False,
+    verbose: bool = False,
+) -> None:
     """
-    Print a colored logging message with thread-safe output.
-    Supports both rich and plain ANSI output.
-    
-    Args:
-        message: The message to log
-        color: Color code from Colors class (for ANSI fallback)
-        verbose_only: If True, only print when verbose is True
-        verbose: Whether verbose mode is enabled
+    Print a colored log line (Rich when enabled, else ANSI).
+
+    Signature preserved for all call sites: log(msg, color, verbose_only, verbose).
     """
     if verbose_only and not verbose:
         return
-    
+
+    color_map = {
+        Colors.CYAN: "cyan",
+        Colors.YELLOW: "yellow",
+        Colors.RED: "red",
+        Colors.GREEN: "green",
+        Colors.WHITE: "white",
+        Colors.BOLD: "bold white",
+    }
+    style = color_map.get(color, "white")
+
     with _log_lock:
         console = _get_console()
-        if console is not None and RICH_AVAILABLE:
-            # Map ANSI colors to rich colors
-            color_map = {
-                Colors.CYAN: "cyan",
-                Colors.YELLOW: "yellow",
-                Colors.RED: "red",
-                Colors.GREEN: "green",
-                Colors.WHITE: "white",
-                Colors.BOLD: "bold white",
-            }
-            rich_color = color_map.get(color, "white")
-            console.print(message, style=rich_color)
+        if console is not None:
+            if color == Colors.BOLD:
+                console.print(message, style=style)
+            else:
+                console.print(message, style=style)
         else:
-            # Fallback to ANSI
-            output = f"{color}{message}{Colors.END}"
-            print(output, flush=True)
+            print(f"{color}{message}{Colors.END}", flush=True)
 
 
 def finding(
@@ -342,175 +367,121 @@ def finding(
     url: str,
     severity: str,
     details: str,
-    evidence: Any = "",
+    evidence: str = "",
     confidence: Optional[str] = None,
-    **extras
 ) -> Dict[str, Any]:
     """
-    Create a standardized finding dictionary with enriched metadata.
-    
-    Args:
-        vuln_type: Type of vulnerability (must match VULN_METADATA keys)
-        url: URL where the finding was discovered
-        severity: Severity level (CRITICAL, HIGH, MEDIUM, LOW, INFO)
-        details: Detailed description of the finding
-        evidence: Evidence or proof of the vulnerability
-        confidence: Confidence level (confirmed/probable/tentative)
-        **extras: Additional metadata fields
-    
-    Returns:
-        Dictionary with standardized finding structure including metadata
+    Build a standardized finding dict with CVSS metadata, fingerprint, and timestamp.
     """
-    # Timestamp in ISO 8601 format
-    timestamp = datetime.utcnow().isoformat() + "Z"
-    
-    # Generate fingerprint: SHA256 of vuln_type:url:evidence
-    fingerprint_str = f"{vuln_type}:{url}:{evidence}"
-    fingerprint = hashlib.sha256(fingerprint_str.encode()).hexdigest()
-    
-    # Extract evidence for default confidence if not provided
+    canonical_type = _resolve_vuln_type(vuln_type)
+    meta = VULN_METADATA.get(canonical_type, {})
+
     if confidence is None:
-        confidence = VULN_METADATA.get(vuln_type, {}).get("confidence", "probable")
-    
-    # Build finding from metadata
-    metadata = VULN_METADATA.get(vuln_type, {})
-    finding_data = {
-        'type': vuln_type,
-        'url': url,
-        'severity': severity,
-        'details': details,
-        'evidence': evidence,
-        'confidence': confidence,
-        'fingerprint': fingerprint,
-        'timestamp': timestamp,
-        'cvss_score': metadata.get('cvss_score'),
-        'cvss_vector': metadata.get('cvss_vector'),
-        'what_is_it': metadata.get('what_is_it'),
-        'impact': metadata.get('impact'),
-        'remediation': metadata.get('remediation'),
-        'references': metadata.get('references', []),
+        confidence = meta.get("confidence", "probable")
+
+    evidence_str = evidence if isinstance(evidence, str) else str(evidence)
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fingerprint = hashlib.sha256(
+        f"{vuln_type}:{url}:{evidence_str}".encode()
+    ).hexdigest()
+
+    result: Dict[str, Any] = {
+        "type": vuln_type,
+        "url": url,
+        "severity": severity,
+        "details": details,
+        "evidence": evidence_str,
+        "confidence": confidence,
+        "fingerprint": fingerprint,
+        "timestamp": timestamp,
     }
-    finding_data.update(extras)
-    return finding_data
+
+    for key in (
+        "cvss_score",
+        "cvss_vector",
+        "what_is_it",
+        "impact",
+        "remediation",
+        "references",
+    ):
+        if key in meta:
+            result[key] = meta[key]
+
+    return result
 
 
 def parse_auth(auth_string: str):
-    """
-    Parse a basic auth credential string into a tuple.
-
-    Args:
-        auth_string: A string formatted as username:password
-
-    Returns:
-        Tuple[str, str] or None
-    """
-    if not auth_string or ':' not in auth_string:
+    """Parse username:password basic auth string."""
+    if not auth_string or ":" not in auth_string:
         return None
-    username, password = auth_string.split(':', 1)
+    username, password = auth_string.split(":", 1)
     return username.strip(), password.strip()
 
 
 def make_session(config: Dict[str, Any]) -> requests.Session:
-    """
-    Create a requests Session with custom configuration.
-    
-    Configures the session with:
-    - Custom headers (User-Agent, Accept, etc. to prevent 406 errors)
-    - Cookie jar if provided
-    - Retry strategy for resilience
-    - SSL verification settings
-    - Optional proxy support and basic auth
-    
-    Args:
-        config: Configuration dictionary containing:
-            - 'headers': dict of HTTP headers
-            - 'cookies': dict of cookies (optional)
-            - 'verify_ssl': bool for SSL verification (default: True)
-            - 'retries': int number of retries (default: 3)
-            - 'proxy': proxy URL (optional)
-            - 'auth': Basic auth credentials string username:password
-    
-    Returns:
-        Configured requests.Session object
-    """
+    """Create a configured requests.Session from scan config."""
     session = requests.Session()
-    
-    # Expanded headers to satisfy the target server's content negotiation rules
+
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8"
+        ),
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1"
+        "Upgrade-Insecure-Requests": "1",
     })
-    
-    # Set headers (This will overwrite the default if you pass custom headers)
-    if 'headers' in config:
-        session.headers.update(config['headers'])
-    
-    # Set cookies if provided
-    if 'cookies' in config and config['cookies']:
-        session.cookies.update(config['cookies'])
-    
-    # Configure proxy support
-    proxy = config.get('proxy')
+
+    if "headers" in config:
+        session.headers.update(config["headers"])
+
+    if config.get("cookies"):
+        session.cookies.update(config["cookies"])
+
+    proxy = config.get("proxy")
     if proxy:
-        session.proxies.update({
-            'http': proxy,
-            'https': proxy
-        })
-    
-    # Set basic auth if provided
-    auth_info = parse_auth(config.get('auth', ''))
+        session.proxies.update({"http": proxy, "https": proxy})
+
+    auth_info = parse_auth(config.get("auth", ""))
     if auth_info:
         session.auth = auth_info
-    
-    # Configure retry strategy
-    retries = config.get('retries', 3)
+
+    retries = config.get("retries", 3)
     retry_strategy = Retry(
         total=retries,
         backoff_factor=0.3,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
     )
-    
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
-    
-    # Handle SSL verification
-    verify_ssl = config.get('verify_ssl', True)
-    session.verify = verify_ssl
-    
-    if not verify_ssl:
-        warnings.filterwarnings('ignore', message='Unverified HTTPS request')
-    
+
+    session.verify = config.get("verify_ssl", True)
+    if not session.verify:
+        warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+
     return session
+
+
 def safe_get(
     session: requests.Session,
     url: str,
     timeout: int = 10,
     allow_redirects: bool = True,
     raise_for_status: bool = True,
-    **kwargs
+    **kwargs,
 ) -> Optional[requests.Response]:
-    """
-    Safely make an HTTP GET request with error handling.
-    
-    Args:
-        session: requests.Session object
-        url: URL to request
-        timeout: Request timeout in seconds
-        allow_redirects: Follow redirects if True
-        raise_for_status: Raise an exception for non-success status codes
-        **kwargs: Additional request kwargs to pass to session.get
-    
-    Returns:
-        requests.Response object or None if error occurred
-    """
+    """HTTP GET with logging on failure."""
     try:
-        response = session.get(url, timeout=timeout, allow_redirects=allow_redirects, **kwargs)
+        response = session.get(
+            url, timeout=timeout, allow_redirects=allow_redirects, **kwargs
+        )
         if raise_for_status:
             response.raise_for_status()
         return response
@@ -521,13 +492,14 @@ def safe_get(
         log(f"[!] Connection error accessing {url}", Colors.YELLOW)
         return None
     except requests.exceptions.HTTPError as e:
-        log(f"[!] HTTP error accessing {url}: {e.response.status_code}", Colors.YELLOW)
+        status = e.response.status_code if e.response is not None else "?"
+        log(f"[!] HTTP error accessing {url}: {status}", Colors.YELLOW)
         return None
     except requests.exceptions.RequestException as e:
-        log(f"[!] Request error accessing {url}: {str(e)}", Colors.YELLOW)
+        log(f"[!] Request error accessing {url}: {e}", Colors.YELLOW)
         return None
     except Exception as e:
-        log(f"[!] Unexpected error accessing {url}: {str(e)}", Colors.RED)
+        log(f"[!] Unexpected error accessing {url}: {e}", Colors.RED)
         return None
 
 
@@ -538,25 +510,13 @@ def safe_post(
     timeout: int = 10,
     allow_redirects: bool = True,
     raise_for_status: bool = True,
-    **kwargs
+    **kwargs,
 ) -> Optional[requests.Response]:
-    """
-    Safely make an HTTP POST request with error handling.
-    
-    Args:
-        session: requests.Session object
-        url: URL to request
-        data: POST data dictionary
-        timeout: Request timeout in seconds
-        allow_redirects: Follow redirects if True
-        raise_for_status: Raise an exception for non-success status codes
-        **kwargs: Additional request kwargs to pass to session.post
-    
-    Returns:
-        requests.Response object or None if error occurred
-    """
+    """HTTP POST with logging on failure."""
     try:
-        response = session.post(url, data=data, timeout=timeout, allow_redirects=allow_redirects, **kwargs)
+        response = session.post(
+            url, data=data, timeout=timeout, allow_redirects=allow_redirects, **kwargs
+        )
         if raise_for_status:
             response.raise_for_status()
         return response
@@ -567,141 +527,149 @@ def safe_post(
         log(f"[!] Connection error posting to {url}", Colors.YELLOW)
         return None
     except requests.exceptions.HTTPError as e:
-        log(f"[!] HTTP error posting to {url}: {e.response.status_code}", Colors.YELLOW)
+        status = e.response.status_code if e.response is not None else "?"
+        log(f"[!] HTTP error posting to {url}: {status}", Colors.YELLOW)
         return None
     except requests.exceptions.RequestException as e:
-        log(f"[!] Request error posting to {url}: {str(e)}", Colors.YELLOW)
+        log(f"[!] Request error posting to {url}: {e}", Colors.YELLOW)
         return None
     except Exception as e:
-        log(f"[!] Unexpected error posting to {url}: {str(e)}", Colors.RED)
+        log(f"[!] Unexpected error posting to {url}: {e}", Colors.RED)
         return None
 
 
 def normalize_url(base_url: str, relative: str) -> str:
-    """
-    Convert a relative URL to an absolute URL.
-    
-    Args:
-        base_url: Base URL to use as reference
-        relative: Relative or absolute URL to normalize
-    
-    Returns:
-        Absolute URL string
-    """
+    """Convert a relative URL to absolute using base_url."""
     try:
-        # If already absolute, return as-is
-        if relative.startswith(('http://', 'https://', '//')):
-            if relative.startswith('//'):
-                # Protocol-relative URL
+        if relative.startswith(("http://", "https://", "//")):
+            if relative.startswith("//"):
                 parsed_base = urlparse(base_url)
                 return f"{parsed_base.scheme}:{relative}"
             return relative
-        
-        # Join relative URL with base
-        normalized = urljoin(base_url, relative)
-        return normalized
+        return urljoin(base_url, relative)
     except Exception:
         return relative
 
 
 def same_domain(target_url: str, url_to_check: str) -> bool:
-    """
-    Check if two URLs belong to the same domain.
-    
-    Args:
-        target_url: Target URL
-        url_to_check: URL to check against target
-    
-    Returns:
-        True if both URLs are on the same domain, False otherwise
-    """
+    """Return True if both URLs share the same host."""
     try:
-        target_parsed = urlparse(target_url)
-        check_parsed = urlparse(url_to_check)
-        
-        # Extract domain (netloc includes host:port)
-        target_domain = target_parsed.netloc.lower()
-        check_domain = check_parsed.netloc.lower()
-        
-        # Remove port if present for comparison
-        target_host = target_domain.split(':')[0]
-        check_host = check_domain.split(':')[0]
-        
+        target_host = urlparse(target_url).netloc.lower().split(":")[0]
+        check_host = urlparse(url_to_check).netloc.lower().split(":")[0]
         return target_host == check_host
     except Exception:
         return False
 
 
-def get_rich_table(title: str, columns: List[str]) -> Optional[Table]:
-    """
-    Create a Rich Table if available, otherwise return None.
-    
-    Args:
-        title: Title of the table
-        columns: List of column names
-    
-    Returns:
-        Rich Table instance or None if Rich is not available
-    """
-    if not RICH_AVAILABLE:
-        return None
-    
-    table = Table(title=title)
-    for col in columns:
-        table.add_column(col)
-    return table
+class _DummyProgress:
+    """Minimal Progress stand-in when Rich is disabled or unavailable."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def add_task(self, description: str, total: int = 0):
+        return 0
+
+    def update(self, task_id, advance: int = 0, **kwargs):
+        pass
 
 
-@contextmanager
 def progress_bar(total: int, description: str = "Processing"):
     """
-    Context manager for a rich progress bar.
-    
-    Args:
-        total: Total number of items to process
-        description: Description of the task
-    
-    Yields:
-        Tuple of (Progress instance, task_id) or (None, None) if Rich is not available
+    Return a Rich Progress instance (context manager) or a no-op dummy.
+
+    Usage:
+        with progress_bar(100, "Scanning") as progress:
+            task = progress.add_task(description, total=total)
+            progress.update(task, advance=1)
     """
-    if RICH_AVAILABLE:
-        progress = Progress(
+    if _use_rich and RICH_AVAILABLE:
+        return Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
             TimeRemainingColumn(),
+            console=_get_console(),
         )
-        with progress:
-            task_id = progress.add_task(description, total=total)
-            yield progress, task_id
-    else:
-        # Fallback: dummy object that does nothing
-        class DummyProgress:
-            def update(self, task_id, advance=1):
-                pass
-        yield DummyProgress(), None
+    return _DummyProgress()
+
+
+def _severity_style(severity: str) -> str:
+    return {
+        "critical": "bold red",
+        "high": "red",
+        "medium": "yellow",
+        "low": "cyan",
+        "info": "dim",
+    }.get(severity.lower(), "white")
+
+
+def _build_findings_table(rows: List[Dict[str, Any]]) -> "Table":
+    table = Table(title="Live Findings", expand=True)
+    table.add_column("Severity", style="bold", width=10)
+    table.add_column("Type", width=28)
+    table.add_column("URL", overflow="fold")
+    table.add_column("Confidence", width=12)
+    table.add_column("CVSS", width=6, justify="right")
+
+    for row in rows:
+        sev = str(row.get("severity", "info"))
+        cvss = row.get("cvss_score")
+        cvss_txt = f"{cvss:.1f}" if isinstance(cvss, (int, float)) else "-"
+        table.add_row(
+            sev.upper(),
+            str(row.get("type", ""))[:28],
+            str(row.get("url", ""))[:80],
+            str(row.get("confidence", "")),
+            cvss_txt,
+            style=_severity_style(sev),
+        )
+    return table
 
 
 @contextmanager
-def live_table(table: Optional[Table], refresh_per_second: int = 4):
+def live_table():
     """
-    Context manager for a live-updating rich table.
-    
-    Args:
-        table: Rich Table instance
-        refresh_per_second: Update frequency
-    
-    Yields:
-        Live instance or None if Rich is not available
+    Context manager showing a live-updating table of findings as they are added.
+
+    Yields an object with add_finding(finding_dict) method.
+
+    Usage:
+        with live_table() as lt:
+            lt.add_finding(finding_dict)
     """
-    if RICH_AVAILABLE and table is not None:
-        live = Live(table, refresh_per_second=refresh_per_second)
-        with live:
-            yield live
+    rows: List[Dict[str, Any]] = []
+    live_ref: Dict[str, Any] = {"live": None}
+
+    class LiveFindingsHandle:
+        def add_finding(self, item: Dict[str, Any]) -> None:
+            rows.append(item)
+            live = live_ref["live"]
+            if live is not None:
+                live.update(_build_findings_table(rows))
+
+    handle = LiveFindingsHandle()
+    console = _get_console()
+
+    if console is not None and RICH_AVAILABLE:
+        table = _build_findings_table(rows)
+        with Live(table, console=console, refresh_per_second=4) as live:
+            live_ref["live"] = live
+            yield handle
     else:
-        # Fallback: dummy context
-        class DummyLive:
-            def update(self, table):
-                pass
-        yield DummyLive()
+        yield handle
+
+
+def get_rich_table(title: str, columns: List[str]) -> Optional["Table"]:
+    """Create a Rich Table when Rich is enabled."""
+    if not _use_rich or not RICH_AVAILABLE:
+        return None
+    table = Table(title=title)
+    for col in columns:
+        table.add_column(col)
+    return table

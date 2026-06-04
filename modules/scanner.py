@@ -6,12 +6,13 @@ Modules: XSS, SQLi, LFI, SSRF, Open Redirect, Security Headers.
 import threading
 import time
 import re
+from typing import Optional
 from urllib.parse import urlparse, urlencode, parse_qs, urljoin, urlunparse
 from queue import Queue
 from bs4 import BeautifulSoup
 
 from modules.utils import (
-    make_session, safe_get, safe_post, finding, log, Colors
+    make_session, safe_get, safe_post, finding, log, Colors, url_in_scope,
 )
 
 
@@ -222,70 +223,64 @@ class VulnScanner:
 
     def _in_scope(self, url: str) -> bool:
         """Check if URL is within scan scope based on include/exclude patterns."""
-        parsed = urlparse(url)
-        path = parsed.path + ("?" + parsed.query if parsed.query else "")
-        
-        # Check exclude patterns first (regex list)
-        exclude_patterns = self.config.get("exclude_patterns", [])
-        for pattern in exclude_patterns:
-            try:
-                if re.search(pattern, url, re.IGNORECASE):
-                    return False
-            except Exception:
-                continue
-        
-        # Check include paths (if specified, only include matching paths)
-        include_paths = self.config.get("include_paths", [])
-        if include_paths:
-            for pattern in include_paths:
-                try:
-                    if re.search(pattern, path, re.IGNORECASE):
-                        return True
-                except Exception:
-                    continue
-            return False  # If include_paths specified but no match, exclude
-        
-        # Default: in scope
-        return True
-    
+        return url_in_scope(url, self.config)
+
+    def _extract_param_name(self, f: dict) -> str:
+        """Extract query parameter name from finding details, evidence, or URL."""
+        for text in (f.get("details", ""), f.get("evidence", "")):
+            if "Parameter '" in text:
+                return text.split("Parameter '")[1].split("'")[0]
+            if "Form field '" in text:
+                return text.split("Form field '")[1].split("'")[0]
+        url = f.get("url", "")
+        if "?" in url:
+            params = parse_qs(urlparse(url).query)
+            if params:
+                return next(iter(params.keys()))
+        return ""
+
     def _deduplicate(self, findings: list[dict]) -> list[dict]:
         """
-        Deduplicate findings by grouping similar ones.
-        If 5+ findings of same type on different URLs, collapse into one with URL list.
+        Group findings by (type, parameter). If a group has 5+ URLs, collapse to one card.
         """
         if not findings:
             return findings
-        
-        # Group by (type, extracted_param)
-        groups = {}
+
+        groups: dict[tuple[str, str], list[dict]] = {}
         for f in findings:
-            vuln_type = f.get('type', f.get('title', 'Unknown'))
-            # Extract parameter name from evidence if possible
-            evidence = f.get('evidence', '')
-            param = ''
-            if "Parameter '" in evidence:
-                param = evidence.split("Parameter '")[1].split("'")[0]
-            
+            vuln_type = f.get("type", "Unknown")
+            param = self._extract_param_name(f)
             key = (vuln_type, param)
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(f)
-        
-        # Collapse groups with 5+ entries
-        deduped = []
-        for (vuln_type, param), group in groups.items():
+            groups.setdefault(key, []).append(f)
+
+        deduped: list[dict] = []
+        for group in groups.values():
             if len(group) >= 5:
-                # Keep first finding, add grouped_urls field
                 first = group[0].copy()
-                grouped_urls = [f.get('url', '') for f in group]
-                first['grouped_urls'] = grouped_urls
-                first['details'] = f"Found on {len(group)} URLs with similar patterns"
+                first["grouped_urls"] = [item.get("url", "") for item in group]
+                note = f"Found on {len(group)} URLs"
+                first["details"] = (
+                    f"{first.get('details', '')} — {note}".strip(" —")
+                    if first.get("details")
+                    else note
+                )
                 deduped.append(first)
             else:
-                # Keep all individual findings
                 deduped.extend(group)
-        
         return deduped
+
+    def _xss_confidence(self, payload: str, body: str) -> Optional[str]:
+        """Return confidence level if payload appears reflected, else None."""
+        if payload in body:
+            return "confirmed"
+        partial_markers = (
+            payload.replace("<", "&lt;"),
+            payload.replace('"', "&quot;"),
+            payload[:12] if len(payload) > 12 else payload,
+        )
+        if any(marker and marker in body for marker in partial_markers):
+            return "probable"
+        return None
 
     def _run_threaded(self, fn, items):
         """Execute function on items using thread pool."""
@@ -335,9 +330,12 @@ class VulnScanner:
                         try:
                             test_url = self._inject_param(url, param, payload)
                             resp = safe_get(self.session, test_url, self.timeout)
-                            if resp and payload in resp.text:
-                                # If payload is reflected verbatim, mark as confirmed
-                                confidence = "confirmed" if payload in resp.text else "probable"
+                            confidence = (
+                                self._xss_confidence(payload, resp.text)
+                                if resp
+                                else None
+                            )
+                            if confidence:
                                 f = finding(
                                     "Reflected XSS",
                                     test_url,
@@ -378,8 +376,12 @@ class VulnScanner:
                                 form_url = form.get("action", "") + "?" + urlencode(data)
                                 resp = safe_get(self.session, form_url, self.timeout)
                             
-                            if resp and payload in resp.text:
-                                confidence = "confirmed" if payload in resp.text else "probable"
+                            confidence = (
+                                self._xss_confidence(payload, resp.text)
+                                if resp
+                                else None
+                            )
+                            if confidence:
                                 f = finding(
                                     "Reflected XSS (Form)",
                                     form.get("action", ""),
@@ -398,7 +400,7 @@ class VulnScanner:
                 log(f"  [XSS Form] Error processing form: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
                 continue
 
-        return findings
+        return self._deduplicate(findings)
 
     # ── SQLi ─────────────────────────────────────────────────────────────
 
@@ -484,6 +486,8 @@ class VulnScanner:
 
         # 3. Time-based blind SQL injection
         for url in self._urls_with_params():
+            if not self._in_scope(url):
+                continue
             try:
                 parsed = urlparse(url)
                 params = list(parse_qs(parsed.query).keys())
@@ -494,13 +498,12 @@ class VulnScanner:
                             resp = safe_get(self.session, test_url, self.timeout + 5)
                             if resp and resp.elapsed.total_seconds() >= 5:
                                 f = finding(
-                                    "Time-based Blind SQL Injection",
+                                    "Blind SQL Injection (Time-based)",
                                     test_url,
                                     "critical",
                                     f"Parameter '{param}' appears vulnerable to time-based SQL injection.",
                                     f"Payload: {payload}",
-                                    impact="This indicates the backend is executing SQL that can be timed to infer database behavior.",
-                                    recommendation="Use parameterized queries and avoid injecting user-controlled data into SQL statements."
+                                    confidence="probable",
                                 )
                                 self._add(f)
                                 findings.append(f)
@@ -512,6 +515,8 @@ class VulnScanner:
             except Exception as e:
                 log(f"  [SQLi Time] Error processing URL: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
                 continue
+
+        return self._deduplicate(findings)
 
     # ── LFI ──────────────────────────────────────────────────────────────
 
@@ -553,7 +558,7 @@ class VulnScanner:
                 log(f"  [LFI] Error processing URL: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
                 continue
 
-        return findings
+        return self._deduplicate(findings)
 
     # ── SSRF ─────────────────────────────────────────────────────────────
 
@@ -620,7 +625,7 @@ class VulnScanner:
                 log(f"  [SSRF] Error processing URL: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
                 continue
 
-        return findings
+        return self._deduplicate(findings)
 
     # ── Open Redirect ─────────────────────────────────────────────────────
 
@@ -695,7 +700,7 @@ class VulnScanner:
                 log(f"  [REDIRECT] Error processing URL: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
                 continue
 
-        return findings
+        return self._deduplicate(findings)
 
     # ── CSRF ─────────────────────────────────────────────────────────────
 
@@ -734,7 +739,7 @@ class VulnScanner:
                 log(f"  [CSRF] Error analyzing form: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
                 continue
 
-        return findings
+        return self._deduplicate(findings)
 
     # ── Directory Fuzzing ─────────────────────────────────────────────────
 
@@ -765,6 +770,8 @@ class VulnScanner:
         for path in paths:
             try:
                 target_url = f"{self.config.get('target').rstrip('/')}/{path.lstrip('/')}"
+                if not self._in_scope(target_url):
+                    continue
                 resp = safe_get(self.session, target_url, self.timeout, raise_for_status=False)
                 if resp and resp.status_code == 200:
                     title = "Exposed Common Path"
@@ -786,7 +793,7 @@ class VulnScanner:
                 log(f"  [DIRB] Error testing {path}: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
                 continue
 
-        return findings
+        return self._deduplicate(findings)
 
     # ── Sensitive Data Exposure ────────────────────────────────────────────
 
@@ -874,7 +881,7 @@ class VulnScanner:
                 log(f"  [EXPOSED] Error checking {exposed_file}: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
                 continue
 
-        return findings
+        return self._deduplicate(findings)
 
     # ── Sensitive Data Exposure ────────────────────────────────────────────
 
@@ -883,6 +890,8 @@ class VulnScanner:
         findings = []
 
         for url in self.recon.get("urls", []):
+            if not self._in_scope(url):
+                continue
             try:
                 resp = safe_get(self.session, url, self.timeout, raise_for_status=False)
                 if not resp or not resp.text:
@@ -896,10 +905,11 @@ class VulnScanner:
                             f"Sensitive Data Exposure ({label})",
                             url,
                             "high" if "key" in label.lower() else "medium",
-                            f"Potential sensitive value detected in page content: {label}.",
+                            (
+                                f"Potential sensitive value detected in page content: {label}. "
+                                "Rotate any exposed credentials immediately."
+                            ),
                             f"Matched: {match.group(0)[:120]}",
-                            impact="Exposure of secrets or credentials can lead to account takeover or data loss.",
-                            recommendation="Remove secrets from public pages and rotate any exposed credentials immediately."
                         )
                         self._add(f)
                         findings.append(f)
@@ -909,7 +919,7 @@ class VulnScanner:
                 log(f"  [SENSITIVE] Error scanning {url}: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
                 continue
 
-        return findings
+        return self._deduplicate(findings)
 
     # ── Security Headers ─────────────────────────────────────────────────
 
@@ -944,12 +954,12 @@ class VulnScanner:
             server = resp.headers.get("Server", "")
             if server and any(c.isdigit() for c in server):
                 f = finding(
-                    "Information Disclosure (Server Banner)",
+                    "Information Disclosure (Server)",
                     target,
                     "low",
                     f"Server header reveals version: {server!r}",
                     "",
-                    confidence="confirmed"
+                    confidence="confirmed",
                 )
                 self._add(f)
                 findings.append(f)
@@ -990,10 +1000,12 @@ class VulnScanner:
                     "Weak Content Security Policy",
                     target,
                     "medium",
-                    "CSP contains potentially unsafe directives.",
+                    (
+                        "CSP contains potentially unsafe directives "
+                        "(unsafe-inline, unsafe-eval, or data:)."
+                    ),
                     f"CSP: {csp[:200]}",
-                    impact="Allows inline script execution and may enable XSS exploitation.",
-                    recommendation="Use a strict CSP without unsafe-inline, unsafe-eval, or data: sources."
+                    confidence="confirmed",
                 )
                 self._add(f)
                 findings.append(f)
@@ -1007,10 +1019,12 @@ class VulnScanner:
                     "Insecure CORS Configuration",
                     target,
                     "high",
-                    "Access-Control-Allow-Origin is '*' while credentials are allowed.",
+                    (
+                        "Access-Control-Allow-Origin is '*' while credentials are allowed. "
+                        "Restrict to trusted origins."
+                    ),
                     f"Access-Control-Allow-Origin: {acao}, Access-Control-Allow-Credentials: {acc}",
-                    impact="Allows attacker-controlled websites to perform credentialed requests.",
-                    recommendation="Do not use '*' with credentials; restrict Access-Control-Allow-Origin to trusted origins."
+                    confidence="confirmed",
                 )
                 self._add(f)
                 findings.append(f)
@@ -1020,10 +1034,9 @@ class VulnScanner:
                     "Overly Permissive CORS",
                     target,
                     "low",
-                    "Access-Control-Allow-Origin is set to '*'.",
+                    "Access-Control-Allow-Origin is set to '*'. Restrict to trusted origins where possible.",
                     f"Access-Control-Allow-Origin: {acao}",
-                    impact="Public resources may be accessible from any origin.",
-                    recommendation="Restrict CORS to trusted origins where possible."
+                    confidence="confirmed",
                 )
                 self._add(f)
                 findings.append(f)
@@ -1039,8 +1052,7 @@ class VulnScanner:
                         "medium",
                         "Set-Cookie header may be missing Secure and/or HttpOnly flags.",
                         f"Set-Cookie: {cookie_headers}",
-                        impact="Cookies without Secure/HttpOnly are more vulnerable to theft and XSS.",
-                        recommendation="Add Secure and HttpOnly flags to session cookies."
+                        confidence="confirmed",
                     )
                     self._add(f)
                     findings.append(f)
@@ -1049,7 +1061,7 @@ class VulnScanner:
         except Exception as e:
             log(f"  [HEADERS] Error scanning headers: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
 
-        return findings
+        return self._deduplicate(findings)
 
     # ── Clickjacking / Frame Options ─────────────────────────────────────────────
 
@@ -1073,9 +1085,12 @@ class VulnScanner:
                     "Clickjacking Exposure",
                     target,
                     "medium",
-                    "The application does not enforce frame protection headers or CSP frame-ancestors.",
+                    (
+                        "The application does not enforce frame protection headers or "
+                        "CSP frame-ancestors. Add X-Frame-Options or frame-ancestors."
+                    ),
                     f"X-Frame-Options: {x_frame or 'missing'}, CSP: {csp or 'missing'}",
-                    recommendation="Add X-Frame-Options or a restrictive CSP frame-ancestors directive."
+                    confidence="confirmed",
                 )
                 self._add(f)
                 findings.append(f)
@@ -1083,7 +1098,7 @@ class VulnScanner:
         except Exception as e:
             log(f"  [CLICKJACKING] Error scanning target: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
 
-        return findings
+        return self._deduplicate(findings)
 
     # ── HTTP Method Exposure ─────────────────────────────────────────────────────
 
@@ -1107,9 +1122,12 @@ class VulnScanner:
                     "Dangerous HTTP Methods Enabled",
                     target,
                     "medium",
-                    "The server supports non-safe HTTP methods that may increase attack surface.",
+                    (
+                        "The server supports non-safe HTTP methods that may increase attack surface. "
+                        "Disable TRACE, PUT, DELETE, and PATCH if not required."
+                    ),
                     f"Allowed methods: {', '.join(sorted(methods))}",
-                    recommendation="Disable TRACE, PUT, DELETE, PATCH, and other non-essential HTTP methods on the server."
+                    confidence="confirmed",
                 )
                 self._add(f)
                 findings.append(f)
@@ -1117,7 +1135,7 @@ class VulnScanner:
         except Exception as e:
             log(f"  [HTTP METHODS] Error scanning methods: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
 
-        return findings
+        return self._deduplicate(findings)
 
     # ── Insecure Forms ───────────────────────────────────────────────────────────
 
@@ -1137,9 +1155,9 @@ class VulnScanner:
                         "Insecure Form Action",
                         action,
                         "high",
-                        "A POST form submits sensitive data over an insecure HTTP connection.",
-                        f"Form action uses http:// scheme",
-                        recommendation="Use HTTPS for all form submissions, especially those carrying credentials."
+                        "A POST form submits sensitive data over an insecure HTTP connection. Use HTTPS.",
+                        "Form action uses http:// scheme",
+                        confidence="confirmed",
                     )
                     self._add(f)
                     findings.append(f)
@@ -1152,9 +1170,12 @@ class VulnScanner:
                             "Password Form Cross-Origin Submission",
                             action,
                             "high",
-                            "A password field is submitting to a different origin than the target application.",
+                            (
+                                "A password field is submitting to a different origin than the target. "
+                                "Submit credentials only to the same trusted origin."
+                            ),
                             f"Action host: {parsed.netloc}",
-                            recommendation="Submit passwords only to the same trusted origin or enforce an allowlist."
+                            confidence="confirmed",
                         )
                         self._add(f)
                         findings.append(f)
@@ -1163,7 +1184,7 @@ class VulnScanner:
                 log(f"  [FORM] Error analyzing form: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
                 continue
 
-        return findings
+        return self._deduplicate(findings)
 
     # ── Subdomain Takeover Detection ───────────────────────────────────────────
 
@@ -1182,13 +1203,15 @@ class VulnScanner:
                     for signature in TAKEOVER_SIGNATURES:
                         if signature.lower() in body.lower():
                             f = finding(
-                                "Potential Subdomain Takeover",
+                                "Subdomain Takeover",
                                 target_url,
                                 "high",
-                                "A known takeover fingerprint was detected on the subdomain.",
+                                (
+                                    "A known takeover fingerprint was detected on the subdomain. "
+                                    "Remove unused DNS entries or provision the missing service."
+                                ),
                                 f"Signature: {signature}",
-                                impact="Subdomains without active services may be hijacked by attackers.",
-                                recommendation="Remove unused DNS entries or provision the missing service."
+                                confidence="probable",
                             )
                             self._add(f)
                             findings.append(f)
@@ -1200,7 +1223,7 @@ class VulnScanner:
                 log(f"  [TAKEOVER] Error checking {subdomain}: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
                 continue
 
-        return findings
+        return self._deduplicate(findings)
 
     # ── Main scan orchestration ───────────────────────────────────────────────────
 

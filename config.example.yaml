@@ -8,6 +8,15 @@
 # Target to scan
 target: https://example.com
 
+# Optional scope controls (regex). exclude_patterns match the full URL;
+# include_paths restrict scanning to matching paths when set.
+# exclude_patterns:
+#   - "/logout"
+#   - "\\.pdf$"
+# include_paths:
+#   - "^/api/"
+#   - "^/app/"
+
 # Output directory for reports
 output: reports
 

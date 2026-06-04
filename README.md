@@ -1,317 +1,258 @@
 <div align="center">
 
-```
-  ____              ____                   _          
- | __ ) _   _  __ _| __ )  ___  _   _ _ __| |_ _   _ 
- |  _ \| | | |/ _` |  _ \ / _ \| | | | '_ \ __| | | |
- | |_) | |_| | (_| | |_) | (_) | |_| | | | | |_| |_| |
- |____/ \__,_|\__, |____/ \___/ \__,_|_| |_|\__|\__, |
-              |___/                             |___/ 
-```
+# BugBounty Hunter
 
-**Automated vulnerability scanner for bug bounty programs**
+**Automated web reconnaissance and vulnerability scanning for bug bounty programs**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)](README.md)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)](CONTRIBUTING.md)
 
 </div>
 
 ---
 
-> [!WARNING]
-> **Authorised use only.** Only run this tool against targets you have explicit written permission to test. Unauthorised scanning is illegal and unethical. The authors accept no liability for misuse.
+> **Authorized testing only.** Run BugBounty Hunter only against targets you have **explicit written permission** to assess. Unauthorized scanning may violate law and program rules.
 
 ---
 
-## Overview
+## What it does
 
-BugBounty Hunter is a modular, multithreaded web vulnerability scanner built for bug bounty hunters. Point it at a target, and it crawls the attack surface, discovers endpoints and forms, then actively fuzzes for common web vulnerabilities — outputting a clean HTML, JSON, or TXT report.
+BugBounty Hunter is a modular, multithreaded scanner that:
+
+1. **Recon** — crawls the target, discovers URLs, forms, query parameters, and common subdomains.
+2. **Active checks** — fuzzes for XSS, SQLi, LFI, SSRF, open redirects, missing headers, CSRF, exposed files, and more.
+3. **Reporting** — writes HTML, JSON, or plain-text reports with severity summaries and evidence.
+
+Each finding is a structured record with **CVSS metadata**, **confidence** (`confirmed` / `probable` / `tentative`), **fingerprint** (for deduplication), and **timestamp**.
+
+---
+
+## Quick start
 
 ```bash
-python main.py --target https://example.com
+git clone https://github.com/mrch4n725/bugbounty-hunter.git
+cd bugbounty-hunter
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python3 main.py --target https://example.com
 ```
+
+Reports are written to `reports/` by default (override with `--output`).
+
+---
+
+## Installation
+
+| Platform | Prerequisites |
+|----------|----------------|
+| **Linux** | `python3`, `python3-pip`, `git` |
+| **macOS** | `brew install python git` or python.org installer |
+| **Windows** | Python 3.10+ with “Add to PATH”; Git optional but recommended |
+
+Use a **virtual environment** so dependencies stay isolated:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+If `python` is not found, try `python3` or `py` (Windows). On permission errors: `pip install --user -r requirements.txt`.
+
+---
+
+## Usage examples
+
+```bash
+# Full active scan (default modules)
+python3 main.py --target https://example.com
+
+# Passive mode — recon + headers only
+python3 main.py --target https://example.com --passive
+
+# Selected modules
+python3 main.py --target https://example.com --modules xss sqli lfi headers
+
+# Authenticated scan
+python3 main.py --target https://example.com \
+  --cookies "session=abc; csrf=xyz" \
+  --headers "Authorization: Bearer TOKEN" \
+  --threads 20
+
+# YAML config (CLI flags override file values)
+python3 main.py --config config.example.yaml
+
+# JSON report + interim autosave every 60s
+python3 main.py --target https://example.com --format json --autosave-interval 60
+```
+
+Copy `config.example.yaml` to `config.yaml` and edit target, scope, and module settings.
+
+---
+
+## Scan scope
+
+Limit what gets crawled and tested with regex in config or YAML:
+
+| Key | Effect |
+|-----|--------|
+| `exclude_patterns` | List of regexes matched against the **full URL** — matches are skipped |
+| `include_paths` | When set, only URLs whose path/query match at least one regex are tested |
+
+Recon and all active modules respect these rules.
 
 ---
 
 ## Modules
 
-| Module | Technique | Severity |
-|---|---|---|
-| 🔍 **Recon** | Crawler, subdomain brute-force, form/param discovery | — |
-| ⚡ **XSS** | Reflected XSS via URL params and HTML forms | High |
-| 💉 **SQLi** | Error-based + time-based blind injection | Critical |
-| 📁 **LFI** | Path traversal with signature matching | Critical |
-| 🔄 **SSRF** | AWS/GCP metadata, localhost probe | Critical |
-| ↪️ **Open Redirect** | 16 common redirect parameter names | Medium |
-| 🔐 **CSRF** | POST forms lacking anti-CSRF tokens | Medium |
-| 📂 **Directory Fuzzing** | Common admin paths and file locations | Medium |
-| 🕵️ **Sensitive Data** | Leaked secrets or tokens found in page content | High |
-| 🛡️ **Headers** | Missing security headers, CORS and cookie checks | Low–High |
-| 🧷 **Clickjacking** | Missing frame protection / CSP frame-ancestors | Medium |
-| 🧰 **HTTP Methods** | Dangerous methods revealed by Allow/CORS headers | Medium |
-| 🔐 **Insecure Forms** | HTTP form posting or password forms to foreign origins | High |
-| ☁️ **Subdomain Takeover** | Fingerprints of orphaned subdomains / takeover pages | High |
----
+| Module | CLI name | Description |
+|--------|----------|-------------|
+| Recon | `recon` | Crawler, subdomain DNS, robots/sitemap |
+| XSS | `xss` | Reflected XSS (URL params + forms) |
+| SQLi | `sqli` | Error-based, boolean-based, time-based blind |
+| LFI | `lfi` | Path traversal / local file inclusion |
+| SSRF | `ssrf` | Internal/metadata URL probes |
+| Open redirect | `open_redirect` | Redirect parameter abuse |
+| Headers | `headers` | Missing security headers, disclosure, CORS, cookies |
+| CSRF | `csrf` | POST forms without anti-CSRF tokens |
+| Directory fuzz | `dirb` | Common paths and optional wordlist |
+| Sensitive data | `sensitive` | Secret patterns in page bodies |
+| Exposed files | `exposed_files` | `.env`, `.git`, backups, etc. |
+| Clickjacking | `clickjacking` | Missing frame protection |
+| HTTP methods | `http_methods` | Dangerous `Allow` / CORS methods |
+| Insecure forms | `insecure_forms` | HTTP actions, cross-origin password posts |
+| Subdomain takeover | `subdomain_takeover` | Dangling SaaS fingerprints |
 
-## Installation
-
-**Requirements:** Python 3.10+
-
-### Windows
-
-**1. Install Python** (if not already installed) — download from [python.org](https://www.python.org/downloads/windows/) and check **"Add Python to PATH"** during setup.
-
-**2. Install Git** — download from [git-scm.com](https://git-scm.com/download/win) (Git Bash is included and recommended).
-
-**3. Clone and install-However, I reccomend virtual enviroment first** — open **Command Prompt**, **PowerShell**, **Git Bash** or **Terminal**:
-
-```cmd
-git clone https://github.com/mrch4n725/bugbounty-hunter.git
-cd bugbounty-hunter
-python -m pip install -r requirements.txt
-```
-### Specific Branch Installation
-```cmd
-git clone -b installer-tools --single-branch https://github.com/mrch4n725/bugbounty-hunter.git
-cd bugbounty-hunter
-python -m pip install -r requirements.txt
-```
-* This specific Branch installation is for users struggling to navigate the git clone. Use this command to clone the branch, then it will be easier to run the software. ! UPDATE: No longer second branch, if in future specific branch created then use this !
-
-> **Tip:** If (on linux or cloning main branch without manual files) you receive: `ERROR: Could not open requirements file: [Errno 2] No such file or directory: 'requirements.txt'` You probably use correct file or cloned the wrong directory.
- 
-> **Tip:** If `python` isn't recognised, try `py` or `python3` instead (the Python Launcher for Windows).
-
-> **Tip:** If you hit permission errors with pip, add `--user` flag: `pip install --user -r requirements.txt`
-
-### macOS
-
-**1. Install Python** via [Homebrew](https://brew.sh) (recommended) or [python.org](https://python.org):
-
-```bash
-brew install python git
-```
-
-**2. Clone and install:**
-
-```bash
-git clone https://github.com/mrch4n725/bugbounty-hunter.git
-cd bugbounty-hunter
-pip3 install -r requirements.txt
-```
-
-### Linux
-
-```bash
-sudo apt install python3 python3-pip git   # Debian/Ubuntu
-# or
-sudo dnf install python3 python3-pip git   # Fedora/RHEL
-
-git clone https://github.com/mrch4n725/bugbounty-hunter.git
-cd bugbounty-hunter
-pip3 install -r requirements.txt
-```
-
-### Virtual environment (all platforms, recommended)
-
-Keeps dependencies isolated from your system Python:
-
-```bash
-# Create and activate
-python -m venv .venv
-
-# Windows (Command Prompt)
-venv\Scripts\activate.bat
-
-# Windows (PowerShell)
-venv\Scripts\Activate.ps1
-
-# macOS / Linux
-source .venv/bin/activate
-
-# Install
-pip install -r requirements.txt
-```
+Use `--modules all` (default) or list modules explicitly. Disable with `--disable-modules sqli sensitive`.
 
 ---
 
-## Usage
-
-### Windows (Command Prompt / PowerShell)
-
-```cmd
-# Full scan
-python3 main.py --target https://example.com
-
-# Passive mode
-python3 main.py --target https://example.com --passive
-
-# Specific modules
-python3 main.py --target https://example.com --modules xss sqli lfi
-
-# Authenticated scan (note: use double quotes on Windows)
-python3 main.py --target https://example.com --cookies "session=abc123; csrf=xyz" --headers "Authorization: Bearer <token>" --format json --threads 20
-
-# Basic auth / proxy scan
-python3 main.py --target https://example.com --auth user:pass --proxy http://127.0.0.1:8080 --format json
-
-# Deep crawl with verbose output
-python3 main.py --target https://example.com --crawl-depth 4 --verbose
-
-# Customize module behavior and parameters
-python3 main.py --target https://example.com --modules all --disable-modules sqli --module-param csrf.token_names=csrfmiddlewaretoken,_token --module-param dirb.max_paths=50
-``` 
-
-### macOS / Linux
-
-```bash
-# Full scan with HTML report (default)
-python3 main.py --target https://example.com
-
-# Passive mode — recon and headers only, no active fuzzing
-python3 main.py --target https://example.com --passive
-
-# Run specific modules
-python3 main.py --target https://example.com --modules xss sqli lfi
-
-# Authenticated scan with cookies and custom headers
-python3 main.py \
-  --target https://example.com \
-  --cookies "session=abc123; csrf=xyz" \
-  --headers "Authorization: Bearer <token>" \
-  --format json \
-  --threads 20
-
-# Basic auth / proxy scan
-python3 main.py \
-  --target https://example.com \
-  --auth user:pass \
-  --proxy http://127.0.0.1:8080 \
-  --format json
-
-# Deep crawl with verbose output
-python3 main.py --target https://example.com --crawl-depth 4 --verbose
-
-# Autosave interim results every minute
-python3 main.py --target https://example.com --autosave-interval 60
-```
-
----
-
-## CLI Reference
+## CLI reference
 
 | Flag | Default | Description |
-|---|---|---|
-| `--target` / `-t` | *required* | Target URL |
-| `--modules` / `-m` | `all` | Space-separated list: `recon xss sqli lfi ssrf open_redirect csrf dirb sensitive headers clickjacking http_methods insecure_forms subdomain_takeover all` |
-| `--output` / `-o` | `reports/` | Output directory |
-| `--format` / `-f` | `html` | Report format: `html` · `json` · `txt` |
-| `--threads` | `10` | Concurrent threads |
-| `--timeout` | `10` | Per-request timeout (seconds) |
-| `--cookies` / `-c` | — | Cookie string e.g. `"session=x; token=y"` |
-| `--headers` / `-H` | — | Custom header e.g. `"Authorization: Bearer ..."` (repeatable) |
-| `--auth` | — | Basic auth credentials `username:password` |
-| `--proxy` | — | Proxy URL for outgoing requests |
-| `--no-verify-ssl` | off | Disable SSL certificate verification |
-| `--crawl-depth` | `2` | Crawler recursion depth |
-| `--max-urls` | `200` | Maximum number of URLs to discover during crawl |
-| `--delay` | `0.0` | Delay between requests in seconds |
-| `--wordlist` | — | Optional directory fuzzing wordlist path |
-| `--disable-modules` | — | Disable specific modules when running all scans |
-| `--module-param` | — | Override module settings using `module.key=value` syntax |
-| `--retries` | `3` | HTTP retry attempts for transient failures |
-| `--autosave-interval` | `0` | Autosave interim report every N seconds |
-| `--passive` | off | Passive mode — no active fuzzing |
-| `--verbose` / `-v` | off | Print each request and finding as they occur |
+|------|---------|-------------|
+| `--target` / `-t` | — | Target URL (required unless set in config) |
+| `--config` / `-C` | — | YAML configuration file |
+| `--modules` / `-m` | `all` | Modules to run (see table above) |
+| `--disable-modules` | — | Modules to skip when running `all` |
+| `--output` / `-o` | `reports` | Report output directory |
+| `--format` / `-f` | `html` | `html`, `json`, or `txt` |
+| `--threads` | `10` | Worker threads |
+| `--timeout` | `10` | Request timeout (seconds) |
+| `--crawl-depth` | `2` | Recon crawl depth |
+| `--max-urls` | `200` | Max URLs to collect |
+| `--delay` | `0` | Delay between requests (seconds) |
+| `--cookies` / `-c` | — | Cookie header string |
+| `--headers` / `-H` | — | Custom header (repeatable) |
+| `--auth` | — | Basic auth `user:pass` |
+| `--proxy` | — | HTTP(S) proxy URL |
+| `--no-verify-ssl` | off | Disable TLS verification |
+| `--wordlist` | — | Extra paths for directory fuzzing |
+| `--module-param` | — | `module.key=value` overrides |
+| `--retries` | `3` | HTTP retry count |
+| `--autosave-interval` | `0` | Autosave partial report every N seconds |
+| `--passive` | off | No active fuzzing |
+| `--verbose` / `-v` | off | Per-request / per-finding logs |
+
+---
+
+## Finding format
+
+Findings are produced by `finding()` in `modules/utils.py`:
+
+```python
+{
+  "type": "Reflected XSS",
+  "url": "https://example.com/?q=...",
+  "severity": "high",           # critical | high | medium | low | info
+  "details": "...",
+  "evidence": "...",
+  "confidence": "confirmed",    # confirmed | probable | tentative
+  "fingerprint": "<sha256>",
+  "timestamp": "2026-06-04T12:00:00Z",
+  "cvss_score": 6.1,
+  "cvss_vector": "CVSS:3.1/...",
+  "what_is_it": "...",
+  "impact": "...",
+  "remediation": "...",
+  "references": ["https://owasp.org/..."],
+  "grouped_urls": ["..."]       # present when 5+ similar hits collapsed
+}
+```
+
+The scanner deduplicates by **fingerprint** (same issue across modules) and can **group** five or more hits on the same parameter into one finding with `grouped_urls`.
 
 ---
 
 ## Reports
 
-Reports are saved to `reports/` (configurable via `--output`).
+| Format | Contents |
+|--------|----------|
+| **HTML** | Dark-themed dashboard, severity summary, findings with evidence |
+| **JSON** | Machine-readable full scan payload |
+| **TXT** | Plain-text summary for terminals and CI |
 
-If `--autosave-interval` is enabled, interim partial reports are written to the same output folder using the filename suffix `.partial`.
-
-The **HTML report** includes a dark-themed dashboard with:
-- Severity summary cards (Critical / High / Medium / Low)
-- Full findings table with URLs and evidence
-- Discovered subdomains and URLs from recon
+Interim reports use the `.partial` suffix when `--autosave-interval` is set.
 
 **Exit codes**
 
 | Code | Meaning |
-|---|---|
-| `0` | Scan complete — no critical or high findings |
-| `1` | One or more critical or high findings detected |
+|------|---------|
+| `0` | Scan finished; no critical or high findings |
+| `1` | One or more critical or high findings |
 
 ---
 
-## Project Structure
+## Project layout
 
 ```
 bugbounty-hunter/
-├── main.py              # CLI entry point & orchestration
-├── requirements.txt     # Python dependencies
+├── main.py                 # CLI and orchestration
+├── config.example.yaml     # Sample YAML configuration
+├── requirements.txt
 ├── modules/
-│   ├── recon.py         # Multithreaded crawler + subdomain enumeration
-│   ├── scanner.py       # All active vulnerability checks
-│   ├── reporter.py      # HTML / JSON / TXT report generation
-│   └── utils.py         # Shared helpers, session factory, finding() dict
-└── reports/             # Generated reports (gitignored)
+│   ├── utils.py            # HTTP helpers, finding(), logging, scope
+│   ├── recon.py            # Crawler and subdomain discovery
+│   ├── scanner.py          # Vulnerability checks
+│   └── reporter.py         # Report generation
+└── reports/                # Output (gitignored)
 ```
 
 ---
 
 ## Extending
 
-Adding a new vulnerability module takes three steps:
+1. Add `scan_mycheck(self) -> list[dict]` on `VulnScanner` in `modules/scanner.py`.
+2. Return findings via `finding(...)` and end with `return self._deduplicate(findings)`.
+3. Register the module in `main.py` (`parse_args` choices + `active_modules` dict).
+4. Optionally add metadata in `VULN_METADATA` inside `modules/utils.py`.
 
-**1.** Add a method to `VulnScanner` in `modules/scanner.py`:
-
-```python
-def scan_mycheck(self) -> list[dict]:
-    findings = []
-    for url in self._urls_with_params():
-        # ... test logic ...
-        findings.append(finding("My Check", url, "high", "Details here", "evidence"))
-    return findings
-```
-
-**2.** Register it in `main.py`:
-
-```python
-# In parse_args choices list:
-choices=["recon", "xss", "sqli", ..., "mycheck", "all"]
-
-# In the active_modules dict:
-"mycheck": scanner.scan_mycheck,
-```
-
-Use the `finding()` helper from `utils.py` to return standardised dicts with consistent severity levels: `critical · high · medium · low · info`.
+Respect `_in_scope()` in every URL loop and use `_add()` so fingerprint deduplication applies.
 
 ---
 
 ## Dependencies
 
-| Package | Purpose |
-|---|---|
+| Package | Role |
+|---------|------|
 | `requests` | HTTP client |
-| `beautifulsoup4` | HTML parsing for crawler and form extraction |
-| `lxml` | Fast HTML parser backend |
-| `urllib3` | Connection pooling |
+| `beautifulsoup4` | HTML parsing |
+| `lxml` | Parser backend |
+| `PyYAML` | Config files |
+| `rich` | Terminal UI (progress, tables, colored logs) |
+| `urllib3` | Retries and connection pooling |
 
 ---
 
 ## Disclaimer
 
-This tool is provided for **educational purposes and authorised security testing only**. Always obtain written permission before scanning any target. The authors and contributors accept no responsibility or liability for any damage or legal consequences caused by misuse of this software.
+This software is for **education and authorized security testing** only. Obtain written permission before scanning any system. Authors and contributors are not liable for misuse or damages.
 
 ---
 
 <div align="center">
 
-Made for the bug bounty community · Use responsibly
+Built for the bug bounty community · Use responsibly
 
 </div>
