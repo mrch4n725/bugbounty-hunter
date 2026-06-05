@@ -602,7 +602,7 @@ class VulnScanner:
             stage = f.get("verification_stage", "").lower()
 
             # Dangerous patterns: SQLi OOB confirmed + critical severity
-            if "sqli" in vuln_type and stage in ("exploitable", "verified") and "oob" in f.get("evidence", "").lower():
+            if "sql" in vuln_type and stage in ("exploitable", "verified") and "oob" in f.get("evidence", "").lower():
                 f["title"] = f["title"] + " — Identified: exploitation withheld pending human review"
                 f["details"] = f["details"] + " | ⚠ This finding was confirmed via OOB. Further exploitation (data extraction, writes) withheld pending human review per self-halting policy."
                 f["impact"] = "CRITICAL: SQL injection confirmed with out-of-band data exfiltration capability. Automated exploitation withheld — requires manual review."
