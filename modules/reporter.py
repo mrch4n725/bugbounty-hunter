@@ -366,301 +366,381 @@ class Reporter:
     
     def _create_html_report(self) -> str:
         """
-        Generate HTML report with dark theme.
-        
-        Returns:
-            str: HTML report content
+        Generate HTML report with Chart.js donut chart, filter buttons,
+        collapsible finding cards, dark/light toggle, and JS intelligence section.
         """
         sorted_findings = self._sort_findings()
         severity_counts = self._get_severity_counts()
-        confirm_counts = self._get_confirmed_counts()
         confidence_breakdown = self._get_confidence_breakdown()
         verification_breakdown = self._get_verification_breakdown()
         subdomains = self.recon_data.get('subdomains', [])
         urls = self.recon_data.get('urls', [])
-        
-        findings_table = self._create_findings_table_html(sorted_findings)
+        js_endpoints = self.recon_data.get('js_endpoints', [])
+        js_urls = self.recon_data.get('js_urls', [])
+
         config_section = self._create_config_section_html()
         subdomains_section = self._create_subdomains_section_html(subdomains)
         urls_section = self._create_urls_section_html(urls)
-        
+        js_section = self._create_js_section_html(js_endpoints, js_urls)
+
+        total = sum(severity_counts.values())
+        cards_html = self._build_stat_cards_html(severity_counts, verification_breakdown)
+        findings_cards = self._build_finding_cards_html(sorted_findings)
+
+        sev_json = json.dumps(severity_counts)
+        ver_json = json.dumps(verification_breakdown)
+
         html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Bug Bounty Report - {self.target}</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        :root {{
+            --bg: #0f0f0f;
+            --surface: #1e1e1e;
+            --surface2: #2a2a2a;
+            --text: #e0e0e0;
+            --text2: #999;
+            --border: #333;
+            --critical: #e74c3c;
+            --high: #e67e22;
+            --medium: #f1c40f;
+            --low: #3498db;
+            --info: #95a5a6;
+            --confirmed: #2ecc71;
         }}
-        
+        .light {{
+            --bg: #f5f5f5;
+            --surface: #ffffff;
+            --surface2: #f0f0f0;
+            --text: #222;
+            --text2: #666;
+            --border: #ddd;
+        }}
         body {{
-            background-color: #1a1a1a;
-            color: #e0e0e0;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Segoe UI', system-ui, sans-serif;
             line-height: 1.6;
             padding: 20px;
+            transition: background .3s, color .3s;
         }}
-        
-        .container {{
-            max-width: 1200px;
-            margin: 0 auto;
+        .container {{ max-width: 1200px; margin: 0 auto; }}
+        header {{ text-align: center; margin-bottom: 40px; border-bottom: 2px solid var(--border); padding-bottom: 20px; }}
+        header h1 {{ font-size: 2.2em; color: var(--text); }}
+        .timestamp {{ color: var(--text2); font-size: .9em; }}
+
+        .top-bar {{ display: flex; justify-content: flex-end; gap: 10px; margin-bottom: 20px; }}
+        .theme-btn {{
+            background: var(--surface2); color: var(--text); border: 1px solid var(--border);
+            padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: .85em;
         }}
-        
-        header {{
-            text-align: center;
-            margin-bottom: 40px;
-            border-bottom: 2px solid #333;
-            padding-bottom: 20px;
+        .theme-btn:hover {{ opacity: .8; }}
+
+        .summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; margin-bottom: 40px; }}
+        .stat-card {{
+            background: var(--surface); border-radius: 8px; padding: 16px; text-align: center;
+            box-shadow: 0 2px 8px rgba(0,0,0,.2); border-top: 4px solid var(--border);
         }}
-        
-        h1 {{
-            font-size: 2.5em;
-            margin-bottom: 10px;
-            color: #fff;
+        .stat-card .val {{ font-size: 2em; font-weight: 700; }}
+        .stat-card .lbl {{ font-size: .8em; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; }}
+        .stat-card.crit {{ border-top-color: var(--critical); }} .stat-card.crit .val {{ color: var(--critical); }}
+        .stat-card.high {{ border-top-color: var(--high); }} .stat-card.high .val {{ color: var(--high); }}
+        .stat-card.med {{ border-top-color: var(--medium); }} .stat-card.med .val {{ color: var(--medium); }}
+        .stat-card.low {{ border-top-color: var(--low); }} .stat-card.low .val {{ color: var(--low); }}
+        .stat-card.info {{ border-top-color: var(--info); }} .stat-card.info .val {{ color: var(--info); }}
+        .stat-card.conf {{ border-top-color: var(--confirmed); }} .stat-card.conf .val {{ color: var(--confirmed); }}
+        .stat-card.exploit {{ border-top-color: #9b59b6; }} .stat-card.exploit .val {{ color: #9b59b6; }}
+        .stat-card.detect {{ border-top-color: #e74c3c; }} .stat-card.detect .val {{ color: #e74c3c; }}
+        .stat-card.valid {{ border-top-color: #f39c12; }} .stat-card.valid .val {{ color: #f39c12; }}
+
+        .chart-row {{ display: flex; gap: 20px; margin-bottom: 40px; flex-wrap: wrap; }}
+        .chart-box {{
+            background: var(--surface); border-radius: 8px; padding: 20px; flex: 1; min-width: 280px;
+            box-shadow: 0 2px 8px rgba(0,0,0,.2); position: relative; height: 300px;
         }}
-        
-        .timestamp {{
-            color: #999;
-            font-size: 0.9em;
+        .chart-box canvas {{ max-height: 240px; }}
+
+        section {{ margin-bottom: 40px; background: var(--surface); padding: 24px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.2); }}
+        section h2 {{ font-size: 1.5em; margin-bottom: 16px; border-bottom: 2px solid var(--border); padding-bottom: 8px; }}
+
+        .filters {{ display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }}
+        .filter-btn {{
+            background: var(--surface2); color: var(--text2); border: 1px solid var(--border);
+            padding: 6px 14px; border-radius: 20px; cursor: pointer; font-size: .8em; transition: all .2s;
         }}
-        
-        .summary {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin-bottom: 40px;
+        .filter-btn:hover {{ opacity: .8; }}
+        .filter-btn.active {{ background: var(--border); color: var(--text); border-color: var(--text2); }}
+
+        .finding-card {{
+            background: var(--surface2); border-radius: 6px; margin-bottom: 12px;
+            border-left: 4px solid var(--border); overflow: hidden;
         }}
-        
-        .card {{
-            background: #2a2a2a;
-            border-left: 5px solid;
-            padding: 20px;
-            border-radius: 4px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        .finding-card.critical {{ border-left-color: var(--critical); }}
+        .finding-card.high {{ border-left-color: var(--high); }}
+        .finding-card.medium {{ border-left-color: var(--medium); }}
+        .finding-card.low {{ border-left-color: var(--low); }}
+        .finding-card.info {{ border-left-color: var(--info); }}
+
+        .finding-header {{
+            padding: 14px 16px; cursor: pointer; display: flex; align-items: center;
+            justify-content: space-between; flex-wrap: wrap; gap: 8px;
         }}
-        
-        .card.critical {{
-            border-left-color: {self.SEVERITY_COLORS['critical']};
+        .finding-header:hover {{ background: rgba(255,255,255,.03); }}
+        .finding-title {{ font-weight: 600; font-size: .95em; flex: 1; min-width: 160px; }}
+        .finding-meta {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
+        .sev-badge {{
+            display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: .75em;
+            font-weight: 700; text-transform: uppercase;
         }}
-        
-        .card.high {{
-            border-left-color: {self.SEVERITY_COLORS['high']};
+        .sev-critical {{ background: var(--critical); color: #fff; }}
+        .sev-high {{ background: var(--high); color: #fff; }}
+        .sev-medium {{ background: var(--medium); color: #000; }}
+        .sev-low {{ background: var(--low); color: #fff; }}
+        .sev-info {{ background: var(--info); color: #fff; }}
+        .conf-badge {{ padding: 2px 8px; border-radius: 10px; font-size: .75em; font-weight: 600; }}
+        .conf-high {{ background: #2ecc71; color: #fff; }}
+        .conf-mid {{ background: #f39c12; color: #000; }}
+        .conf-low {{ background: #e74c3c; color: #fff; }}
+        .stage-badge {{ padding: 2px 8px; border-radius: 10px; font-size: .75em; color: var(--text2); border: 1px solid var(--border); }}
+
+        .finding-body {{ padding: 0 16px 16px; display: none; }}
+        .finding-card.open .finding-body {{ display: block; }}
+        .finding-body .row {{ margin-bottom: 8px; font-size: .88em; }}
+        .finding-body .row strong {{ color: var(--text2); min-width: 90px; display: inline-block; }}
+        .finding-body .url {{ font-family: 'Courier New', monospace; word-break: break-all; font-size: .85em; }}
+        .finding-body .evidence {{ background: var(--bg); padding: 8px 12px; border-radius: 4px; font-family: 'Courier New', monospace; font-size: .82em; word-break: break-all; margin-top: 4px; }}
+        .finding-body .steps {{ margin: 4px 0; padding-left: 16px; }}
+        .finding-body .steps li {{ margin-bottom: 4px; font-size: .85em; }}
+        .copy-btn {{
+            background: var(--surface); color: var(--text2); border: 1px solid var(--border);
+            padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: .78em;
         }}
-        
-        .card.medium {{
-            border-left-color: {self.SEVERITY_COLORS['medium']};
-        }}
-        
-        .card.low {{
-            border-left-color: {self.SEVERITY_COLORS['low']};
-        }}
-        
-        .card.info {{
-            border-left-color: {self.SEVERITY_COLORS['info']};
-        }}
-        
-        .card-value {{
-            font-size: 2.5em;
-            font-weight: bold;
-            margin: 10px 0;
-        }}
-        
-        .card-label {{
-            font-size: 0.9em;
-            color: #999;
-            text-transform: uppercase;
-        }}
-        
-        section {{
-            margin-bottom: 40px;
-            background: #2a2a2a;
-            padding: 20px;
-            border-radius: 4px;
-        }}
-        
-        section h2 {{
-            font-size: 1.8em;
-            margin-bottom: 20px;
-            border-bottom: 2px solid #444;
-            padding-bottom: 10px;
-            color: #fff;
-        }}
-        
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 15px;
-        }}
-        
-        table thead {{
-            background-color: #333;
-        }}
-        
-        table th {{
-            padding: 12px;
-            text-align: left;
-            font-weight: bold;
-            border-bottom: 2px solid #444;
-        }}
-        
-        table td {{
-            padding: 12px;
-            border-bottom: 1px solid #444;
-        }}
-        
-        table tr:hover {{
-            background-color: #333;
-        }}
-        
-        .severity-badge {{
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 3px;
-            font-weight: bold;
-            font-size: 0.85em;
-            text-transform: uppercase;
-        }}
-        
-        .severity-critical {{
-            background-color: {self.SEVERITY_COLORS['critical']};
-            color: white;
-        }}
-        
-        .severity-high {{
-            background-color: {self.SEVERITY_COLORS['high']};
-            color: white;
-        }}
-        
-        .severity-medium {{
-            background-color: {self.SEVERITY_COLORS['medium']};
-            color: black;
-        }}
-        
-        .severity-low {{
-            background-color: {self.SEVERITY_COLORS['low']};
-            color: white;
-        }}
-        
-        .severity-info {{
-            background-color: {self.SEVERITY_COLORS['info']};
-            color: white;
-        }}
-        
-        .detail-text {{
-            font-size: 0.9em;
-            color: #ccc;
-            word-break: break-word;
-        }}
-        
-        .url {{
-            font-family: 'Courier New', monospace;
-            background-color: #1a1a1a;
-            padding: 4px 8px;
-            border-radius: 3px;
-            font-size: 0.85em;
-        }}
-        
-        .empty-message {{
-            color: #999;
-            font-style: italic;
-            padding: 20px;
-            text-align: center;
-        }}
-        
-        ul {{
-            margin-left: 20px;
-        }}
-        
-        li {{
-            margin-bottom: 8px;
-            color: #ccc;
-        }}
-        
-        footer {{
-            text-align: center;
-            margin-top: 40px;
-            padding-top: 20px;
-            border-top: 2px solid #333;
-            color: #999;
-            font-size: 0.85em;
+        .copy-btn:hover {{ background: var(--border); }}
+
+        .recon-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; }}
+        .recon-grid .url {{ display: block; padding: 6px 10px; background: var(--surface2); border-radius: 4px; font-size: .82em; word-break: break-all; }}
+
+        footer {{ text-align: center; margin-top: 40px; padding-top: 20px; border-top: 2px solid var(--border); color: var(--text2); font-size: .85em; }}
+        .empty-message {{ color: var(--text2); font-style: italic; padding: 20px; text-align: center; }}
+
+        @media (max-width: 600px) {{
+            .summary {{ grid-template-columns: repeat(2, 1fr); }}
+            .finding-header {{ flex-direction: column; align-items: flex-start; }}
         }}
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>🔐 Bug Bounty Report</h1>
+            <h1>Bug Bounty Report</h1>
             <p class="timestamp">Target: <strong>{self.target}</strong> | Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         </header>
-        
+
+        <div class="top-bar">
+            <button class="theme-btn" onclick="toggleTheme()">Toggle Theme</button>
+        </div>
+
         <section class="summary">
-            <div class="card critical">
-                <div class="card-label">Critical</div>
-                <div class="card-value">{severity_counts['critical']}</div>
-            </div>
-            <div class="card high">
-                <div class="card-label">High</div>
-                <div class="card-value">{severity_counts['high']}</div>
-            </div>
-            <div class="card medium">
-                <div class="card-label">Medium</div>
-                <div class="card-value">{severity_counts['medium']}</div>
-            </div>
-            <div class="card low">
-                <div class="card-label">Low</div>
-                <div class="card-value">{severity_counts['low']}</div>
-            </div>
-            <div class="card info">
-                <div class="card-label">Info</div>
-                <div class="card-value">{severity_counts['info']}</div>
-            </div>
-            <div class="card" style="background:#2a2a2a;border-left:5px solid #2ecc71;padding:20px;border-radius:4px">
-                <div class="card-label">Confirmed</div>
-                <div class="card-value">{confirm_counts['confirmed']}</div>
-            </div>
-            <div class="card" style="background:#2a2a2a;border-left:5px solid #e74c3c;padding:20px;border-radius:4px">
-                <div class="card-label">Unconfirmed</div>
-                <div class="card-value">{confirm_counts['unconfirmed']}</div>
-            </div>
-            <div class="card" style="background:#2a2a2a;border-left:5px solid #2ecc71;padding:20px;border-radius:4px">
-                <div class="card-label">Confirmed</div>
-                <div class="card-value">{confidence_breakdown['confirmed']}</div>
-            </div>
-            <div class="card" style="background:#2a2a2a;border-left:5px solid #f39c12;padding:20px;border-radius:4px">
-                <div class="card-label">Validated</div>
-                <div class="card-value">{verification_breakdown['validated']}</div>
-            </div>
-            <div class="card" style="background:#2a2a2a;border-left:5px solid #e74c3c;padding:20px;border-radius:4px">
-                <div class="card-label">Detected</div>
-                <div class="card-value">{verification_breakdown['detected']}</div>
-            </div>
-            <div class="card" style="background:#2a2a2a;border-left:5px solid #9b59b6;padding:20px;border-radius:4px">
-                <div class="card-label">Exploitable</div>
-                <div class="card-value">{verification_breakdown['exploitable']}</div>
-            </div>
+            {cards_html}
         </section>
-        
+
+        <div class="chart-row">
+            <div class="chart-box">
+                <canvas id="sevChart"></canvas>
+            </div>
+            <div class="chart-box">
+                <canvas id="verChart"></canvas>
+            </div>
+        </div>
+
         {config_section}
+
         <section>
-            <h2>Vulnerability Findings</h2>
-            {findings_table}
+            <h2>Findings <span style="font-size:.6em;color:var(--text2)">({total})</span></h2>
+            <div class="filters" id="filters">
+                <button class="filter-btn active" data-filter="all">All</button>
+                <button class="filter-btn" data-filter="critical">Critical</button>
+                <button class="filter-btn" data-filter="high">High</button>
+                <button class="filter-btn" data-filter="medium">Medium</button>
+                <button class="filter-btn" data-filter="low">Low</button>
+                <button class="filter-btn" data-filter="info">Info</button>
+                <button class="filter-btn" data-filter="exploitable">Exploitable</button>
+                <button class="filter-btn" data-filter="validated">Validated</button>
+                <button class="filter-btn" data-filter="detected">Detected</button>
+            </div>
+            <div id="findingsContainer">
+                {findings_cards if sorted_findings else '<div class="empty-message">No vulnerabilities found.</div>'}
+            </div>
         </section>
-        
+
         {subdomains_section}
         {urls_section}
-        
+        {js_section}
+
         <footer>
-            <p>This report was generated by BugBounty Hunter</p>
+            <p>Generated by BugBounty Hunter — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         </footer>
     </div>
+
+    <script>
+        var sevData = {sev_json};
+        var verData = {ver_json};
+
+        var sevCtx = document.getElementById('sevChart').getContext('2d');
+        new Chart(sevCtx, {{
+            type: 'doughnut',
+            data: {{
+                labels: Object.keys(sevData).filter(k => sevData[k] > 0).map(k => k.charAt(0).toUpperCase() + k.slice(1)),
+                datasets: [{{
+                    data: Object.values(sevData).filter(v => v > 0),
+                    backgroundColor: ['#e74c3c','#e67e22','#f1c40f','#3498db','#95a5a6'],
+                    borderWidth: 0
+                }}]
+            }},
+            options: {{
+                responsive: true, maintainAspectRatio: false,
+                plugins: {{ legend: {{ position: 'right', labels: {{ color: '#999' }} }} }}
+            }}
+        }});
+
+        var verCtx = document.getElementById('verChart').getContext('2d');
+        new Chart(verCtx, {{
+            type: 'doughnut',
+            data: {{
+                labels: Object.keys(verData).filter(k => verData[k] > 0).map(k => k.charAt(0).toUpperCase() + k.slice(1)),
+                datasets: [{{
+                    data: Object.values(verData).filter(v => v > 0),
+                    backgroundColor: ['#e74c3c','#f39c12','#2ecc71','#9b59b6'],
+                    borderWidth: 0
+                }}]
+            }},
+            options: {{
+                responsive: true, maintainAspectRatio: false,
+                plugins: {{ legend: {{ position: 'right', labels: {{ color: '#999' }} }} }}
+            }}
+        }});
+
+        // Filter buttons
+        document.querySelectorAll('.filter-btn').forEach(btn => {{
+            btn.addEventListener('click', function() {{
+                document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+                this.classList.add('active');
+                var filter = this.dataset.filter;
+                document.querySelectorAll('.finding-card').forEach(card => {{
+                    if (filter === 'all') {{ card.style.display = ''; return; }}
+                    var show = card.dataset.severity === filter || card.dataset.stage === filter;
+                    card.style.display = show ? '' : 'none';
+                }});
+            }});
+        }});
+
+        // Collapsible cards
+        document.querySelectorAll('.finding-header').forEach(hdr => {{
+            hdr.addEventListener('click', function() {{
+                this.parentElement.classList.toggle('open');
+            }});
+        }});
+
+        // Theme toggle
+        function toggleTheme() {{
+            document.body.classList.toggle('light');
+        }}
+
+        // Copy URL
+        function copyUrl(url) {{
+            navigator.clipboard.writeText(url).then(() => {{
+                var btn = event.target;
+                var orig = btn.textContent;
+                btn.textContent = 'Copied!';
+                setTimeout(() => btn.textContent = orig, 1200);
+            }});
+        }}
+    </script>
 </body>
 </html>"""
-        
         return html_content
+
+    def _build_stat_cards_html(self, sev: Dict[str, int], ver: Dict[str, int]) -> str:
+        cards = ""
+        sev_map = [("crit", "critical", "Critical"), ("high", "high", "High"), ("med", "medium", "Medium"),
+                   ("low", "low", "Low"), ("info", "info", "Info")]
+        for cls, key, label in sev_map:
+            cards += f'<div class="stat-card {cls}"><div class="val">{sev.get(key, 0)}</div><div class="lbl">{label}</div></div>'
+        cards += f'<div class="stat-card conf"><div class="val">{ver.get("exploitable", 0)}</div><div class="lbl">Exploitable</div></div>'
+        cards += f'<div class="stat-card valid"><div class="val">{ver.get("validated", 0)}</div><div class="lbl">Validated</div></div>'
+        cards += f'<div class="stat-card detect"><div class="val">{ver.get("detected", 0)}</div><div class="lbl">Detected</div></div>'
+        return cards
+
+    def _build_finding_cards_html(self, findings: List[Dict[str, Any]]) -> str:
+        if not findings:
+            return '<div class="empty-message">No vulnerabilities found.</div>'
+        html = ""
+        for f in findings:
+            sev = f.get("severity", "info").lower()
+            stage = f.get("verification_stage", "detected").lower()
+            score = f.get("confidence_score", 0)
+            evidence = f.get("evidence", "")
+            details = f.get("details", "")
+            vuln_url = f.get("url", "")
+            fpr = f.get("false_positive_risk", "")
+            cvss = f.get("cvss_score", "")
+            steps = f.get("validation_steps", [])
+
+            sev_class = {"critical": "critical", "high": "high", "medium": "medium", "low": "low", "info": "info"}.get(sev, "info")
+            conf_class = "high" if score >= 61 else ("mid" if score >= 31 else "low")
+            stage_label = stage.title()
+
+            steps_html = ""
+            if steps:
+                items = "".join(f"<li>{s}</li>" for s in steps[:5])
+                steps_html = f'<div class="row"><strong>Steps:</strong><ol class="steps">{items}</ol></div>'
+
+            evidence_html = ""
+            if evidence:
+                evidence_html = f'<div class="row"><strong>Evidence:</strong><div class="evidence">{evidence[:300]}</div></div>'
+
+            cvss_html = f'<span>CVSS: {cvss:.1f}</span>' if isinstance(cvss, (int, float)) else ""
+
+            html += f'''<div class="finding-card {sev_class}" data-severity="{sev}" data-stage="{stage}">
+                <div class="finding-header">
+                    <div class="finding-title">{f.get("title", "Finding")}</div>
+                    <div class="finding-meta">
+                        <span class="sev-badge sev-{sev_class}">{sev.upper()}</span>
+                        <span class="conf-badge conf-{conf_class}">{score:.0f}%</span>
+                        <span class="stage-badge">{stage_label}</span>
+                    </div>
+                </div>
+                <div class="finding-body">
+                    <div class="row"><strong>URL:</strong> <span class="url">{vuln_url}</span> <button class="copy-btn" onclick="copyUrl('{vuln_url.replace("'", "\\'")}')">Copy URL</button></div>
+                    <div class="row"><strong>Details:</strong> {details}</div>
+                    {evidence_html}
+                    {steps_html}
+                    <div class="row"><strong>FP Risk:</strong> {fpr.title() if fpr else "—"} {cvss_html}</div>
+                </div>
+            </div>'''
+        return html
+
+    def _create_js_section_html(self, js_endpoints: List[str], js_urls: List[str]) -> str:
+        if not js_endpoints and not js_urls:
+            return ""
+        html = '<section><h2>JavaScript Intelligence</h2>'
+        if js_urls:
+            html += '<div style="margin-bottom:12px"><strong>JS Bundles:</strong></div><div class="recon-grid">'
+            for u in js_urls[:30]:
+                html += f'<span class="url">{u}</span>'
+            html += '</div>'
+        if js_endpoints:
+            html += '<div style="margin:12px 0 8px"><strong>Discovered JS Endpoints:</strong></div><div class="recon-grid">'
+            for ep in js_endpoints[:40]:
+                html += f'<span class="url">{ep}</span>'
+            html += '</div>'
+        html += '</section>'
+        return html
     
     def _create_json_report(self) -> str:
         """

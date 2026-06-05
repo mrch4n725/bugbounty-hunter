@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument("--config", "-C", help="Path to YAML configuration file")
     parser.add_argument("--target", "-t", help="Target URL (e.g. https://example.com)")
     parser.add_argument("--modules", "-m", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "all"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "all"],
         default=["all"])
     parser.add_argument("--output", "-o", default="reports")
     parser.add_argument("--format", "-f", choices=["json", "html", "txt", "markdown-report", "hackerone", "bugcrowd"], default="html")
@@ -50,7 +50,7 @@ def parse_args():
         help="Out-of-band callback host for SSRF and SQLi OOB verification (e.g. Burp Collaborator or interactsh URL)")
     parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
     parser.add_argument("--disable-modules", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting"],
         default=[], help="Disable specific modules when scanning all or default modules")
     parser.add_argument("--module-param", action="append", default=[],
         help="Override module settings using module.key=value")
@@ -344,6 +344,7 @@ def _active_module_map(scanner, recon):
         "subdomain_takeover": scanner.scan_subdomain_takeover,
         "graphql": scanner.scan_graphql,
         "idor": scanner.scan_idor,
+        "rate_limiting": scanner.scan_rate_limiting,
     }
     if recon is not None:
         modules["js_secrets"] = recon.mine_js_bundles

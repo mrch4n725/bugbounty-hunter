@@ -450,9 +450,14 @@ class Recon:
     # ── crt.sh subdomain discovery ──────────────────────────────────────
 
     def _crt_sh_lookup(self) -> None:
-        """Query crt.sh Certificate Transparency logs for subdomains."""
+        """Query crt.sh Certificate Transparency logs for subdomains.
+
+        Strips wildcard prefixes, deduplicates, and optionally probes
+        liveness via HTTP HEAD concurrently with wordlist bruteforce.
+        """
         parsed = urlparse(self.target if '://' in self.target else f'http://{self.target}')
         domain = parsed.netloc.split(':')[0]
+        raw: set = set()
         try:
             r = self.session.get(
                 f"https://crt.sh/?q=%.{domain}&output=json",
@@ -467,19 +472,45 @@ class Recon:
                 name = entry.get("name_value", "") or ""
                 if "\n" in name:
                     for sub in name.split("\n"):
-                        sub = sub.strip()
+                        sub = sub.strip().lstrip("*.").lower()
                         if sub.endswith(f".{domain}") or sub == domain:
-                            with self.subdomains_lock:
-                                self.subdomains.add(sub)
+                            raw.add(sub)
                 else:
+                    name = name.strip().lstrip("*.").lower()
                     if name.endswith(f".{domain}") or name == domain:
-                        with self.subdomains_lock:
-                            self.subdomains.add(name)
-            log(f"[+] crt.sh: {len(self.subdomains)} subdomain(s) found", Colors.GREEN, verbose_only=True, verbose=self.verbose)
+                        raw.add(name)
+            log(f"[+] crt.sh: {len(raw)} raw subdomain(s) found", Colors.GREEN,
+                verbose_only=True, verbose=self.verbose)
+
+            # Probe liveness concurrently
+            live: set = set()
+            probe_lock = threading.Lock()
+
+            def _probe(sub: str) -> None:
+                candidate = f"https://{sub}"
+                try:
+                    resp = self.session.head(candidate, timeout=min(5, self.timeout), allow_redirects=True)
+                    if resp.status_code < 500:
+                        with probe_lock:
+                            live.add(sub)
+                except Exception:
+                    pass
+
+            with ThreadPoolExecutor(max_workers=self.threads) as pool:
+                for sub in raw:
+                    pool.submit(_probe, sub)
+
+            with self.subdomains_lock:
+                self.subdomains.update(live)
+
+            stale = len(raw) - len(live)
+            log(f"[+] crt.sh: {len(live)} live, {stale} unresolved", Colors.GREEN,
+                verbose_only=True, verbose=self.verbose)
         except json.JSONDecodeError:
             pass
         except Exception as e:
-            log(f"[!] crt.sh lookup failed: {e}", Colors.RED, verbose_only=True, verbose=self.verbose)
+            log(f"[!] crt.sh lookup failed: {e}", Colors.RED,
+                verbose_only=True, verbose=self.verbose)
 
     # ── Playwright headless crawling ────────────────────────────────────
 
@@ -619,16 +650,31 @@ class Recon:
             if not r or not r.text:
                 continue
 
-            # Full AST-enhanced analysis
-            jsintel = JSIntelligence(base_url=self.target)
+            jsintel = JSIntelligence(base_url=self.target, config=self.config)
             analysis = jsintel.analyze(r.text, source_url=js_url)
 
-            # Report secrets
-            for secret in analysis.get("secrets", []):
+            # Report validated secrets (live-API confirmed) as Critical
+            for secret in analysis.get("validated_secrets", []):
                 if not self._confirm_js_evidence(js_url, secret["value"]):
                     continue
+                det = secret.get("validation_details", "")
                 f = finding(
-                    f"JS Secret: {secret['type']}", js_url, "high",
+                    f"Validated JS Secret: {secret['type']}", js_url, "critical",
+                    f"Live-API validated secret in JS bundle — {det}",
+                    secret["value"],
+                )
+                if f:
+                    findings.append(f)
+
+            # Report unvalidated secrets
+            for secret in analysis.get("secrets", []):
+                if secret.get("validated"):
+                    continue
+                if not self._confirm_js_evidence(js_url, secret["value"]):
+                    continue
+                sev = "info" if secret.get("validated") is False else "high"
+                f = finding(
+                    f"JS Secret: {secret['type']}", js_url, sev,
                     f"Pattern '{secret['type']}' matched in JS bundle",
                     secret["value"],
                 )
@@ -649,11 +695,19 @@ class Recon:
 
             # Report discovered routes
             for route in analysis.get("routes", []):
-                if findings:
-                    pass  # Log routes in verbose mode only
                 if self.verbose:
                     log(f"  [JS Route] {route['framework']}: {route['route']}", Colors.CYAN,
                         verbose_only=True, verbose=self.verbose)
+
+            # Report environment variable references
+            for ev in analysis.get("env_vars", []):
+                log(f"  [Env Var] {ev['reference']}: {ev['variable']}", Colors.YELLOW,
+                    verbose_only=True, verbose=self.verbose)
+
+            # Log discovered endpoints in verbose mode
+            for ep in analysis.get("endpoints", []):
+                log(f"  [JS Endpoint] {ep['type']}: {ep['url']}", Colors.CYAN,
+                    verbose_only=True, verbose=self.verbose)
 
         return findings
 

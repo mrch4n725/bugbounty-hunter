@@ -420,22 +420,18 @@ class VulnScanner:
     def _get_module_param(self, module_name, key, default=None):
         return self.config.get("module_params", {}).get(module_name, {}).get(key, default)
 
-    def _load_sqli_payloads(self) -> dict:
-        yaml_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "payloads", "sqli.yaml"
-        )
-        try:
-            with open(yaml_path, "r") as f:
-                loaded = yaml.safe_load(f)
-            if loaded and "payloads" in loaded:
-                return loaded["payloads"]
-        except (FileNotFoundError, yaml.YAMLError):
-            pass
-        return DEFAULT_SQLI_PAYLOADS
+    def _load_payloads(self, payload_type: str) -> Any:
+        """Load payloads from YAML file with inline fallback.
 
-    def _load_xss_payloads(self) -> dict:
+        Args:
+            payload_type: One of 'sqli', 'xss', 'lfi', 'ssrf', 'xxe', 'ssti', 'cmdi'
+
+        Returns:
+            Parsed payload structure (dict or list) from YAML, or the inline
+            default constant (DEFAULT_SQLI_PAYLOADS, DEFAULT_XSS_PAYLOADS, etc.)
+        """
         yaml_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "payloads", "xss.yaml"
+            os.path.dirname(os.path.dirname(__file__)), "payloads", f"{payload_type}.yaml"
         )
         try:
             with open(yaml_path, "r") as f:
@@ -444,7 +440,17 @@ class VulnScanner:
                 return loaded["payloads"]
         except (FileNotFoundError, yaml.YAMLError):
             pass
-        return DEFAULT_XSS_PAYLOADS
+
+        fallbacks = {
+            "sqli": DEFAULT_SQLI_PAYLOADS,
+            "xss": DEFAULT_XSS_PAYLOADS,
+            "lfi": LFI_PAYLOADS,
+            "ssrf": SSRF_PAYLOADS,
+            "xxe": XXE_PAYLOADS,
+            "ssti": SSTI_PAYLOADS,
+            "cmdi": CMD_INJECTION_PAYLOADS,
+        }
+        return fallbacks.get(payload_type, [])
 
     def _in_scope(self, url: str) -> bool:
         return url_in_scope(url, self.config)
@@ -576,9 +582,10 @@ class VulnScanner:
         return self._get_findings()
 
     def _ssti_test_parameter(self, url: str, param: str) -> Optional[dict]:
+        ssti_payloads = self._load_payloads("ssti")
         # Stage 1: Arithmetic reflection detection
         arithmetic_results = []
-        for payload in SSTI_PAYLOADS["arithmetic"]:
+        for payload in ssti_payloads.get("arithmetic", SSTI_PAYLOADS.get("arithmetic", [])):
             test_url = self._inject_param(url, param, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if not resp:
@@ -600,7 +607,7 @@ class VulnScanner:
 
         # Stage 2: Engine fingerprinting
         engine_sigs = []
-        for engine, payload, expected in SSTI_PAYLOADS["engine_fingerprint"]:
+        for engine, payload, expected in ssti_payloads.get("engine_fingerprint", SSTI_PAYLOADS.get("engine_fingerprint", [])):
             test_url = self._inject_param(url, param, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if resp and expected and expected in resp.text:
@@ -624,7 +631,7 @@ class VulnScanner:
         # Stage 4: Read-proof attempt (safe, non-destructive)
         read_proof = []
         if verified_engine or has_arithmetic:
-            for payload in SSTI_PAYLOADS["read_proof"]:
+            for payload in ssti_payloads.get("read_proof", SSTI_PAYLOADS.get("read_proof", [])):
                 test_url = self._inject_param(url, param, payload)
                 resp = safe_get(self.session, test_url, self.timeout)
                 if resp and len(resp.text) > 500 and payload not in resp.text:
@@ -685,7 +692,7 @@ class VulnScanner:
         Requires multiple signals before marking Confirmed.
         """
         self._prepare_scan()
-        payloads = self._load_sqli_payloads()
+        payloads = self._load_payloads("sqli")
         oob_host = self.config.get("oob_host")
 
         for url in self.recon.get("urls", []):
@@ -835,8 +842,9 @@ class VulnScanner:
                     len(baseline_resp.text) if baseline_resp else 0,
                 )
 
+                ssrf_payloads = self._load_payloads("ssrf")
                 for param in params:
-                    for payload in SSRF_PAYLOADS:
+                    for payload in ssrf_payloads:
                         test_url = self._build_ssrf_url(url, parsed, original_params, param, payload)
                         resp = safe_get(self.session, test_url, self.timeout)
                         if not resp:
@@ -914,8 +922,9 @@ class VulnScanner:
 
             xml_headers = {"Content-Type": "application/xml"}
 
+            xxe_payloads = self._load_payloads("xxe")
             # In-Band: file read via entity
-            for payload in XXE_PAYLOADS["in_band"]:
+            for payload in xxe_payloads.get("in_band", XXE_PAYLOADS.get("in_band", [])):
                 try:
                     resp = safe_post(self.session, url, payload,
                                      self.timeout, headers=xml_headers)
@@ -945,7 +954,7 @@ class VulnScanner:
 
             # Error-based: file read via error message
             if not signals["in_band"]:
-                for payload in XXE_PAYLOADS["error_based"]:
+                for payload in xxe_payloads.get("error_based", XXE_PAYLOADS.get("error_based", [])):
                     try:
                         resp = safe_post(self.session, url, payload,
                                          self.timeout, headers=xml_headers)
@@ -975,7 +984,7 @@ class VulnScanner:
 
             # OOB-based blind XXE
             if oob_host and not signals["in_band"] and not signals["error"]:
-                for payload in XXE_PAYLOADS["oob"]:
+                for payload in xxe_payloads.get("oob", XXE_PAYLOADS.get("oob", [])):
                     try:
                         formatted = payload.replace("{oob}", f"{self.oob.callback_token}.{oob_host}")
                         safe_post(self.session, url, formatted,
@@ -1054,11 +1063,12 @@ class VulnScanner:
 
     def _cmd_injection_test_parameter(self, url: str, param: str,
                                       oob_host: Optional[str]) -> Dict[str, bool]:
+        cmdi_payloads = self._load_payloads("cmdi")
         signals: Dict[str, bool] = {"output": False, "time": False, "oob": False}
         evidence_parts = []
 
         # Output-based detection
-        for payload, expected in CMD_INJECTION_PAYLOADS["unix"]:
+        for payload, expected in cmdi_payloads.get("unix", CMD_INJECTION_PAYLOADS.get("unix", [])):
             test_url = self._inject_param(url, param, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if not resp:
@@ -1077,7 +1087,7 @@ class VulnScanner:
                 break
 
         if not signals["output"]:
-            for payload, expected in CMD_INJECTION_PAYLOADS["windows"]:
+            for payload, expected in cmdi_payloads.get("windows", CMD_INJECTION_PAYLOADS.get("windows", [])):
                 test_url = self._inject_param(url, param, payload)
                 resp = safe_get(self.session, test_url, self.timeout)
                 if not resp:
@@ -1089,7 +1099,7 @@ class VulnScanner:
                     break
 
         # Time-based detection
-        for payload, min_delay in CMD_INJECTION_PAYLOADS["time_based"]:
+        for payload, min_delay in cmdi_payloads.get("time_based", CMD_INJECTION_PAYLOADS.get("time_based", [])):
             test_url = self._inject_param(url, param, payload)
             delays = []
             for _ in range(2):
@@ -1103,7 +1113,7 @@ class VulnScanner:
 
         # OOB-based detection
         if oob_host and not signals["output"]:
-            for payload_template in CMD_INJECTION_PAYLOADS["oob"]:
+            for payload_template in cmdi_payloads.get("oob", CMD_INJECTION_PAYLOADS.get("oob", [])):
                 payload = payload_template.replace("{oob}", f"{self.oob.callback_token}.{oob_host}")
                 test_url = self._inject_param(url, param, payload)
                 safe_get(self.session, test_url, self.timeout, raise_for_status=False)
@@ -1153,7 +1163,7 @@ class VulnScanner:
         4. Report only execution-verified XSS as Confirmed
         """
         self._prepare_scan()
-        payloads = self._load_xss_payloads()
+        payloads = self._load_payloads("xss")
 
         for url in self.recon.get("urls", []):
             if not self._in_scope(url):
@@ -1426,6 +1436,7 @@ class VulnScanner:
 
     def scan_lfi(self) -> list[dict]:
         findings: list[dict] = []
+        lfi_payloads = self._load_payloads("lfi")
         for url in self._urls_with_params():
             if not self._in_scope(url):
                 continue
@@ -1433,7 +1444,7 @@ class VulnScanner:
                 parsed = urlparse(url)
                 params = list(parse_qs(parsed.query).keys())
                 for param in params:
-                    for payload in LFI_PAYLOADS:
+                    for payload in lfi_payloads:
                         try:
                             test_url = self._inject_param(url, param, payload)
                             resp = safe_get(self.session, test_url, self.timeout)
@@ -1960,6 +1971,72 @@ class VulnScanner:
                 continue
             except Exception:
                 continue
+        return self._get_findings()
+
+    # ═════════════════════════════════════════════════════════════════════
+    # Rate Limiting
+    # ═════════════════════════════════════════════════════════════════════
+
+    def scan_rate_limiting(self) -> list[dict]:
+        """Test auth-related endpoints for missing or weak rate limiting.
+
+        Sends 20 rapid requests to common sensitive endpoints and checks
+        whether a 429 (Too Many Requests) or soft-limiting (increasing delay)
+        is enforced. Absence of either is a finding.
+        """
+        findings: list[dict] = []
+        rate_limited_endpoints = [
+            "/login", "/auth/login", "/api/login", "/api/auth/login",
+            "/register", "/auth/register", "/api/register",
+            "/reset-password", "/auth/reset-password", "/api/reset-password",
+            "/forgot-password", "/auth/forgot-password",
+            "/api/v1/login", "/api/v1/register",
+            "/oauth/token", "/api/token",
+        ]
+
+        for endpoint in rate_limited_endpoints:
+            test_url = urljoin(self.base_url, endpoint)
+            statuses = []
+            times = []
+            start = time.time()
+
+            for _ in range(20):
+                try:
+                    resp = self.session.get(test_url, timeout=self.timeout)
+                    statuses.append(resp.status_code)
+                except Exception:
+                    statuses.append(0)
+                times.append(time.time())
+
+            elapsed = time.time() - start
+            unique_statuses = set(statuses)
+            has_429 = 429 in unique_statuses
+            has_5xx = any(s >= 500 for s in unique_statuses)
+            avg_rps = 20 / max(elapsed, 0.1)
+
+            if not has_429 and not has_5xx:
+                f = finding(
+                    vuln_type="Missing Rate Limiting",
+                    url=test_url,
+                    severity="medium",
+                    details=f"Endpoint accepted 20 requests in {elapsed:.1f}s ({avg_rps:.0f} req/s) without rate limiting (HTTP 429)",
+                    evidence=f"Statuses: {sorted(unique_statuses)}, RPS: {avg_rps:.0f}",
+                    verification_stage=VerificationStage.VALIDATED.value,
+                    validation_steps=[
+                        f"Sent 20 rapid GET requests to {test_url}",
+                        f"Received statuses: {sorted(unique_statuses)}",
+                        f"No 429 returned — rate limiting absent or ineffective",
+                    ],
+                )
+                if f:
+                    self._add(f)
+                    findings.append(f)
+                    log(f"  [RATE LIMITING] {test_url} — no 429 in {elapsed:.1f}s",
+                        Colors.RED, verbose_only=True, verbose=self.verbose)
+            elif has_429:
+                log(f"  [RATE LIMITING] {test_url} — rate limited (429 present)",
+                    Colors.GREEN, verbose_only=True, verbose=self.verbose)
+
         return self._get_findings()
 
     # ═════════════════════════════════════════════════════════════════════
