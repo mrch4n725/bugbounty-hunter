@@ -532,30 +532,53 @@ class VulnScanner:
     # ── Chain Analysis ────────────────────────────────────────────────
 
     @staticmethod
+    def _origin(url: str) -> str:
+        """Extract scheme + netloc from a URL for origin comparison."""
+        try:
+            p = urlparse(url)
+            return f"{p.scheme}://{p.netloc}".lower()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _is_exploitable(f: dict) -> bool:
+        """Chain-quality check: Stage 3+ (exploitable/verified)."""
+        stage = f.get("verification_stage", "").lower()
+        return stage in ("exploitable", "verified")
+
+    @staticmethod
     def chain_analysis(findings: list[dict]) -> list[dict]:
-        """Detect exploitable chains and enrich impact fields."""
-        types = {f.get("type", "").lower(): f for f in findings}
-        chains_found = []
+        """Detect exploitable chains and enrich impact fields.
 
-        # CSRF + XSS → ATO
-        csrf = [f for f in findings if "csrf" in f.get("type", "").lower() and f.get("url")]
-        xss = [f for f in findings if "xss" in f.get("type", "").lower() and f.get("url")]
-        if csrf and xss:
-            chain_finding = {
-                "title": "Chained: CSRF + XSS → Account Takeover",
-                "type": "chain",
-                "severity": "critical",
-                "details": "CSRF vulnerabilities allow an attacker to forge requests; combined with stored XSS, this enables silent account takeover without user interaction beyond visiting a page.",
-                "impact": "Full account takeover via CSRF-triggered stored XSS payload injection.",
-                "url": csrf[0].get("url") + " & " + xss[0].get("url"),
-                "verification_stage": VerificationStage.VALIDATED.value,
-                "evidence": f"CSRF: {len(csrf)} findings | XSS: {len(xss)} findings",
-                "chains": True,
-            }
-            chains_found.append(chain_finding)
+        Only pairs findings that are both Stage 3+ (exploitable/verified)
+        and share the same origin (scheme + host).
+        """
+        chains_found: list[dict] = []
+        exploitable = [f for f in findings if VulnScanner._is_exploitable(f)]
 
-        # SSRF + internal service → RCE potential
-        ssrf = [f for f in findings if "ssrf" in f.get("type", "").lower()]
+        # CSRF + XSS (same origin) → ATO
+        csrf = [f for f in exploitable if "csrf" in f.get("type", "").lower() and f.get("url")]
+        xss = [f for f in exploitable if "xss" in f.get("type", "").lower() and f.get("url")]
+        for c in csrf:
+            c_origin = VulnScanner._origin(c["url"])
+            match = next((x for x in xss if VulnScanner._origin(x["url"]) == c_origin), None)
+            if match:
+                chain_finding = {
+                    "title": "Chained: CSRF + XSS → Account Takeover",
+                    "type": "chain",
+                    "severity": "critical",
+                    "details": "CSRF vulnerabilities allow an attacker to forge requests; combined with stored XSS, this enables silent account takeover without user interaction beyond visiting a page.",
+                    "impact": "Full account takeover via CSRF-triggered stored XSS payload injection.",
+                    "url": c["url"] + " & " + match["url"],
+                    "verification_stage": VerificationStage.VALIDATED.value,
+                    "evidence": f"Same-origin CSRF ({c['url']}) + XSS ({match['url']})",
+                    "chains": True,
+                }
+                chains_found.append(chain_finding)
+                break
+
+        # SSRF (exploitable only) → RCE potential
+        ssrf = [f for f in exploitable if "ssrf" in f.get("type", "").lower()]
         if ssrf:
             chain_finding = {
                 "title": "Chained: SSRF → Internal Service Enumeration / RCE",
@@ -564,28 +587,32 @@ class VulnScanner:
                 "details": "SSRF can be leveraged to probe internal services, access cloud metadata endpoints, or exploit internal-facing RCE (e.g., Jenkins, Hadoop, Consul).",
                 "impact": "Potential lateral movement and remote code execution on internal infrastructure.",
                 "url": ssrf[0].get("url"),
-                "verification_stage": VerificationStage.VALIDATED.value,
-                "evidence": f"SSRF: {len(ssrf)} findings",
+                "verification_stage": VerificationStage.EXPLOITABLE.value,
+                "evidence": f"Exploitable SSRF: {len(ssrf)} finding(s)",
                 "chains": True,
             }
             chains_found.append(chain_finding)
 
-        # IDOR + sensitive data → PII breach
-        idor = [f for f in findings if "idor" in f.get("type", "").lower() or "id" in f.get("parameter", "").lower()]
-        sensitive = [f for f in findings if "sensitive" in f.get("type", "").lower()]
-        if idor and sensitive:
-            chain_finding = {
-                "title": "Chained: IDOR + Sensitive Data Exposure → PII Breach",
-                "type": "chain",
-                "severity": "critical",
-                "details": "IDOR vulnerabilities allow enumerating user/object identifiers; combined with sensitive data exposure, this enables mass PII harvesting.",
-                "impact": "Massive personal data breach via predictable ID enumeration.",
-                "url": idor[0].get("url") + " & " + sensitive[0].get("url"),
-                "verification_stage": VerificationStage.VALIDATED.value,
-                "evidence": f"IDOR: {len(idor)} findings | Sensitive Data: {len(sensitive)} findings",
-                "chains": True,
-            }
-            chains_found.append(chain_finding)
+        # IDOR + sensitive data (same origin) → PII breach
+        idor = [f for f in exploitable if "idor" in f.get("type", "").lower() or "id" in f.get("parameter", "").lower()]
+        sensitive = [f for f in exploitable if "sensitive" in f.get("type", "").lower()]
+        for i in idor:
+            i_origin = VulnScanner._origin(i["url"])
+            match = next((s for s in sensitive if VulnScanner._origin(s["url"]) == i_origin), None)
+            if match:
+                chain_finding = {
+                    "title": "Chained: IDOR + Sensitive Data Exposure → PII Breach",
+                    "type": "chain",
+                    "severity": "critical",
+                    "details": "IDOR vulnerabilities allow enumerating user/object identifiers; combined with sensitive data exposure, this enables mass PII harvesting.",
+                    "impact": "Massive personal data breach via predictable ID enumeration.",
+                    "url": i["url"] + " & " + match["url"],
+                    "verification_stage": VerificationStage.EXPLOITABLE.value,
+                    "evidence": f"Same-origin IDOR ({i['url']}) + Sensitive Data ({match['url']})",
+                    "chains": True,
+                }
+                chains_found.append(chain_finding)
+                break
 
         findings.extend(chains_found)
         return findings
