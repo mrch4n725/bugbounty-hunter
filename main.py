@@ -329,6 +329,7 @@ def _collect_module_findings(modules, config, run_all, disabled_modules, all_fin
 
 def _active_module_map(scanner, recon):
     modules = {
+        "openapi": scanner.scan_openapi,
         "xss": scanner.scan_xss, "sqli": scanner.scan_sqli,
         "lfi": scanner.scan_lfi, "ssrf": scanner.scan_ssrf,
         "xxe": scanner.scan_xxe,

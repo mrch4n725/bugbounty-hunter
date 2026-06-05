@@ -190,12 +190,17 @@ class Reporter:
     
     def _sort_findings(self) -> List[Dict[str, Any]]:
         """
-        Sort findings by severity level.
+        Sort findings by priority_score (descending), falling back to severity.
         
         Returns:
             List: Sorted findings list
         """
-        return sorted(self.findings, key=lambda x: self.SEVERITY_ORDER.get(x.get('severity', 'info').lower(), 4))
+        def sort_key(x):
+            ps = x.get("priority_score")
+            if ps is not None:
+                return -ps
+            return self.SEVERITY_ORDER.get(x.get('severity', 'info').lower(), 4)
+        return sorted(self.findings, key=sort_key)
     
     def _dedupe_findings(self) -> List[Dict[str, Any]]:
         """

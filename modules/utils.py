@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:
     from rich.console import Console
@@ -148,6 +150,44 @@ def false_positive_risk_from_score(score: int) -> FalsePositiveRisk:
     if score >= 61:
         return FalsePositiveRisk.MEDIUM
     return FalsePositiveRisk.HIGH
+
+# ── Prioritization Scoring Engine ────────────────────────────────────────────
+
+SEVERITY_PRIORITY = {"critical": 100, "high": 75, "medium": 50, "low": 25}
+STAGE_PRIORITY = {"verified": 100, "exploitable": 90, "validated": 60, "detected": 30}
+
+def compute_priority_score(finding: dict) -> int:
+    """
+    Compute a 0–100 priority score for a finding based on:
+    - Severity (25 pts max)
+    - Verification stage (35 pts max)
+    - Evidence strength (20 pts max)
+    - OOB bonus (+15)
+    - Signal count (+5 per signal, cap 10)
+    """
+    severity = finding.get("severity", "low").lower()
+    stage = finding.get("verification_stage", "detected").lower()
+    evidence = finding.get("evidence_strength", "weak").lower()
+
+    sev_score = SEVERITY_PRIORITY.get(severity, 25)
+    stage_score = STAGE_PRIORITY.get(stage, 30)
+    evidence_map = {"verified": 20, "strong": 15, "moderate": 10, "weak": 5}
+    ev_score = evidence_map.get(evidence, 5)
+
+    oob_bonus = 15 if "oob" in finding.get("evidence", "").lower() else 0
+    validation_steps = finding.get("validation_steps", [])
+    signal_bonus = min(len(validation_steps) * 5, 10)
+
+    raw = sev_score * 0.25 + stage_score * 0.35 + ev_score * 0.20 + oob_bonus + signal_bonus
+    return min(int(raw), 100)
+
+
+def prioritize_findings(findings: list[dict]) -> list[dict]:
+    """Sort findings by computed priority score descending, adding priority_score key."""
+    for f in findings:
+        f["priority_score"] = compute_priority_score(f)
+    return sorted(findings, key=lambda f: f.get("priority_score", 0), reverse=True)
+
 
 # ── Vulnerability Finding Model ─────────────────────────────────────────────
 
@@ -398,29 +438,63 @@ class DeduplicationEngine:
 # ── Browser Validation Layer ─────────────────────────────────────────────
 
 class BrowserValidator:
-    """Playwright-based browser validation for XSS, DOM XSS, and client-side issues."""
+    """Pooled Playwright browser validator.
+    
+    Launches ONE browser per scan session. Every check_* method reuses the
+    same browser — only individual pages are created and closed. Call
+    `close()` at scan end to release the browser.
+    """
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.timeout = config.get("timeout", 10) * 1000
+        self._pw = None
+        self._browser = None
+        self._lock = threading.Lock()
 
-    def _get_browser(self):
-        try:
-            from playwright.sync_api import sync_playwright
-            pw = sync_playwright().start()
-            browser = pw.chromium.launch(headless=True)
-            return pw, browser
-        except Exception:
-            return None, None
+    def _ensure_browser(self):
+        if self._browser is not None:
+            return self._browser
+        with self._lock:
+            if self._browser is not None:
+                return self._browser
+            try:
+                from playwright.sync_api import sync_playwright
+                self._pw = sync_playwright().start()
+                self._browser = self._pw.chromium.launch(headless=True)
+            except Exception:
+                self._pw = None
+                self._browser = None
+            return self._browser
+
+    def close(self):
+        with self._lock:
+            try:
+                if self._browser:
+                    self._browser.close()
+            except Exception:
+                pass
+            try:
+                if self._pw:
+                    self._pw.stop()
+            except Exception:
+                pass
+            self._browser = None
+            self._pw = None
+
+    def _new_page(self):
+        browser = self._ensure_browser()
+        if not browser:
+            return None
+        return browser.new_page()
 
     def check_xss_execution(self, url: str, payload: str,
                             html_content: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Load URL (or HTML content for POST forms) in headless browser and check if JS executes."""
-        pw, browser = self._get_browser()
-        if not browser:
+        """Load URL (or HTML content for POST forms) and check if JS executes."""
+        page = self._new_page()
+        if not page:
             return None
         try:
-            page = browser.new_page()
             result = {"alert_fired": False, "dom_mutation": False, "callback": False}
 
             def on_dialog(dialog):
@@ -444,84 +518,119 @@ class BrowserValidator:
                 };
             }""")
             result["dom_mutation"] = dom_evidence.get("has_bbh_marker", False)
-
-            if result["alert_fired"] or result["dom_mutation"]:
+            page.close()
+            return result
+        except Exception:
+            try:
                 page.close()
-                browser.close()
-                pw.stop()
-                return result
-
-            page.close()
-            browser.close()
-            pw.stop()
-            return result
-        except Exception:
-            try:
-                browser.close()
-                pw.stop()
             except Exception:
                 pass
             return None
 
-    def check_dom_xss(self, url: str) -> Optional[Dict[str, Any]]:
-        """Check if URL triggers DOM-based XSS via common sinks."""
-        pw, browser = self._get_browser()
-        if not browser:
-            return None
+    def scan_dom_xss(self, url: str, probes: List[str]) -> List[Dict[str, Any]]:
+        """Scan for DOM-based XSS by testing common sinks with each probe.
+        
+        Tests: document.write, innerHTML, outerHTML, insertAdjacentHTML,
+        eval, setTimeout, Function constructor, jQuery $().
+        Returns list of findings dicts with 'sink', 'probe', 'executed' keys.
+        """
+        findings: List[Dict[str, Any]] = []
+        page = self._new_page()
+        if not page:
+            return findings
         try:
-            page = browser.new_page()
-            result: Dict[str, Any] = {"sink": None, "payload_reflected": False}
-
-            page.on("console", lambda msg: result.update({"sink": msg.text}) if msg.type == "error" else None)
             page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(1000)
+            marker = "__bbh_dom_sink_triggered"
 
-            content = page.content()
+            for probe in probes:
+                sink_checks = [
+                    ("document.write", """
+                        try { document.write('<script>window.{m}="dw"<\\/script>');
+                        return window.{m} === "dw"; } catch(e) { return false; }
+                    """.replace("{m}", marker)),
+                    ("div.innerHTML", """
+                        try { var d=document.createElement('div');
+                        d.innerHTML='<img src=x onerror=window.{m}="ih">';
+                        document.body.appendChild(d);
+                        return window.{m} === "ih"; } catch(e) { return false; }
+                    """.replace("{m}", marker)),
+                    ("div.outerHTML", """
+                        try { var d=document.createElement('div');
+                        d.outerHTML='<img src=x onerror=window.{m}="oh">';
+                        document.body.appendChild(d);
+                        return window.{m} === "oh"; } catch(e) { return false; }
+                    """.replace("{m}", marker)),
+                    ("insertAdjacentHTML", """
+                        try { var d=document.createElement('div');
+                        d.insertAdjacentHTML('afterbegin','<img src=x onerror=window.{m}="iah">');
+                        document.body.appendChild(d);
+                        return window.{m} === "iah"; } catch(e) { return false; }
+                    """.replace("{m}", marker)),
+                    ("eval", """
+                        try { eval('window.{m}="ev"');
+                        return window.{m} === "ev"; } catch(e) { return false; }
+                    """.replace("{m}", marker)),
+                    ("Function", """
+                        try { new Function('window.{m}="fn"')( );
+                        return window.{m} === "fn"; } catch(e) { return false; }
+                    """.replace("{m}", marker)),
+                    ("setTimeout", """
+                        try { setTimeout('window.{m}="st"',0);
+                        return window.{m} === "st"; } catch(e) { return false; }
+                    """.replace("{m}", marker)),
+                    ("jQuery.$()", """
+                        try { window.{m}="jq"; $(window).html('<img src=x onerror=window.{m}="jqe">');
+                        return window.{m} === "jqe"; } catch(e) { return false; }
+                    """.replace("{m}", marker)),
+                ]
+                for sink_name, js_code in sink_checks:
+                    try:
+                        executed = page.evaluate(js_code)
+                        if executed:
+                            findings.append({
+                                "sink": sink_name, "probe": probe,
+                                "executed": True, "url": url,
+                            })
+                    except Exception:
+                        continue
+
             page.close()
-            browser.close()
-            pw.stop()
-            return result
+            return findings
         except Exception:
             try:
-                browser.close()
-                pw.stop()
+                page.close()
             except Exception:
                 pass
-            return None
+            return findings
 
     def capture_screenshot(self, url: str, output_path: str) -> Optional[str]:
-        """Load URL in headless browser and capture a PNG screenshot."""
-        pw, browser = self._get_browser()
-        if not browser:
+        """Capture a full-page PNG screenshot."""
+        page = self._new_page()
+        if not page:
             return None
         try:
-            page = browser.new_page(viewport={"width": 1280, "height": 720})
+            page.set_viewport_size({"width": 1280, "height": 720})
             page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
             page.wait_for_timeout(1500)
             page.screenshot(path=output_path, full_page=True)
             page.close()
-            browser.close()
-            pw.stop()
             return output_path
         except Exception:
             try:
-                browser.close()
-                pw.stop()
+                page.close()
             except Exception:
                 pass
             return None
 
     def check_network_requests(self, url: str, callback_domain: str) -> Optional[Dict[str, Any]]:
-        """Load URL and capture outbound network requests matching callback_domain."""
-        pw, browser = self._get_browser()
-        if not browser:
+        """Load URL and intercept outbound requests matching callback_domain."""
+        page = self._new_page()
+        if not page:
             return None
         try:
-            page = browser.new_page()
             result: Dict[str, Any] = {
-                "requests": [],
-                "callback_detected": False,
-                "callback_urls": [],
+                "requests": [], "callback_detected": False, "callback_urls": [],
             }
 
             def on_request(request):
@@ -533,31 +642,24 @@ class BrowserValidator:
             page.on("request", on_request)
             page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
             page.wait_for_timeout(3000)
-
             page.close()
-            browser.close()
-            pw.stop()
             return result
         except Exception:
             try:
-                browser.close()
-                pw.stop()
+                page.close()
             except Exception:
                 pass
             return None
 
     def check_blind_xss(self, url: str, oob_host: str) -> Optional[Dict[str, Any]]:
-        """Load URL and check for DOM-based XSS execution with OOB callback detection."""
-        pw, browser = self._get_browser()
-        if not browser:
+        """Load URL and check for JS execution with OOB callback detection."""
+        page = self._new_page()
+        if not page:
             return None
         try:
-            page = browser.new_page()
             result: Dict[str, Any] = {
-                "alert_fired": False,
-                "dom_mutation": False,
-                "callback_detected": False,
-                "network_requests": [],
+                "alert_fired": False, "dom_mutation": False,
+                "callback_detected": False, "network_requests": [],
             }
 
             def on_dialog(dialog):
@@ -583,15 +685,11 @@ class BrowserValidator:
                 };
             }""")
             result["dom_mutation"] = dom_evidence.get("has_bbh_marker", False)
-
             page.close()
-            browser.close()
-            pw.stop()
             return result
         except Exception:
             try:
-                browser.close()
-                pw.stop()
+                page.close()
             except Exception:
                 pass
             return None
@@ -1558,6 +1656,26 @@ def make_session(config: Dict[str, Any]) -> requests.Session:
     session.verify = config.get("verify_ssl", True)
     if not session.verify:
         warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+
+    # ── Connection pooling with retry adapters ─────────────────────
+    retries = int(config.get("retries", 3))
+    retry_strategy = Retry(
+        total=retries,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=50,
+        pool_maxsize=50,
+        pool_block=False,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    # Keep-alive: disable default pool-block, allow connection reuse
+    session.keep_alive = True
 
     pipeline = session.request
 
