@@ -15,6 +15,8 @@ from urllib.parse import urljoin, urlparse
 
 from modules.utils import SecretValidator
 
+# Install esprima (pip install esprima) for AST-based parsing.
+# Regex fallback is used automatically when esprima is absent.
 try:
     import esprima
     ESPRIMA_AVAILABLE = True

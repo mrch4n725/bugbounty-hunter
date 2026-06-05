@@ -643,11 +643,8 @@ class Recon:
         from modules.js_intelligence import JSIntelligence
         findings = []
         for js_url in sorted(self.js_urls):
-            try:
-                r = self.session.get(js_url, timeout=self.timeout)
-            except Exception:
-                continue
-            if not r or not r.text:
+            r = safe_get(self.session, js_url, timeout=self.timeout, raise_for_status=False)
+            if r is None or r.status_code >= 400 or not r.text:
                 continue
 
             jsintel = JSIntelligence(base_url=self.target, config=self.config)

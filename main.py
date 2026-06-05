@@ -347,8 +347,6 @@ def _active_module_map(scanner, recon):
         "idor": scanner.scan_idor,
         "rate_limiting": scanner.scan_rate_limiting,
     }
-    if recon is not None:
-        modules["js_secrets"] = recon.mine_js_bundles
     _api_scanner = ApiScanner(scanner.config, scanner.recon)
     modules["api"] = _api_scanner.run_all
     _idor_scanner = IdorScanner(scanner.config, scanner.recon)
@@ -361,8 +359,6 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         log("[*] Passive mode — skipping active fuzzing.", Colors.YELLOW)
         scanner = VulnScanner(config, recon_data)
         modules = {"headers": scanner.scan_headers}
-        if recon is not None:
-            modules["js_secrets"] = recon.mine_js_bundles
     else:
         scanner = VulnScanner(config, recon_data)
         modules = _active_module_map(scanner, recon)

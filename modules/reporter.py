@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
+from modules.utils import log, Colors
+
 
 # Severity → CVSS 3.1 base score mapping (fallback when finding lacks cvss_score)
 CVSS_BY_SEVERITY: Dict[str, float] = {
@@ -1088,7 +1090,12 @@ End of Report
                 return {}
             return {k: v for k, v in result.items() if isinstance(v, str)}
         except ImportError:
-            pass
+            log(
+                "[!] --triage-assist requires the openai package. "
+                "Install it with: pip install openai",
+                Colors.YELLOW
+            )
+            return {}
         except Exception:
             pass
         return {}

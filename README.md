@@ -64,6 +64,15 @@ If `python` is not found, try `python3` or `py` (Windows). On permission errors:
 
 ---
 
+## Optional Dependencies
+
+| Package | Required for | Install |
+|---------|-------------|---------|
+| **esprima** | AST-based JavaScript analysis — more accurate secret/endpoint extraction from minified bundles (regex fallback used when absent) | `pip install esprima` |
+| **openai** | AI-assisted triage narratives in Markdown reports via `--triage-assist` (requires `OPENAI_API_KEY` env var) | `pip install openai` |
+
+Both packages are fully optional — the tool works without them using built-in fallbacks.
+
 ## Usage examples
 
 ```bash
