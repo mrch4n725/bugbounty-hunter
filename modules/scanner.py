@@ -423,6 +423,15 @@ class VulnScanner:
     def _load_payloads(self, payload_type: str) -> Any:
         """Load payloads from YAML file with inline fallback.
 
+        Handles both flat lists and nested dict payloads.  Nested dicts
+        (category-based grouping) are flattened into a single ordered list
+        by concatenating category values in insertion order.
+
+        For payload types whose fallback is a dict (sqli, xss, xxe, ssti,
+        cmdi) the raw dict is returned as-is so that callers can access
+        individual categories via .get("category", []).  For list-fallback
+        types (lfi, ssrf) the result is always flattened.
+
         Args:
             payload_type: One of 'sqli', 'xss', 'lfi', 'ssrf', 'xxe', 'ssti', 'cmdi'
 
@@ -433,11 +442,21 @@ class VulnScanner:
         yaml_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "payloads", f"{payload_type}.yaml"
         )
+        list_types = {"lfi", "ssrf"}
         try:
             with open(yaml_path, "r") as f:
                 loaded = yaml.safe_load(f)
             if loaded and "payloads" in loaded:
-                return loaded["payloads"]
+                raw = loaded["payloads"]
+                if isinstance(raw, dict) and payload_type in list_types:
+                    flat = []
+                    for cat in raw.values():
+                        if isinstance(cat, list):
+                            flat.extend(cat)
+                    if flat:
+                        return flat
+                if isinstance(raw, (dict, list)):
+                    return raw
         except (FileNotFoundError, yaml.YAMLError):
             pass
 
@@ -450,7 +469,11 @@ class VulnScanner:
             "ssti": SSTI_PAYLOADS,
             "cmdi": CMD_INJECTION_PAYLOADS,
         }
-        return fallbacks.get(payload_type, [])
+        fb = fallbacks.get(payload_type, [])
+        if self.verbose:
+            log(f"[*] Payload YAML for '{payload_type}' not found or empty — using hardcoded fallback",
+                Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+        return fb
 
     def _in_scope(self, url: str) -> bool:
         return url_in_scope(url, self.config)
@@ -1980,12 +2003,14 @@ class VulnScanner:
     def scan_rate_limiting(self) -> list[dict]:
         """Test auth-related endpoints for missing or weak rate limiting.
 
-        Sends 20 rapid requests to common sensitive endpoints and checks
-        whether a 429 (Too Many Requests) or soft-limiting (increasing delay)
-        is enforced. Absence of either is a finding.
+        Builds a candidate list from known auth paths AND forms discovered
+        during recon that contain password/secret fields.  Sends 20 rapid
+        POST requests with probe credentials, skipping 404/410 endpoints.
         """
         findings: list[dict] = []
-        rate_limited_endpoints = [
+
+        # ── STEP 1: Build candidate list ─────────────────────────────────
+        hardcoded_paths = [
             "/login", "/auth/login", "/api/login", "/api/auth/login",
             "/register", "/auth/register", "/api/register",
             "/reset-password", "/auth/reset-password", "/api/reset-password",
@@ -1994,36 +2019,103 @@ class VulnScanner:
             "/oauth/token", "/api/token",
         ]
 
-        for endpoint in rate_limited_endpoints:
-            test_url = urljoin(self.base_url, endpoint)
-            statuses = []
-            times = []
+        candidates: list[dict] = []
+        seen_urls: set = set()
+
+        def _add_candidate(url: str, sev: str, form_fields: list = None):
+            if url in seen_urls:
+                return
+            seen_urls.add(url)
+            candidates.append({"url": url, "severity": sev, "form_fields": form_fields or []})
+
+        for path in hardcoded_paths:
+            full = urljoin(self.base_url, path)
+            sev = "high" if any(k in path for k in ("login", "auth", "signin", "reset", "password", "token")) else "medium"
+            _add_candidate(full, sev)
+
+        for form in self.recon.get("forms", []):
+            method = form.get("method", "GET").upper()
+            if method != "POST":
+                continue
+            fields = form.get("fields", [])
+            field_names = [f.get("name", "").lower() for f in fields if f.get("name")]
+            pw_fields = [n for n in field_names if n in ("password", "passwd", "pass", "secret", "pin", "otp", "code", "token")]
+            if not pw_fields:
+                continue
+            action = form.get("action", "")
+            if not action:
+                continue
+            sev = "high" if pw_fields else "medium"
+            _add_candidate(action, sev, fields)
+
+        # ── STEP 2–3: Probe each candidate ──────────────────────────────
+        for candidate in candidates:
+            test_url = candidate["url"]
+            form_fields = candidate["form_fields"]
+            severity = candidate["severity"]
+
+            # Baseline — skip 404/410
+            try:
+                base_resp = self.session.post(test_url, timeout=self.timeout,
+                    data={"baseline": "1"})
+                if base_resp.status_code in (404, 410):
+                    continue
+            except Exception:
+                continue
+
+            # Build probe data
+            if form_fields:
+                probe_data = {}
+                for f in form_fields:
+                    name = f.get("name", "")
+                    ftype = f.get("type", "").lower()
+                    if name.lower() in ("password", "passwd", "pass", "secret", "pin", "otp"):
+                        probe_data[name] = "Wr0ng_P4ss_probe!"
+                    elif name.lower() in ("email", "username", "login"):
+                        probe_data[name] = "probe@ratelimit.test"
+                    elif name.lower() in ("code", "token"):
+                        probe_data[name] = "000000"
+                    else:
+                        probe_data[name] = f.get("value", "test")
+            else:
+                probe_data = {
+                    "username": "ratelimit_probe_user",
+                    "password": "Wr0ng_P4ss_probe!",
+                    "email": "probe@ratelimit.test",
+                }
+
+            statuses: list[int] = []
             start = time.time()
 
             for _ in range(20):
                 try:
-                    resp = self.session.get(test_url, timeout=self.timeout)
+                    resp = self.session.post(test_url, data=probe_data, timeout=self.timeout)
                     statuses.append(resp.status_code)
                 except Exception:
                     statuses.append(0)
-                times.append(time.time())
+                time.sleep(0.05)
 
             elapsed = time.time() - start
             unique_statuses = set(statuses)
             has_429 = 429 in unique_statuses
             has_5xx = any(s >= 500 for s in unique_statuses)
-            avg_rps = 20 / max(elapsed, 0.1)
 
             if not has_429 and not has_5xx:
+                avg_time = elapsed / 20
+                evidence = (
+                    f"Sent 20 POST requests. Statuses: {sorted(unique_statuses)}. "
+                    f"No 429 received. Avg response time: {avg_time:.2f}s. "
+                    f"Endpoint: {test_url}"
+                )
                 f = finding(
                     vuln_type="Missing Rate Limiting",
                     url=test_url,
-                    severity="medium",
-                    details=f"Endpoint accepted 20 requests in {elapsed:.1f}s ({avg_rps:.0f} req/s) without rate limiting (HTTP 429)",
-                    evidence=f"Statuses: {sorted(unique_statuses)}, RPS: {avg_rps:.0f}",
+                    severity=severity,
+                    details=f"Endpoint accepted 20 POST requests in {elapsed:.1f}s without rate limiting",
+                    evidence=evidence,
                     verification_stage=VerificationStage.VALIDATED.value,
                     validation_steps=[
-                        f"Sent 20 rapid GET requests to {test_url}",
+                        f"Sent 20 rapid POST requests to {test_url}",
                         f"Received statuses: {sorted(unique_statuses)}",
                         f"No 429 returned — rate limiting absent or ineffective",
                     ],

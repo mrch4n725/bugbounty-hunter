@@ -145,7 +145,8 @@ class Reporter:
         'info': 4
     }
     
-    def __init__(self, config: Dict[str, Any], findings: List[Dict[str, Any]], recon_data: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], findings: List[Dict[str, Any]],
+                 recon_data: Dict[str, Any], js_data: Optional[Dict[str, Any]] = None):
         """
         Initialize the Reporter.
         
@@ -153,10 +154,12 @@ class Reporter:
             config (Dict): Configuration dictionary with target, output_dir, timestamp, report_format
             findings (List): List of vulnerability findings
             recon_data (Dict): Reconnaissance data with subdomains and URLs
+            js_data (Dict, optional): JS Intelligence scan results (secrets, endpoints, env_vars)
         """
         self.config = config
         self.findings = findings
         self.recon_data = recon_data or {}
+        self.js_data = js_data or {}
         self.target = config.get('target', 'target')
         self.timestamp = config.get('timestamp', datetime.now().strftime('%Y%m%d_%H%M%S'))
         self.output_dir = config.get('output_dir', './reports')
@@ -375,13 +378,11 @@ class Reporter:
         verification_breakdown = self._get_verification_breakdown()
         subdomains = self.recon_data.get('subdomains', [])
         urls = self.recon_data.get('urls', [])
-        js_endpoints = self.recon_data.get('js_endpoints', [])
-        js_urls = self.recon_data.get('js_urls', [])
 
         config_section = self._create_config_section_html()
         subdomains_section = self._create_subdomains_section_html(subdomains)
         urls_section = self._create_urls_section_html(urls)
-        js_section = self._create_js_section_html(js_endpoints, js_urls)
+        js_section = self._create_js_section_html(self.js_data)
 
         total = sum(severity_counts.values())
         cards_html = self._build_stat_cards_html(severity_counts, verification_breakdown)
@@ -725,20 +726,66 @@ class Reporter:
             </div>'''
         return html
 
-    def _create_js_section_html(self, js_endpoints: List[str], js_urls: List[str]) -> str:
-        if not js_endpoints and not js_urls:
+    def _create_js_section_html(self, js_data: dict) -> str:
+        """Render JS Intelligence section from js_data dict."""
+        secrets = js_data.get("secrets", [])
+        endpoints = js_data.get("endpoints", [])
+        hidden = js_data.get("hidden_endpoints", [])
+        env_vars = js_data.get("env_vars", [])
+        js_urls = self.recon_data.get("js_urls", [])
+
+        if not any([secrets, endpoints, hidden, env_vars, js_urls]):
             return ""
+
         html = '<section><h2>JavaScript Intelligence</h2>'
-        if js_urls:
-            html += '<div style="margin-bottom:12px"><strong>JS Bundles:</strong></div><div class="recon-grid">'
-            for u in js_urls[:30]:
-                html += f'<span class="url">{u}</span>'
+
+        # ── Secrets table ────────────────────────────────────────────
+        if secrets:
+            html += '<h3 style="font-size:1.1em;margin:12px 0 8px;color:var(--text)">Discovered Secrets</h3>'
+            html += '<table><thead><tr><th>Type</th><th>Value</th><th>Source File</th><th>Validated</th></tr></thead><tbody>'
+            for s in secrets:
+                if s.get("confidence") == "none":
+                    continue
+                val = s.get("value", "")[:40] + "..." if len(s.get("value", "")) > 40 else s.get("value", "")
+                source = s.get("source_url", "").split("/")[-1] or s.get("source_url", "")
+                validated = s.get("validated")
+                if validated is True:
+                    badge = '<span style="color:#2ecc71;font-weight:bold">✓ Confirmed</span>'
+                    row_class = "style=\"background:rgba(46,204,113,.08)\""
+                else:
+                    badge = '<span style="color:#f1c40f;font-weight:bold">? Unverified</span>'
+                    row_class = "style=\"background:rgba(241,196,15,.06)\""
+                html += f'<tr {row_class}><td>{s.get("type", "")}</td><td style="font-family:monospace;font-size:.85em">{val}</td><td>{source}</td><td>{badge}</td></tr>'
+            html += '</tbody></table>'
+        else:
+            html += '<p>No secrets found in JavaScript files.</p>'
+
+        # ── Endpoints table ──────────────────────────────────────────
+        all_eps = list(endpoints) + list(hidden)
+        if all_eps:
+            html += '<h3 style="font-size:1.1em;margin:20px 0 8px;color:var(--text)">Discovered Endpoints</h3>'
+            html += '<table><thead><tr><th>Type</th><th>Endpoint</th><th>Source File</th></tr></thead><tbody>'
+            for ep in all_eps[:100]:
+                ep_url = ep.get("url", "")
+                ep_type = ep.get("type", "")
+                source = ep.get("source_url", "").split("/")[-1] or ""
+                style = ""
+                if ep in hidden:
+                    style = "style=\"color:#e67e22;\""
+                html += f'<tr><td>{ep_type}</td><td {style} style="font-family:monospace;font-size:.85em;word-break:break-all">{ep_url}</td><td>{source}</td></tr>'
+            html += '</tbody></table>'
+        else:
+            html += '<p>No additional endpoints discovered.</p>'
+
+        # ── Env vars section ─────────────────────────────────────────
+        if env_vars:
+            html += '<h3 style="font-size:1.1em;margin:20px 0 8px;color:var(--text)">Environment Variable References</h3>'
+            html += '<p style="margin-bottom:8px;color:var(--text2);font-size:.85em">These indicate what configuration the application expects — useful for identifying further attack surface.</p>'
+            html += '<div class="recon-grid">'
+            for ev in env_vars:
+                html += f'<span class="url" style="font-size:.82em">{ev.get("variable", "")}</span>'
             html += '</div>'
-        if js_endpoints:
-            html += '<div style="margin:12px 0 8px"><strong>Discovered JS Endpoints:</strong></div><div class="recon-grid">'
-            for ep in js_endpoints[:40]:
-                html += f'<span class="url">{ep}</span>'
-            html += '</div>'
+
         html += '</section>'
         return html
     
@@ -784,6 +831,12 @@ class Reporter:
             'recon_data': {
                 'subdomains': self.recon_data.get('subdomains', []),
                 'urls': self.recon_data.get('urls', [])
+            },
+            'js_intelligence': {
+                'secrets': self.js_data.get('secrets', []),
+                'endpoints': self.js_data.get('endpoints', []),
+                'hidden_endpoints': self.js_data.get('hidden_endpoints', []),
+                'env_vars': self.js_data.get('env_vars', []),
             }
         }
         

@@ -4,6 +4,4 @@ lxml>=4.9.0
 urllib3>=2.0.0
 PyYAML>=6.0
 rich>=13.0.0
-tqdm
 playwright>=1.40.0
-openai>=1.0.0

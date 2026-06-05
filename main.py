@@ -16,7 +16,8 @@ from modules.scanner import VulnScanner
 from modules.api_scanner import ApiScanner
 from modules.idor import IdorScanner
 from modules.reporter import Reporter
-from modules.utils import banner, log, Colors, ScopeEnforcer
+from modules.js_intelligence import JSIntelligence
+from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session
 
 
 def parse_args():
@@ -294,7 +295,7 @@ def _start_autosave(config, recon_data, all_findings, all_findings_lock):
         return stop_event, None
 
     def worker():
-        reporter = Reporter(config, [], recon_data)
+        reporter = Reporter(config, [], recon_data, js_data=js_data)
         while not stop_event.wait(interval):
             with all_findings_lock:
                 reporter.findings = list(all_findings)
@@ -368,9 +369,9 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     _collect_module_findings(modules, config, run_all, disabled_modules, all_findings, lock)
 
 
-def _write_report_and_summary(config, all_findings, recon_data) -> int:
+def _write_report_and_summary(config, all_findings, recon_data, js_data=None) -> int:
     try:
-        report_path = Reporter(config, all_findings, recon_data).generate()
+        report_path = Reporter(config, all_findings, recon_data, js_data=js_data).generate()
         log(f"\n[✓] Report saved → {report_path}", Colors.GREEN)
     except Exception as e:
         log(f"\n[✗] Failed to save report: {e}", Colors.RED)
@@ -436,6 +437,66 @@ def main():
     recon, recon_data = _run_recon_if_needed(
         config, _should_run_recon(config, run_all, disabled_modules)
     )
+
+    # ── JS Intelligence scan ─────────────────────────────────────────────
+    js_data: dict = {
+        "secrets": [], "endpoints": [], "hidden_endpoints": [],
+        "routes": [], "env_vars": [], "hardcoded_values": [],
+    }
+    js_urls = recon_data.get("js_urls", [])
+    run_js = (
+        "all" in config["modules"] or "js_secrets" in config["modules"]
+    ) and bool(js_urls) and not config.get("passive", False)
+
+    if run_js:
+        log("[*] Running JS Intelligence scan...", Colors.YELLOW)
+        js_intel = JSIntelligence(base_url=config["target"], config=config)
+        js_session = make_session(config)
+        max_js = 50
+        urls_to_scan = js_urls[:max_js]
+        if len(js_urls) > max_js:
+            log(f"[!] {len(js_urls)} JS bundles found, scanning first {max_js} (--max-urls to increase)",
+                Colors.YELLOW)
+
+        for url in urls_to_scan:
+            resp = safe_get(js_session, url, timeout=config.get("timeout", 10), raise_for_status=False)
+            if resp is None or resp.status_code >= 400:
+                continue
+            result = js_intel.analyze(resp.text, source_url=url)
+            for key in ("secrets", "endpoints", "hidden_endpoints", "routes", "env_vars", "hardcoded_values"):
+                js_data.setdefault(key, []).extend(result.get(key, []))
+
+        # Add discovered same-domain URLs to scan target list
+        for ep in js_data.get("endpoints", []):
+            ep_url = ep.get("url", "")
+            if ep_url and same_domain(config["target"], ep_url):
+                if ep_url not in recon_data["urls"]:
+                    recon_data["urls"].append(ep_url)
+        for ep in js_data.get("hidden_endpoints", []):
+            ep_url = ep.get("url", "")
+            if ep_url and same_domain(config["target"], ep_url):
+                if ep_url not in recon_data["urls"]:
+                    recon_data["urls"].append(ep_url)
+
+        # Generate findings from secrets
+        for entry in js_data.get("secrets", []):
+            if entry.get("confidence") == "none":
+                continue
+            f = finding(
+                vuln_type=f"Exposed JS Secret ({entry['type']})",
+                url=entry.get("source_url", ""),
+                severity="critical" if entry.get("validated") else "high",
+                details=f"Secret type '{entry['type']}' found in JS file",
+                evidence=f"Match: {entry['value'][:40]}... Source: {entry.get('source_url', '')}",
+            )
+            if f:
+                all_findings.append(f)
+
+        secret_count = len(js_data.get("secrets", []))
+        endpoint_count = len(js_data.get("endpoints", [])) + len(js_data.get("hidden_endpoints", []))
+        log(f"[+] JS Intelligence scan complete: {secret_count} secrets, {endpoint_count} endpoints",
+            Colors.GREEN)
+
     all_findings_lock = threading.Lock()
     stop_autosave, autosave_thread = _start_autosave(
         config, recon_data, all_findings, all_findings_lock
@@ -444,7 +505,7 @@ def main():
     if autosave_thread:
         stop_autosave.set()
         autosave_thread.join(timeout=2)
-    return _write_report_and_summary(config, all_findings, recon_data)
+    return _write_report_and_summary(config, all_findings, recon_data, js_data=js_data)
 
 
 if __name__ == "__main__":
