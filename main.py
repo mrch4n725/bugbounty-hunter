@@ -29,7 +29,7 @@ def parse_args():
     parser.add_argument("--config", "-C", help="Path to YAML configuration file")
     parser.add_argument("--target", "-t", help="Target URL (e.g. https://example.com)")
     parser.add_argument("--modules", "-m", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "all"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "all"],
         default=["all"])
     parser.add_argument("--output", "-o", default="reports")
     parser.add_argument("--format", "-f", choices=["json", "html", "txt", "markdown-report", "hackerone", "bugcrowd"], default="html")
@@ -52,7 +52,7 @@ def parse_args():
         help="Out-of-band callback host for SSRF and SQLi OOB verification (e.g. Burp Collaborator or interactsh URL)")
     parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
     parser.add_argument("--disable-modules", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting"],
         default=[], help="Disable specific modules when scanning all or default modules")
     parser.add_argument("--module-param", action="append", default=[],
         help="Override module settings using module.key=value")
@@ -125,12 +125,16 @@ def _apply_scalar_config(cli_args, config_file: dict) -> None:
         'include_paths': 'include_paths',
         'autosave_interval': 'autosave_interval',
     }
-    defaulted = {'threads', 'timeout', 'retries', 'crawl_depth', 'autosave_interval', 'rps'}
+    arg_defaults = {
+        'threads': 10, 'timeout': 10, 'retries': 3,
+        'crawl_depth': 2, 'autosave_interval': 0, 'rps': 5.0,
+    }
     for yaml_key, arg_key in yaml_to_arg.items():
         if yaml_key not in config_file:
             continue
         cli_value = getattr(cli_args, arg_key, None)
-        if cli_value is None or (arg_key in defaulted and cli_value in (10, 2, 3, 0, 5.0)):
+        is_default = cli_value is None or cli_value == arg_defaults.get(arg_key)
+        if is_default:
             setattr(cli_args, arg_key, config_file[yaml_key])
 
 
@@ -297,14 +301,15 @@ def _run_recon_if_needed(config: dict, run_recon: bool):
     return recon, recon_data
 
 
-def _start_autosave(config, recon_data, all_findings, all_findings_lock):
+def _start_autosave(config, recon_data, all_findings, all_findings_lock, js_data=None):
     interval = config.get("autosave_interval", 0)
     stop_event = threading.Event()
+    _js_data = js_data or {}
     if interval <= 0:
         return stop_event, None
 
     def worker():
-        reporter = Reporter(config, [], recon_data, js_data=js_data)
+        reporter = Reporter(config, [], recon_data, js_data=_js_data)
         while not stop_event.wait(interval):
             with all_findings_lock:
                 reporter.findings = list(all_findings)
@@ -341,6 +346,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     TARGET_LEVEL: set[str] = {
         "headers", "dirb", "exposed_files", "clickjacking",
         "subdomain_takeover", "graphql", "blind_xss", "js_secrets", "api",
+        "ssti",
     }
 
     if config["passive"]:
@@ -359,6 +365,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         "xss": scanner.scan_xss, "sqli": scanner.scan_sqli,
         "lfi": scanner.scan_lfi, "ssrf": scanner.scan_ssrf,
         "xxe": scanner.scan_xxe,
+        "ssti": scanner.scan_ssti,
         "cmd_injection": scanner.scan_command_injection,
         "blind_xss": scanner.scan_blind_xss,
         "open_redirect": scanner.scan_open_redirect,
@@ -446,13 +453,20 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     # Merge TARGET_LEVEL findings (ApiScanner/IdorScanner don't use self._add())
     # by fingerprint to avoid duplicating VulnScanner entries already in dedup.
     seen_fingerprints = {f.get("fingerprint") for f in updated if f.get("fingerprint")}
+    seen_urls_types: set[tuple] = {
+        (f.get("url", ""), f.get("type", "")) for f in updated
+    }
     for f in all_findings_local:
         fp = f.get("fingerprint")
-        if fp and fp not in seen_fingerprints:
-            seen_fingerprints.add(fp)
-            updated.append(f)
-        elif not fp:
-            updated.append(f)
+        if fp:
+            if fp not in seen_fingerprints:
+                seen_fingerprints.add(fp)
+                updated.append(f)
+        else:
+            key = (f.get("url", ""), f.get("type", ""))
+            if key not in seen_urls_types:
+                seen_urls_types.add(key)
+                updated.append(f)
 
     with lock:
         all_findings.clear()
@@ -589,7 +603,7 @@ def main():
 
     all_findings_lock = threading.Lock()
     stop_autosave, autosave_thread = _start_autosave(
-        config, recon_data, all_findings, all_findings_lock
+        config, recon_data, all_findings, all_findings_lock, js_data=js_data
     )
     _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, all_findings_lock)
     if autosave_thread:

@@ -882,7 +882,9 @@ class VulnScanner:
             except Exception as e:
                 log(f"  [SSTI] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
 
-        return self._get_findings()
+        for f in findings:
+            self._add(f)
+        return findings
 
     def _ssti_test_parameter(self, url: str, param: str) -> Optional[dict]:
         ssti_payloads = self._load_payloads("ssti")
