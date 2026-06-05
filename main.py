@@ -396,6 +396,13 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         log(f"    {rank:>2}. [{score:>3}] {url}", Colors.CYAN)
 
     # ── Step 4: Per-URL intelligent module selection ─────────────────────
+    # Data-flow: every VulnScanner scan method writes findings via
+    # self._add() into scanner.dedup.  ApiScanner and IdorScanner write
+    # into their returned list via _append_finding().  The single
+    # authoritative read is scanner._get_findings() (Step 5).  The per-URL
+    # loop intentionally discards return values — all findings reach the
+    # dedup via self._add().  Modules that don't use self._add() are
+    # collected via all_findings_local and merged in Step 5.
     per_url_modules = {k: v for k, v in module_map.items() if k not in TARGET_LEVEL}
 
     for url in sorted_urls:
@@ -411,15 +418,13 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         if not applicable:
             continue
 
-        log(f"[*] {url} → {len(applicable)} modules selected: {sorted(applicable)}", Colors.YELLOW, verbose_only=True, verbose=config.get("verbose", False))
+        if config.get("verbose", False):
+            log(f"[*] {url} → {len(applicable)} modules selected: {sorted(applicable)}", Colors.YELLOW)
 
         for mod_name in applicable:
             try:
                 mod_fn = per_url_modules[mod_name]
-                findings = mod_fn(target_urls=[url])
-                if findings:
-                    with lock:
-                        all_findings_local.extend(findings)
+                mod_fn(target_urls=[url])  # findings written via self._add() to scanner.dedup
             except Exception as e:
                 log(f"  [!] {mod_name} error on {url}: {e}", Colors.RED, verbose_only=True, verbose=config.get("verbose", False))
 
@@ -437,6 +442,17 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
 
     from modules.utils import prioritize_findings
     updated = prioritize_findings(updated)
+
+    # Merge TARGET_LEVEL findings (ApiScanner/IdorScanner don't use self._add())
+    # by fingerprint to avoid duplicating VulnScanner entries already in dedup.
+    seen_fingerprints = {f.get("fingerprint") for f in updated if f.get("fingerprint")}
+    for f in all_findings_local:
+        fp = f.get("fingerprint")
+        if fp and fp not in seen_fingerprints:
+            seen_fingerprints.add(fp)
+            updated.append(f)
+        elif not fp:
+            updated.append(f)
 
     with lock:
         all_findings.clear()
