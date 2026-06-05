@@ -24,9 +24,102 @@ CVSS_VECTORS: Dict[str, str] = {
 }
 
 
+# ── Impact assessment matrix ────────────────────────────────────────────────────
+# Maps vulnerability type → (data_exposure, ato_potential, rce_potential, biz_impact_desc)
+IMPACT_MATRIX: Dict[str, tuple] = {
+    "xss":             (2, 5, 0, "Account takeover via session theft, phishing, or UI redressing"),
+    "sqli":            (5, 4, 2, "Full database exfiltration, authentication bypass, data integrity loss"),
+    "lfi":             (4, 0, 0, "Source code disclosure, credential leak, path traversal data access"),
+    "ssrf":            (4, 0, 4, "Internal network scanning, cloud metadata access, pivot to internal services"),
+    "xxe":             (5, 0, 3, "File disclosure, SSRF pivot, denial of service, data exfiltration"),
+    "cmd_injection":   (5, 5, 5, "Full server compromise, lateral movement, data destruction or exfiltration"),
+    "blind_xss":       (2, 4, 0, "Session hijacking of privileged users, admin panel compromise"),
+    "open_redirect":   (0, 2, 0, "Phishing, Bypassing URL allowlists, OAuth token theft"),
+    "csrf":            (0, 3, 0, "State-changing actions on behalf of authenticated users"),
+    "idor":            (5, 3, 0, "Unauthorized access to other users' private data, privilege escalation"),
+    "graphql":         (4, 2, 1, "Data disclosure via introspection, batch attacks, query depth abuse"),
+    "sensitive_data":  (5, 0, 0, "Secrets in source/response enable lateral attacks, cloud compromise"),
+    "headers":         (0, 0, 0, "Increased attack surface, missing clickjacking/HSTS protection"),
+    "clickjacking":    (0, 0, 0, "UI redressing, mouse-jacking — chained with XSS for account takeover"),
+    "subdomain_takeover": (0, 2, 0, "Brand impersonation, phishing, credential harvesting"),
+    "command_injection": (5, 5, 5, "Full server compromise, lateral movement, data destruction or exfiltration"),
+}
+
+IMPACT_VULN_EXAMPLES: Dict[str, str] = {
+    "xss":             "alert(1) in browser context",
+    "sqli":            "UNION-based data extraction or blind boolean inference",
+    "lfi":             "/etc/passwd read or log poisoning → RCE",
+    "ssrf":            "Cloud metadata endpoint (169.254.169.254) access",
+    "xxe":             "Out-of-band file read + callback confirmation",
+    "cmd_injection":   "uid= output or OOB nslookup callback",
+    "blind_xss":       "Interactsh callback from admin browser",
+    "open_redirect":   "Redirect to attacker-controlled origin",
+    "csrfs":           "No CSRF token on state-changing endpoints",
+    "idor":            "Parameter tampering reveals other users' data",
+    "graphql":         "Introspection query returns full schema",
+    "sensitive_data":  "Valid AWS key with live STS caller identity",
+    "subdomain_takeover": "DNS CNAME points to unclaimed cloud service",
+}
+
+DATA_EXPOSURE_LABELS = {0: "None", 1: "Low (metadata)", 2: "Medium (limited data)", 3: "High (sensitive data)", 4: "Very High (credentials/keys)", 5: "Critical (full access)"}
+ATO_LABELS = {0: "No risk", 1: "Low", 2: "Medium", 3: "High", 4: "Very High", 5: "Immediate takeover possible"}
+RCE_LABELS = {0: "No risk", 1: "Low", 2: "Medium", 3: "High", 4: "Very High", 5: "Immediate RCE"}
+
+
+def assess_finding_impact(finding: Dict[str, Any]) -> Dict[str, Any]:
+    """Assess and enrich a finding with detailed impact analysis."""
+    title = (finding.get("title") or finding.get("details") or "").lower()
+    vuln_type = title.split(" ")[0].lower() if title else ""
+    sev = finding.get("severity", "info").lower()
+
+    matrix_entry = None
+    # best-match vuln type
+    for key in IMPACT_MATRIX:
+        if key in title or title.startswith(key):
+            matrix_entry = IMPACT_MATRIX[key]
+            break
+    if not matrix_entry:
+        # fallback by severity
+        data_exp, ato, rce = {
+            "critical": (5, 5, 5),
+            "high": (4, 3, 2),
+            "medium": (2, 1, 0),
+            "low": (1, 0, 0),
+        }.get(sev, (0, 0, 0))
+    else:
+        data_exp, ato, rce, biz_impact = matrix_entry
+        finding["business_impact"] = biz_impact
+
+    finding.setdefault("impact_assessment", {})
+    ia = finding["impact_assessment"]
+    ia["data_exposure"] = {"score": data_exp, "label": DATA_EXPOSURE_LABELS.get(data_exp, "Unknown")}
+    ia["account_takeover_potential"] = {"score": ato, "label": ATO_LABELS.get(ato, "Unknown")}
+    ia["rce_potential"] = {"score": rce, "label": RCE_LABELS.get(rce, "Unknown")}
+
+    demonstrated = finding.get("demonstrated_impact", "").strip()
+    is_theoretical = finding.get("verification_stage") in ("detected",)
+    ia["demonstrated_impact"] = demonstrated or (
+        "None yet — theoretical risk only (reflection confirmed, execution not verified)"
+        if is_theoretical
+        else IMPACT_VULN_EXAMPLES.get(vuln_type, "See evidence")
+    )
+
+    # combine into overall textual impact
+    parts = []
+    if biz_impact := finding.get("business_impact"):
+        parts.append(f"Business: {biz_impact}")
+    parts.append(f"Data exposure: {ia['data_exposure']['label']}")
+    parts.append(f"ATO potential: {ia['account_takeover_potential']['label']}")
+    parts.append(f"RCE potential: {ia['rce_potential']['label']}")
+    parts.append(f"Demonstrated: {ia['demonstrated_impact']}")
+    ia["narrative"] = " | ".join(parts)
+
+    return finding
+
+
 class Reporter:
     """
-    Generates vulnerability scan reports in multiple formats (HTML, JSON, TXT).
+    Generates vulnerability scan reports in multiple formats (HTML, JSON, TXT, Markdown, HackerOne, Bugcrowd).
     
     Attributes:
         config (Dict): Configuration dictionary containing target, output_dir, timestamp, report_format
@@ -68,6 +161,9 @@ class Reporter:
         self.timestamp = config.get('timestamp', datetime.now().strftime('%Y%m%d_%H%M%S'))
         self.output_dir = config.get('output_dir', './reports')
         self.report_format = config.get('report_format', 'html').lower()
+
+        # Run impact assessment on all findings
+        self.findings = [assess_finding_impact(f) for f in self.findings]
         
     def _sanitize_target(self) -> str:
         """
@@ -133,41 +229,77 @@ class Reporter:
         """Return (confirmed, unconfirmed) counts."""
         confirmed = sum(1 for f in self.findings if f.get("confirmed"))
         return {"confirmed": confirmed, "unconfirmed": len(self.findings) - confirmed}
+
+    def _get_confidence_breakdown(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {"confirmed": 0, "high": 0, "likely": 0, "unverified": 0}
+        for f in self.findings:
+            score = f.get("confidence_score")
+            if score is None:
+                counts["unverified"] += 1
+            elif score >= 86:
+                counts["confirmed"] += 1
+            elif score >= 61:
+                counts["high"] += 1
+            elif score >= 31:
+                counts["likely"] += 1
+            else:
+                counts["unverified"] += 1
+        return counts
+
+    def _get_verification_breakdown(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {"detected": 0, "validated": 0, "exploitable": 0}
+        for f in self.findings:
+            stage = f.get("verification_stage", "detected").lower()
+            if stage in counts:
+                counts[stage] += 1
+        return counts
     
+    def _confidence_badge_html(self, score: Optional[float]) -> str:
+        if score is None:
+            return '<span style="color:#95a5a6">—</span>'
+        score_class = "high" if score >= 61 else ("medium" if score >= 31 else "low")
+        colors = {"low": "#e74c3c", "medium": "#f1c40f", "high": "#2ecc71"}
+        return f'<span style="color:{colors[score_class]};font-weight:bold">{score:.0f}</span>'
+
+    def _verification_badge_html(self, stage: Optional[str]) -> str:
+        if not stage:
+            return '<span style="color:#95a5a6">—</span>'
+        colors = {"detected": "#e74c3c", "validated": "#f39c12", "exploitable": "#2ecc71"}
+        color = colors.get(stage.lower(), "#95a5a6")
+        return f'<span style="color:{color};font-weight:bold">{stage.title()}</span>'
+
     def _create_findings_table_html(self, sorted_findings: List[Dict[str, Any]]) -> str:
-        """
-        Create HTML table rows for findings.
-        
-        Args:
-            sorted_findings (List): Sorted list of findings
-            
-        Returns:
-            str: HTML table content
-        """
         if not sorted_findings:
             return '<div class="empty-message">No vulnerabilities found.</div>'
         
-        rows = '<table><thead><tr><th>Title</th><th>URL</th><th>Severity</th><th>Confirmed</th><th>Details</th></tr></thead><tbody>'
+        rows = '<table><thead><tr><th>Title</th><th>URL</th><th>Severity</th><th>Confidence</th><th>Verification</th><th>Details</th></tr></thead><tbody>'
         for finding in sorted_findings:
             severity = finding.get('severity', 'info').lower()
-            confirmed = finding.get('confirmed', False)
-            conf_badge = ('<span style="color:#2ecc71;font-weight:bold">YES</span>'
-                          if confirmed else
-                          '<span style="color:#e74c3c;font-weight:bold">NO</span>')
+            confidence_score = finding.get('confidence_score')
+            verification_stage = finding.get('verification_stage', '')
+            evidence_strength = finding.get('evidence_strength', '')
+            fpr = finding.get('false_positive_risk', '')
             details = finding.get('details', 'N/A')
             evidence = finding.get('evidence', '')
+            validation_steps = finding.get('validation_steps', [])
             recommendation = finding.get('recommendation', '')
             details_html = f"<div>{details}</div>"
             if evidence:
                 details_html += f"<div><strong>Evidence:</strong> {evidence}</div>"
+            if validation_steps:
+                steps = "<br>".join(f"▸ {s}" for s in validation_steps[:5])
+                details_html += f"<div><strong>Validation:</strong><br>{steps}</div>"
             if recommendation:
                 details_html += f"<div><strong>Recommendation:</strong> {recommendation}</div>"
+            if fpr:
+                details_html += f"<div><strong>FP Risk:</strong> {fpr}</div>"
 
             rows += f'''<tr>
                     <td>{finding.get('title', 'N/A')}</td>
                     <td><span class="url">{finding.get('url', 'N/A')}</span></td>
                     <td><span class="severity-badge severity-{severity}">{severity.upper()}</span></td>
-                    <td style="text-align:center">{conf_badge}</td>
+                    <td style="text-align:center">{self._confidence_badge_html(confidence_score)}</td>
+                    <td style="text-align:center">{self._verification_badge_html(verification_stage)}</td>
                     <td><div class="detail-text">{details_html}</div></td>
                 </tr>'''
         rows += '</tbody></table>'
@@ -242,6 +374,8 @@ class Reporter:
         sorted_findings = self._sort_findings()
         severity_counts = self._get_severity_counts()
         confirm_counts = self._get_confirmed_counts()
+        confidence_breakdown = self._get_confidence_breakdown()
+        verification_breakdown = self._get_verification_breakdown()
         subdomains = self.recon_data.get('subdomains', [])
         urls = self.recon_data.get('urls', [])
         
@@ -492,6 +626,22 @@ class Reporter:
                 <div class="card-label">Unconfirmed</div>
                 <div class="card-value">{confirm_counts['unconfirmed']}</div>
             </div>
+            <div class="card" style="background:#2a2a2a;border-left:5px solid #2ecc71;padding:20px;border-radius:4px">
+                <div class="card-label">Confirmed</div>
+                <div class="card-value">{confidence_breakdown['confirmed']}</div>
+            </div>
+            <div class="card" style="background:#2a2a2a;border-left:5px solid #f39c12;padding:20px;border-radius:4px">
+                <div class="card-label">Validated</div>
+                <div class="card-value">{verification_breakdown['validated']}</div>
+            </div>
+            <div class="card" style="background:#2a2a2a;border-left:5px solid #e74c3c;padding:20px;border-radius:4px">
+                <div class="card-label">Detected</div>
+                <div class="card-value">{verification_breakdown['detected']}</div>
+            </div>
+            <div class="card" style="background:#2a2a2a;border-left:5px solid #9b59b6;padding:20px;border-radius:4px">
+                <div class="card-label">Exploitable</div>
+                <div class="card-value">{verification_breakdown['exploitable']}</div>
+            </div>
         </section>
         
         {config_section}
@@ -522,6 +672,8 @@ class Reporter:
         sorted_findings = self._sort_findings()
         severity_counts = self._get_severity_counts()
         confirm_counts = self._get_confirmed_counts()
+        confidence_breakdown = self._get_confidence_breakdown()
+        verification_breakdown = self._get_verification_breakdown()
         
         report_data = {
             'metadata': {
@@ -542,7 +694,11 @@ class Reporter:
                 'retries': self.config.get('retries'),
                 'module_params': self.config.get('module_params', {})
             },
-            'summary': severity_counts,
+            'summary': {
+                'severity': severity_counts,
+                'confidence': confidence_breakdown,
+                'verification_stage': verification_breakdown,
+            },
             'verification': confirm_counts,
             'findings': sorted_findings,
             'recon_data': {
@@ -607,19 +763,31 @@ VULNERABILITY FINDINGS
             txt_content += "\nNo vulnerabilities found.\n"
         else:
             for i, finding in enumerate(sorted_findings, 1):
+                score = finding.get('confidence_score')
+                score_str = f"{score:.0f}/100" if score is not None else "—"
+                stage = finding.get('verification_stage', '').title() or "—"
+                fpr = finding.get('false_positive_risk', '')
+                evidence_strength = finding.get('evidence_strength', '')
                 txt_content += f"""
 [{i}] {finding.get('title', 'N/A')}
-    Severity: {finding.get('severity', 'N/A').upper()}
-    URL: {finding.get('url', 'N/A')}
-    Confirmed: {'YES' if finding.get('confirmed') else 'NO'}
-    Details: {finding.get('details', 'N/A')}
+    Severity    : {finding.get('severity', 'N/A').upper()}
+    Confidence  : {score_str}
+    Verification: {stage}
+    FP Risk     : {fpr or '—'}
+    Evidence    : {evidence_strength or '—'}
+    URL         : {finding.get('url', 'N/A')}
+    Details     : {finding.get('details', 'N/A')}
 """
                 if finding.get('evidence'):
-                    txt_content += f"    Evidence: {finding['evidence']}\n"
+                    txt_content += f"    Raw Evidence: {finding['evidence'][:200]}\n"
+                validation_steps = finding.get('validation_steps', [])
+                if validation_steps:
+                    for vs in validation_steps[:5]:
+                        txt_content += f"    ⬩ {vs}\n"
                 if finding.get('impact'):
                     txt_content += f"    Impact: {finding['impact']}\n"
                 if finding.get('recommendation'):
-                    txt_content += f"    Recommendation: {finding['recommendation']}\n"
+                    txt_content += f"    Fix    : {finding['recommendation']}\n"
                 txt_content += "\n"
         
         if subdomains:
@@ -832,11 +1000,23 @@ End of Report
             filename = f"{vuln_type}_{safe_target}.md"
             filepath = os.path.join(md_dir, filename)
 
+            score = finding.get('confidence_score')
+            score_str = f"{score:.0f}/100" if score is not None else "—"
+            stage = finding.get('verification_stage', '').title() or "—"
+            fpr = finding.get('false_positive_risk', '')
+            evidence_strength = finding.get('evidence_strength', '')
+            validation_steps = finding.get('validation_steps', [])
+            grouped_urls = finding.get('grouped_urls', [])
+
             content = f"""# {finding.get('title', 'Vulnerability Report')}
 
 **Target:** `{self.target}`
 **Component:** `{component}`
 **Severity:** {finding.get('severity', 'info').upper()}
+**Confidence:** {score_str}
+**Verification Stage:** {stage}
+**Evidence Strength:** {evidence_strength or '—'}
+**False Positive Risk:** {fpr or '—'}
 **Confirmed:** {"Yes" if confirmed else "No"}
 **CVSS Score:** {cvss_score} ({rating})
 **CVSS Vector:** `{cvss_vector}`
@@ -849,8 +1029,19 @@ End of Report
 
 ## Steps to Reproduce
 {steps}
+"""
+            if validation_steps:
+                content += "## Validation Steps\n\n"
+                for i, vs in enumerate(validation_steps, 1):
+                    content += f"{i}. {vs}\n"
+                content += "\n"
+            if grouped_urls:
+                content += "## Affected URLs\n\n"
+                for gu in grouped_urls:
+                    content += f"- {gu}\n"
+                content += "\n"
 
-## Impact
+            content += f"""## Impact
 
 {impact}
 
@@ -868,6 +1059,188 @@ End of Report
                 f.write(content)
 
         return md_dir
+
+    def _hackerone_vuln_section(self, f: Dict[str, Any]) -> str:
+        """Generate one vulnerability section in HackerOne submission format."""
+        sev = f.get("severity", "info").upper()
+        title = f.get("title") or f.get("details", "Untitled")
+        component = f.get("component") or f.get("url", self.target)
+        what = f.get("what_is_it") or f.get("details", "")
+        impact_narrative = f.get("impact_assessment", {}).get("narrative", "")
+        steps = f.get("validation_steps") or f.get("steps_to_reproduce", "")
+        if isinstance(steps, list):
+            steps = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
+        evidence = f.get("proof") or f.get("evidence") or f.get("request_response", "")
+        if isinstance(evidence, dict):
+            evidence = json.dumps(evidence, indent=2)
+        remediation = f.get("remediation") or f.get("recommendation", "")
+
+        grouped = f.get("grouped_urls", [])
+        affected_urls = "\n".join(f"- {u}" for u in grouped) if grouped else f"- {f.get('url', self.target)}"
+
+        ia = f.get("impact_assessment", {})
+        fp_risk = f.get("false_positive_risk", "")
+
+        return f"""### {title}
+
+**Severity:** {sev}
+**Component:** {component}
+**CVSS:** {f.get('cvss_score', '—')} ({f.get('cvss_rating', '—')})
+
+#### Summary
+{what}
+
+#### Affected URLs
+{affected_urls}
+
+#### Steps to Reproduce
+{steps}
+
+#### Evidence
+```
+{self._format_evidence(evidence, 50)}
+```
+
+#### Impact
+{impact_narrative}
+
+#### Recommended Fix
+{remediation}
+
+#### False Positive Risk
+{fp_risk}
+
+---
+"""
+
+    def _generate_hackerone_report(self) -> str:
+        """Generate a HackerOne-ready markdown report with all findings."""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+        high_sev = [f for f in self.findings if f.get("severity", "info").lower() in ("critical", "high")]
+        medium_sev = [f for f in self.findings if f.get("severity", "info").lower() == "medium"]
+        low_sev = [f for f in self.findings if f.get("severity", "info").lower() in ("low", "info")]
+
+        sections = []
+        for label, group in [("Critical & High", high_sev), ("Medium", medium_sev), ("Low & Info", low_sev)]:
+            if not group:
+                continue
+            sections.append(f"## {label} Severity Findings\n")
+            for f in group:
+                sections.append(self._hackerone_vuln_section(f))
+
+        total = len(self.findings)
+        body = "\n".join(sections) if sections else "No vulnerabilities detected during this scan."
+
+        return f"""# Bug Bounty Report: {self.target}
+
+**Generated:** {now}
+**Tool:** BugBounty-Hunter
+**Total Findings:** {total}
+
+---
+
+{body}
+
+## Summary
+
+This report was automatically generated by BugBounty-Hunter. \
+Each finding includes severity, CVSS score, reproduction steps, evidence, and impact assessment. \
+Please verify each finding before submitting.
+
+---
+
+*Report generated by BugBounty-Hunter — https://github.com/anomalyco/bugbounty-hunter*
+"""
+
+    def _generate_bugcrowd_report(self) -> str:
+        """Generate a Bugcrowd-ready markdown report."""
+        # Bugcrowd prefers per-finding submissions; generate a summary + per-finding details
+        now = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+
+        summary_rows = []
+        for i, f in enumerate(self.findings, 1):
+            sev = f.get("severity", "info").upper()
+            title = f.get("title") or f.get("details", "Untitled")
+            url = f.get("url", self.target)
+            stage = f.get("verification_stage", "").title() or "Detected"
+            confidence = f.get("confidence_score")
+            cs = f"{confidence:.0f}/100" if confidence is not None else "—"
+            summary_rows.append(f"| {i} | {title} | {sev} | `{url}` | {stage} | {cs} |")
+
+        summary_table = "\n".join(summary_rows) if summary_rows else "No findings."
+
+        per_finding = []
+        for i, f in enumerate(self.findings, 1):
+            title = f.get("title") or f.get("details", "Untitled")
+            sev = f.get("severity", "info").upper()
+            what = f.get("what_is_it") or f.get("details", "")
+            impact = f.get("impact_assessment", {}).get("narrative", "")
+            steps = f.get("validation_steps") or f.get("steps_to_reproduce", "")
+            if isinstance(steps, list):
+                steps = "\n".join(f"{j+1}. {s}" for j, s in enumerate(steps))
+            remed = f.get("remediation") or f.get("recommendation", "")
+            evidence = f.get("proof") or f.get("evidence", "")
+            if isinstance(evidence, dict):
+                evidence = json.dumps(evidence, indent=2)
+
+            grouped = f.get("grouped_urls", [])
+            urls = "\n".join(f"- {u}" for u in grouped) if grouped else f"- {f.get('url', self.target)}"
+
+            per_finding.append(f"""## Finding #{i}: {title}
+
+| Field | Value |
+|-------|-------|
+| Severity | {sev} |
+| URL | `{f.get('url', self.target)}` |
+| Verification Stage | {f.get('verification_stage', '').title() or 'Detected'} |
+| Confidence | {cs} |
+| CVSS | {f.get('cvss_score', '—')} ({f.get('cvss_rating', '—')}) |
+
+### Description
+{what}
+
+### Affected URLs
+{urls}
+
+### Steps to Reproduce
+{steps}
+
+### Evidence
+```
+{self._format_evidence(evidence, 50)}
+```
+
+### Impact
+{impact}
+
+### Remediation
+{remed}
+
+---
+""")
+
+        body = "\n".join(per_finding) if per_finding else "No vulnerabilities detected."
+
+        return f"""# Bugcrowd Submission: {self.target}
+
+**Generated:** {now}
+**Tool:** BugBounty-Hunter
+**Total Findings:** {len(self.findings)}
+
+## Finding Summary
+
+| # | Title | Severity | URL | Stage | Confidence |
+|---|-------|----------|-----|-------|------------|
+{summary_table}
+
+---
+
+{body}
+
+---
+
+*Report generated by BugBounty-Hunter — https://github.com/anomalyco/bugbounty-hunter*
+"""
 
     def generate(self, suffix: str | None = None) -> str:
         """
@@ -909,6 +1282,18 @@ End of Report
                     f.write(report_content)
             elif self.report_format == 'markdown-report':
                 file_path = self._create_markdown_report()
+            elif self.report_format == 'hackerone':
+                report_content = self._generate_hackerone_report()
+                file_extension = 'md'
+                file_path = self._get_report_path(file_extension, suffix)
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(report_content)
+            elif self.report_format == 'bugcrowd':
+                report_content = self._generate_bugcrowd_report()
+                file_extension = 'md'
+                file_path = self._get_report_path(file_extension, suffix)
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(report_content)
             else:
                 raise ValueError(f"Unsupported report format: {self.report_format}")
             

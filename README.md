@@ -2,7 +2,7 @@
 
 # BugBounty Hunter
 
-**Automated web reconnaissance and vulnerability scanning for bug bounty programs**
+**Automated web reconnaissance and vulnerability scanning for bug bounty programs — with evidence-based verification and bug-bounty-grade reporting**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
@@ -17,13 +17,15 @@
 
 ## What it does
 
-BugBounty Hunter is a modular, multithreaded scanner that:
+BugBounty Hunter is a modular, multithreaded scanner with **evidence-based verification** — findings progress through Detection → Validation → Exploitation → Verified, each with confidence scoring and proof-of-concept evidence.
 
-1. **Recon** — crawls the target, discovers URLs, forms, query parameters, and common subdomains.
-2. **Active checks** — fuzzes for XSS, SQLi, LFI, SSRF, open redirects, missing headers, CSRF, exposed files, and more.
-3. **Reporting** — writes HTML, JSON, or plain-text reports with severity summaries and evidence.
+1. **Recon** — crawls the target, discovers URLs, forms, query parameters, subdomains, and mines JavaScript bundles for endpoints/secrets.
+2. **Intelligence** — technology fingerprinting (framework/CMS/language/WAF), JS AST analysis for hidden endpoints and hardcoded credentials.
+3. **Active checks** — fuzzes for XSS, SQLi, LFI, SSRF, XXE, Command Injection, Blind XSS, open redirects, missing headers, CSRF, IDOR, GraphQL, exposed files, subdomain takeover, and more.
+4. **Verification** — OOB callback framework (Interactsh/Collaborator), browser-based XSS execution verification (Playwright), live secret validation (AWS STS, GitHub API, Slack API), multi-signal SQLi, 4-stage SSTI.
+5. **Reporting** — HTML, JSON, TXT, per-finding Markdown, and **bug-bounty-ready** HackerOne/Bugcrowd submission formats with CVSS, impact assessment, and reproduction steps.
 
-Each finding is a structured record with **CVSS metadata**, **confidence** (`confirmed` / `probable` / `tentative`), **fingerprint** (for deduplication), and **timestamp**.
+Each finding is a structured record with **CVSS metadata**, **verification stage** (detected / validated / exploitable / verified), **confidence score** (0–100), **evidence strength** (Weak / Moderate / Strong / Verified), **false positive risk**, **impact assessment** (data exposure / ATO / RCE potential), **fingerprint** (for deduplication), and **grouped URLs**.
 
 ---
 
@@ -108,16 +110,19 @@ Recon and all active modules respect these rules.
 
 | Module | CLI name | Description |
 |--------|----------|-------------|
-| Recon | `recon` | Crawler, subdomain DNS, robots/sitemap, JS endpoint mining |
-| XSS | `xss` | Reflected XSS (URL params + forms) |
-| SQLi | `sqli` | Error-based, boolean-based, time-based blind |
+| Recon | `recon` | Crawler, subdomain DNS, robots/sitemap, JS endpoint mining via JSIntelligence |
+| XSS | `xss` | Context-aware reflected XSS (HTML/attribute/JS/URL) + Playwright execution verification |
+| SQLi | `sqli` | Error-based, boolean-based, time-based blind, OOB callback — requires 2+ signals for Confirmed |
 | LFI | `lfi` | Path traversal / local file inclusion |
-| SSRF | `ssrf` | Internal/metadata URL probes, OOB callback verification |
+| SSRF | `ssrf` | OOB callback + cloud metadata endpoint verification (no parameter-name heuristics) |
+| XXE | `xxe` | In-band file read, error-based leak, OOB blind XXE via Interactsh |
+| Command Injection | `cmd_injection` | Output-based (`uid=`), time-based (≥5s), OOB callback (nslookup/curl) |
+| Blind XSS | `blind_xss` | Inject OOB-payload forms/params, poll for callback from admin browser |
 | Open redirect | `open_redirect` | Redirect parameter abuse |
 | Headers | `headers` | Missing security headers, disclosure, CORS, cookies |
 | CSRF | `csrf` | POST forms without anti-CSRF tokens |
 | Directory fuzz | `dirb` | Common paths and optional wordlist |
-| Sensitive data | `sensitive` | Secret patterns in page bodies |
+| Sensitive data | `sensitive` | Secret patterns in page bodies + **live validation** (AWS keys, GitHub tokens, Slack tokens) |
 | Exposed files | `exposed_files` | `.env`, `.git`, backups, etc. |
 | Clickjacking | `clickjacking` | Missing frame protection |
 | HTTP methods | `http_methods` | Dangerous `Allow` / CORS methods |
@@ -126,7 +131,7 @@ Recon and all active modules respect these rules.
 | GraphQL | `graphql` | Introspection, query batching, alias amplification |
 | IDOR | `idor` | Numeric/UUID parameter mutation and horizontal escalation |
 | API | `api` | OpenAPI/Swagger discovery, REST fuzzing, mass assignment |
-| JS secrets | `js_secrets` | Regex-based secret extraction from JS bundles (recon) |
+| JS secrets | `js_secrets` | AST + regex secret extraction from JS bundles (integrated into recon) |
 
 Use `--modules all` (default) or list modules explicitly. Disable with `--disable-modules sqli sensitive`.
 
@@ -141,7 +146,7 @@ Use `--modules all` (default) or list modules explicitly. Disable with `--disabl
 | `--modules` / `-m` | `all` | Modules to run (see table above) |
 | `--disable-modules` | — | Modules to skip when running `all` |
 | `--output` / `-o` | `reports` | Report output directory |
-| `--format` / `-f` | `html` | `html`, `json`, `txt`, or `markdown-report` |
+| `--format` / `-f` | `html` | `html`, `json`, `txt`, `markdown-report`, `hackerone`, or `bugcrowd` |
 | `--threads` | `10` | Worker threads |
 | `--timeout` | `10` | Request timeout (seconds) |
 | `--crawl-depth` | `2` | Recon crawl depth |
@@ -154,8 +159,8 @@ Use `--modules all` (default) or list modules explicitly. Disable with `--disabl
 | `--proxy` | — | HTTP(S) proxy URL |
 | `--no-verify-ssl` | off | Disable TLS verification |
 | `--wordlist` | — | Extra paths for directory fuzzing |
-| `--oob-host` | — | Out-of-band callback host for SSRF / SQLi OOB verification |
-| `--headless` | off | Use Playwright headless browser for JS-rendered crawling |
+| `--oob-host` | — | Out-of-band callback host for SSRF / SQLi / XXE / Cmd Injection / Blind XSS OOB verification |
+| `--headless` | off | Use Playwright headless browser for JS-rendered crawling + XSS execution verification |
 | `--rps` | `5.0` | Requests per second (halved on 429, restored after 20 OK) |
 | `--stealth` | off | Rotate 20 User-Agent strings, random 0.5–2s delay, shuffle POST params |
 | `--scope` | — | Path to scope file (one domain/IP/CIDR per line) |
@@ -171,30 +176,65 @@ Use `--modules all` (default) or list modules explicitly. Disable with `--disabl
 
 ## Finding format
 
-Findings are produced by `finding()` in `modules/utils.py`:
+Findings are produced by `finding()` (legacy) or `finding_v2()` (explicit stage scoring) in `modules/utils.py`:
 
 ```python
 {
   "title": "Reflected XSS",
   "type": "Reflected XSS",
   "url": "https://example.com/?q=...",
-  "severity": "high",           # critical | high | medium | low | info
-  "details": "...",
-  "evidence": "...",
-  "confidence": "confirmed",    # confirmed | probable | tentative
+  "severity": "high",             # critical | high | medium | low | info
+  "details": "Payload reflected in response without sanitization",
+  "evidence": "<svg/onload=alert(1)>",
+  "confidence": "Probable",
+  "confidence_score": 60,          # 0–100
+  "verification_stage": "validated", # detected | validated | exploitable | verified
+  "evidence_strength": "Moderate",  # Weak | Moderate | Strong | Verified
+  "false_positive_risk": "Medium",  # Low | Medium | High
   "fingerprint": "<sha256>",
   "timestamp": "2026-06-04T12:00:00Z",
   "cvss_score": 6.1,
-  "cvss_vector": "CVSS:3.1/...",
-  "what_is_it": "...",
-  "impact": "...",
-  "remediation": "...",
-  "references": ["https://owasp.org/..."],
-  "grouped_urls": ["..."]       # present when 5+ similar hits collapsed
+  "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+  "what_is_it": "User input is reflected in the HTML response body without encoding",
+  "impact": "Session theft, phishing, or UI redressing via stored/reflected script execution",
+  "remediation": "Apply context-aware output encoding; use Content-Security-Policy",
+  "references": ["https://owasp.org/www-community/attacks/xss/"],
+  "grouped_urls": ["https://...", "https://..."],
+  "validation_steps": [
+    "Payload reflected in response body without sanitization",
+    "Context: HTML attribute — payload breaks out with \"><svg/onload=alert(1)>",
+    "Browser execution verified via Playwright (screenshot captured)"
+  ],
+  "impact_assessment": {
+    "data_exposure": {"score": 2, "label": "Medium (limited data)"},
+    "account_takeover_potential": {"score": 5, "label": "Immediate takeover possible"},
+    "rce_potential": {"score": 0, "label": "No risk"},
+    "demonstrated_impact": "alert(1) in browser context",
+    "narrative": "Business: Account takeover via session theft | Data exposure: Medium | ATO potential: Immediate takeover possible | RCE potential: No risk"
+  }
 }
 ```
 
-The scanner deduplicates by **fingerprint** (same issue across modules) and can **group** five or more hits on the same parameter into one finding with `grouped_urls`.
+The scanner deduplicates by **fingerprint** (same vuln type + parameter + root cause) and can **group** related hits across URLs into a single finding with `grouped_urls`.
+
+### Confidence calculation
+
+| Component | Weight |
+|-----------|--------|
+| Detection (reflection / error) | 25 pts |
+| Validation (OOB callback / boolean diff / >4.5s delay) | 35 pts |
+| Exploitation (screenshot / file read / live API call) | 40 pts |
+
+**Stages:** `detected` (0–25) → `validated` (26–60) → `exploitable` (61–99) → `verified` (100)
+
+### Verification stages
+
+| Stage | Meaning |
+|-------|---------|
+| **Detected** | Payload reflected or error triggered; theoretical risk only |
+| **Validated** | Multiple independent signals confirm the vulnerability exists |
+| **Exploitable** | Demonstrated real-world impact; proof-of-concept evidence |
+| **Verified** | Confirmed with strong evidence (screenshot, OOB callback, live secret) |
 
 ---
 
@@ -202,10 +242,12 @@ The scanner deduplicates by **fingerprint** (same issue across modules) and can 
 
 | Format | Contents |
 |--------|----------|
-| **HTML** | Dark-themed dashboard, severity summary, findings with evidence |
-| **JSON** | Machine-readable full scan payload |
+| **HTML** | Dark-themed dashboard with confidence badges, verification stage badges, severity summary, findings with evidence |
+| **JSON** | Machine-readable full scan payload with confidence/verification/impact breakdown |
 | **TXT** | Plain-text summary for terminals and CI |
-| **Markdown** (`markdown-report`) | Per-finding `.md` files with CVSS, evidence, impact, remediation |
+| **Markdown** (`markdown-report`) | Per-finding `.md` files with CVSS, evidence, impact, remediation, validation steps |
+| **HackerOne** (`hackerone`) | Ready-to-submit bug bounty report: per-finding sections, CVSS, evidence, impact, reproduction steps, FP risk |
+| **Bugcrowd** (`bugcrowd`) | Summary table + per-finding detail with verification stage, confidence, and impact assessment |
 
 Interim reports use the `.partial` suffix when `--autosave-interval` is set.
 
@@ -232,12 +274,13 @@ bugbounty-hunter/
 │   └── sqli.yaml
 ├── modules/
 │   ├── __init__.py
-│   ├── utils.py                     # HTTP helpers, finding(), logging, scope, rate-limiter
-│   ├── recon.py                     # Crawler, subdomain discovery, JS secret mining
-│   ├── scanner.py                   # VulnScanner — active vulnerability checks
+│   ├── utils.py                     # HTTP helpers, finding(), finding_v2(), OOB, Dedup, TechFP, SecretValidator, BrowserValidator
+│   ├── recon.py                     # Crawler, subdomain discovery, JS secret mining via JSIntelligence
+│   ├── scanner.py                   # VulnScanner — XXE, Cmd Injection, Blind XSS, XSS, SQLi, SSRF, LFI, SSTI, etc.
 │   ├── api_scanner.py               # ApiScanner — REST / GraphQL / OpenAPI checks
 │   ├── idor.py                      # IdorScanner — IDOR / BOLA detection
-│   └── reporter.py                  # HTML / JSON / TXT / Markdown reports
+│   ├── js_intelligence.py           # JSIntelligence — AST + regex endpoint/secret/route extraction
+│   └── reporter.py                  # HTML / JSON / TXT / Markdown / HackerOne / Bugcrowd reports
 └── reports/                         # Output (gitignored)
 ```
 
@@ -271,8 +314,10 @@ Respect `url_in_scope()` in every URL loop and use `self._record_confirmed(...)`
 | `rich` | Terminal UI (progress, tables, colored logs) |
 | `urllib3` | Retries and connection pooling |
 | `tqdm` | Progress bars |
-| `playwright` | Headless browser for JS-rendered crawling |
+| `playwright` | Headless browser for JS-rendered crawling + XSS execution verification |
 | `openai` | LLM-assisted triage (markdown reports) |
+| `esprima` | (optional) JavaScript AST parsing for enhanced JS intelligence |
+| `boto3` | (optional) Live AWS key validation via STS |
 
 ---
 

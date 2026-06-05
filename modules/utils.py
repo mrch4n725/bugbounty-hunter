@@ -5,14 +5,19 @@ Provides helper functions for HTTP requests, logging, URL handling,
 and standardized data structures used throughout the application.
 """
 
+import enum
 import hashlib
+import json
 import os
 import random
 import re
+import socket
 import threading
 import time
+import uuid
 import warnings
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
@@ -70,7 +75,734 @@ class Colors:
     END = "\033[0m"
 
 
-# CVSS v3 metadata keyed by vuln type strings used in scanner.py
+# ── Enums ──────────────────────────────────────────────────────────────────────
+
+class VerificationStage(str, enum.Enum):
+    DETECTED = "detected"
+    VALIDATED = "validated"
+    EXPLOITABLE = "exploitable"
+
+class EvidenceStrength(str, enum.Enum):
+    WEAK = "weak"
+    MODERATE = "moderate"
+    STRONG = "strong"
+    VERIFIED = "verified"
+
+class FalsePositiveRisk(str, enum.Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+class ConfidenceLevel(str, enum.Enum):
+    UNVERIFIED = "Unverified"
+    LIKELY = "Likely"
+    HIGH_CONFIDENCE = "High Confidence"
+    CONFIRMED = "Confirmed"
+
+    @staticmethod
+    def from_score(score: int) -> "ConfidenceLevel":
+        if score >= 86:
+            return ConfidenceLevel.CONFIRMED
+        if score >= 61:
+            return ConfidenceLevel.HIGH_CONFIDENCE
+        if score >= 31:
+            return ConfidenceLevel.LIKELY
+        return ConfidenceLevel.UNVERIFIED
+
+# ── Confidence Scoring ─────────────────────────────────────────────────────
+
+CONFIDENCE_WEIGHTS = {
+    "detection_signal": 25,
+    "validation_signal": 35,
+    "exploitation_proof": 40,
+}
+
+def calculate_confidence(
+    detection: bool = False,
+    validation: bool = False,
+    exploitation: bool = False,
+    extra_points: int = 0,
+) -> int:
+    score = 0
+    if detection:
+        score += CONFIDENCE_WEIGHTS["detection_signal"]
+    if validation:
+        score += CONFIDENCE_WEIGHTS["validation_signal"]
+    if exploitation:
+        score += CONFIDENCE_WEIGHTS["exploitation_proof"]
+    score = min(100, score + extra_points)
+    return score
+
+def evidence_strength_from_score(score: int) -> EvidenceStrength:
+    if score >= 86:
+        return EvidenceStrength.VERIFIED
+    if score >= 61:
+        return EvidenceStrength.STRONG
+    if score >= 31:
+        return EvidenceStrength.MODERATE
+    return EvidenceStrength.WEAK
+
+def false_positive_risk_from_score(score: int) -> FalsePositiveRisk:
+    if score >= 86:
+        return FalsePositiveRisk.LOW
+    if score >= 61:
+        return FalsePositiveRisk.MEDIUM
+    return FalsePositiveRisk.HIGH
+
+# ── Vulnerability Finding Model ─────────────────────────────────────────────
+
+@dataclass
+class VulnerabilityFinding:
+    title: str
+    vuln_type: str
+    url: str
+    severity: str
+    details: str
+    evidence: str = ""
+    confidence_score: int = 0
+    confidence_label: str = "Unverified"
+    verification_stage: str = "detected"
+    evidence_strength: str = "weak"
+    false_positive_risk: str = "high"
+    proof: List[str] = field(default_factory=list)
+    fingerprint: str = ""
+    grouped_urls: List[str] = field(default_factory=list)
+    cvss_score: Optional[float] = None
+    cvss_vector: Optional[str] = None
+    what_is_it: str = ""
+    impact: str = ""
+    remediation: str = ""
+    references: List[str] = field(default_factory=list)
+    timestamp: str = ""
+    validation_steps: List[str] = field(default_factory=list)
+    exploitability_rating: str = "unknown"
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "title": self.title,
+            "type": self.vuln_type,
+            "url": self.url,
+            "severity": self.severity,
+            "details": self.details,
+            "evidence": self.evidence,
+            "confidence": self.confidence_label,
+            "confidence_score": self.confidence_score,
+            "evidence_strength": self.evidence_strength,
+            "verification_stage": self.verification_stage,
+            "false_positive_risk": self.false_positive_risk,
+            "proof": self.proof,
+            "fingerprint": self.fingerprint,
+            "timestamp": self.timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "validation_steps": self.validation_steps,
+            "exploitability_rating": self.exploitability_rating,
+        }
+        if self.grouped_urls:
+            result["grouped_urls"] = self.grouped_urls
+        if self.cvss_score is not None:
+            result["cvss_score"] = self.cvss_score
+        if self.cvss_vector is not None:
+            result["cvss_vector"] = self.cvss_vector
+        if self.what_is_it:
+            result["what_is_it"] = self.what_is_it
+        if self.impact:
+            result["impact"] = self.impact
+        if self.remediation:
+            result["remediation"] = self.remediation
+        if self.references:
+            result["references"] = self.references
+        return result
+
+    def _compute_fingerprint(self) -> str:
+        return hashlib.sha256(
+            f"{self.vuln_type}:{self._extract_param_name()}:{self._extract_root_cause()}".encode()
+        ).hexdigest()
+
+    def _extract_param_name(self) -> str:
+        for text in (self.details, self.evidence):
+            if "Parameter '" in text:
+                return text.split("Parameter '")[1].split("'")[0]
+            if "Form field '" in text:
+                return text.split("Form field '")[1].split("'")[0]
+        if "?" in self.url:
+            from urllib.parse import parse_qs, urlparse
+            params = parse_qs(urlparse(self.url).query)
+            if params:
+                return next(iter(params.keys()))
+        return ""
+
+    def _extract_root_cause(self) -> str:
+        return self.details[:80] if self.details else self.evidence[:80]
+
+    @staticmethod
+    def from_legacy(f: Dict[str, Any]) -> "VulnerabilityFinding":
+        score = calculate_confidence(
+            detection=True,
+            validation=f.get("confirmed", False),
+            exploitation=False,
+        )
+        vf = VulnerabilityFinding(
+            title=f.get("title", f.get("type", "Unknown")),
+            vuln_type=f.get("type", "Unknown"),
+            url=f.get("url", ""),
+            severity=f.get("severity", "info"),
+            details=f.get("details", ""),
+            evidence=f.get("evidence", ""),
+            confidence_score=score,
+            confidence_label=ConfidenceLevel.from_score(score).value,
+            verification_stage=VerificationStage.VALIDATED.value if f.get("confirmed") else VerificationStage.DETECTED.value,
+            evidence_strength=evidence_strength_from_score(score).value,
+            false_positive_risk=false_positive_risk_from_score(score).value,
+            fingerprint=f.get("fingerprint", ""),
+            timestamp=f.get("timestamp", ""),
+            cvss_score=f.get("cvss_score"),
+            cvss_vector=f.get("cvss_vector"),
+            what_is_it=f.get("what_is_it", ""),
+            impact=f.get("impact", ""),
+            remediation=f.get("remediation", ""),
+            references=f.get("references", []),
+            grouped_urls=f.get("grouped_urls", []),
+        )
+        if not vf.fingerprint:
+            vf.fingerprint = vf._compute_fingerprint()
+        return vf
+
+
+# ── OOB Detection Framework ───────────────────────────────────────────────
+
+class OOBDetectionFramework:
+    """Out-of-band detection using Interactsh, Burp Collaborator, or custom webhooks.
+
+    Generates unique callback tokens, registers expected interactions,
+    and polls for DNS/HTTP callbacks to confirm blind vulnerabilities.
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.oob_host = config.get("oob_host", "")
+        self.callback_token = str(uuid.uuid4()).replace("-", "")[:16]
+        self._interactions: Dict[str, List[Dict[str, Any]]] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def callback_host(self) -> str:
+        """Return the callback host with a unique token subdomain."""
+        if not self.oob_host:
+            return ""
+        return f"{self.callback_token}.{self.oob_host}"
+
+    @property
+    def callback_url(self) -> str:
+        host = self.callback_host
+        if not host:
+            return ""
+        return f"http://{host}/bbh-verify"
+
+    def generate_payload(self, placeholder: str = "{oob}") -> str:
+        """Replace {oob} placeholder with the unique callback URL."""
+        if not self.oob_host:
+            return ""
+        return placeholder.replace("{oob}", self.callback_host)
+
+    def register_interaction(self, vuln_type: str, payload: str, url: str) -> None:
+        with self._lock:
+            self._interactions.setdefault(vuln_type, []).append({
+                "payload": payload,
+                "url": url,
+                "timestamp": time.time(),
+            })
+
+    def poll(self, timeout: float = 5.0) -> List[Dict[str, Any]]:
+        """Poll for callbacks. Returns list of confirmed interactions."""
+        if not self.oob_host:
+            return []
+        confirmed: List[Dict[str, Any]] = []
+        for vuln_type, interactions in list(self._interactions.items()):
+            for entry in interactions:
+                if entry.get("confirmed"):
+                    continue
+                if self._check_callback(entry):
+                    entry["confirmed"] = True
+                    confirmed.append(entry)
+        return confirmed
+
+    def _check_callback(self, entry: Dict[str, Any]) -> bool:
+        """Check if a callback has been received for this entry."""
+        try:
+            import urllib.request
+            poll_url = f"http://{self.oob_host}/poll?id={self.callback_token}"
+            req = urllib.request.Request(poll_url, method="GET")
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            if resp.status == 200:
+                data = json.loads(resp.read().decode())
+                return len(data.get("interactions", [])) > 0
+        except Exception:
+            pass
+        return False
+
+    def clear(self) -> None:
+        with self._lock:
+            self._interactions.clear()
+
+
+# ── Deduplication Engine ─────────────────────────────────────────────────
+
+class DeduplicationEngine:
+    """Deduplicate findings by (vuln_type + parameter + root_cause) fingerprint.
+    Groups findings that share the same root cause across URLs.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._groups: Dict[str, Dict[str, Any]] = {}
+
+    def _make_key(self, f: VulnerabilityFinding) -> str:
+        return hashlib.sha256(
+            f"{f.vuln_type}:{f._extract_param_name()}:{f._extract_root_cause()}".encode()
+        ).hexdigest()
+
+    def add(self, finding: VulnerabilityFinding) -> Optional[VulnerabilityFinding]:
+        key = finding._compute_fingerprint()
+        with self._lock:
+            if key in self._groups:
+                existing = self._groups[key]
+                existing.grouped_urls.append(finding.url)
+                return None
+            self._groups[key] = finding
+            return finding
+
+    def add_legacy(self, f: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        vf = VulnerabilityFinding.from_legacy(f)
+        added = self.add(vf)
+        if added is None:
+            return None
+        return added.to_dict()
+
+    def get_findings(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            results = []
+            for f in self._groups.values():
+                d = f.to_dict()
+                if len(f.grouped_urls) >= 5:
+                    d["grouped_urls"] = f.grouped_urls
+                    d["details"] = (
+                        f"{f.details} — Found on {len(f.grouped_urls)} URLs"
+                    )
+                results.append(d)
+            return results
+
+    def clear(self) -> None:
+        with self._lock:
+            self._groups.clear()
+
+
+# ── Browser Validation Layer ─────────────────────────────────────────────
+
+class BrowserValidator:
+    """Playwright-based browser validation for XSS, DOM XSS, and client-side issues."""
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.timeout = config.get("timeout", 10) * 1000
+
+    def _get_browser(self):
+        try:
+            from playwright.sync_api import sync_playwright
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch(headless=True)
+            return pw, browser
+        except Exception:
+            return None, None
+
+    def check_xss_execution(self, url: str, payload: str) -> Optional[Dict[str, Any]]:
+        """Load URL in headless browser and check if JS executes."""
+        pw, browser = self._get_browser()
+        if not browser:
+            return None
+        try:
+            page = browser.new_page()
+            result = {"alert_fired": False, "dom_mutation": False, "callback": False}
+
+            def on_dialog(dialog):
+                result["alert_fired"] = True
+                dialog.dismiss()
+
+            page.on("dialog", on_dialog)
+            page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+
+            dom_evidence = page.evaluate("""() => {
+                const body = document.body ? document.body.innerHTML : '';
+                const scripts = Array.from(document.querySelectorAll('script'));
+                return {
+                    body_snippet: body.substring(0, 200),
+                    script_count: scripts.length,
+                    has_bbh_marker: window.__bbh_xss === 1 || body.includes('__bbh_xss'),
+                };
+            }""")
+            result["dom_mutation"] = dom_evidence.get("has_bbh_marker", False)
+
+            if result["alert_fired"] or result["dom_mutation"]:
+                page.close()
+                browser.close()
+                pw.stop()
+                return result
+
+            page.close()
+            browser.close()
+            pw.stop()
+            return result
+        except Exception:
+            try:
+                browser.close()
+                pw.stop()
+            except Exception:
+                pass
+            return None
+
+    def check_dom_xss(self, url: str) -> Optional[Dict[str, Any]]:
+        """Check if URL triggers DOM-based XSS via common sinks."""
+        pw, browser = self._get_browser()
+        if not browser:
+            return None
+        try:
+            page = browser.new_page()
+            result: Dict[str, Any] = {"sink": None, "payload_reflected": False}
+
+            page.on("console", lambda msg: result.update({"sink": msg.text}) if msg.type == "error" else None)
+            page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+
+            content = page.content()
+            page.close()
+            browser.close()
+            pw.stop()
+            return result
+        except Exception:
+            try:
+                browser.close()
+                pw.stop()
+            except Exception:
+                pass
+            return None
+
+    def capture_screenshot(self, url: str, output_path: str) -> Optional[str]:
+        """Load URL in headless browser and capture a PNG screenshot."""
+        pw, browser = self._get_browser()
+        if not browser:
+            return None
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 720})
+            page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
+            page.wait_for_timeout(1500)
+            page.screenshot(path=output_path, full_page=True)
+            page.close()
+            browser.close()
+            pw.stop()
+            return output_path
+        except Exception:
+            try:
+                browser.close()
+                pw.stop()
+            except Exception:
+                pass
+            return None
+
+    def check_network_requests(self, url: str, callback_domain: str) -> Optional[Dict[str, Any]]:
+        """Load URL and capture outbound network requests matching callback_domain."""
+        pw, browser = self._get_browser()
+        if not browser:
+            return None
+        try:
+            page = browser.new_page()
+            result: Dict[str, Any] = {
+                "requests": [],
+                "callback_detected": False,
+                "callback_urls": [],
+            }
+
+            def on_request(request):
+                result["requests"].append(request.url)
+                if callback_domain and callback_domain in request.url:
+                    result["callback_detected"] = True
+                    result["callback_urls"].append(request.url)
+
+            page.on("request", on_request)
+            page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+
+            page.close()
+            browser.close()
+            pw.stop()
+            return result
+        except Exception:
+            try:
+                browser.close()
+                pw.stop()
+            except Exception:
+                pass
+            return None
+
+    def check_blind_xss(self, url: str, oob_host: str) -> Optional[Dict[str, Any]]:
+        """Load URL and check for DOM-based XSS execution with OOB callback detection."""
+        pw, browser = self._get_browser()
+        if not browser:
+            return None
+        try:
+            page = browser.new_page()
+            result: Dict[str, Any] = {
+                "alert_fired": False,
+                "dom_mutation": False,
+                "callback_detected": False,
+                "network_requests": [],
+            }
+
+            def on_dialog(dialog):
+                result["alert_fired"] = True
+                dialog.dismiss()
+
+            def on_request(request):
+                url_str = request.url
+                result["network_requests"].append(url_str)
+                if oob_host and oob_host in url_str:
+                    result["callback_detected"] = True
+                    result["callback_url"] = url_str
+
+            page.on("dialog", on_dialog)
+            page.on("request", on_request)
+            page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+
+            dom_evidence = page.evaluate("""() => {
+                return {
+                    body_snippet: (document.body ? document.body.innerHTML.substring(0, 500) : ''),
+                    has_bbh_marker: window.__bbh_xss === 1,
+                };
+            }""")
+            result["dom_mutation"] = dom_evidence.get("has_bbh_marker", False)
+
+            page.close()
+            browser.close()
+            pw.stop()
+            return result
+        except Exception:
+            try:
+                browser.close()
+                pw.stop()
+            except Exception:
+                pass
+            return None
+
+
+# ── Secret Validator ──────────────────────────────────────────────────────
+
+class SecretValidator:
+    """Validate discovered credentials by making verified API calls."""
+
+    @staticmethod
+    def validate_aws_key(access_key: str, secret_key: Optional[str] = None) -> Dict[str, Any]:
+        """Test AWS credentials via STS GetCallerIdentity."""
+        try:
+            import boto3
+            session = boto3.Session(
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key or "dummy",
+            )
+            sts = session.client("sts", region_name="us-east-1")
+            identity = sts.get_caller_identity()
+            return {
+                "valid": True,
+                "type": "aws",
+                "details": f"ARN: {identity.get('Arn', 'unknown')}",
+                "account_id": identity.get("Account", ""),
+            }
+        except ImportError:
+            return {"valid": None, "type": "aws", "details": "boto3 not installed"}
+        except Exception as e:
+            error_str = str(e).lower()
+            if "access denied" in error_str or "not authorized" in error_str:
+                return {"valid": False, "type": "aws", "details": "Access denied — key may be invalid"}
+            if "invalid" in error_str or "not found" in error_str or "could not be found" in error_str:
+                return {"valid": False, "type": "aws", "details": f"Invalid credentials: {e}"}
+            return {"valid": None, "type": "aws", "details": f"Unknown: {e}"}
+
+    @staticmethod
+    def validate_github_token(token: str) -> Dict[str, Any]:
+        """Test GitHub token via /user endpoint."""
+        try:
+            resp = requests.get(
+                "https://api.github.com/user",
+                headers={"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return {
+                    "valid": True,
+                    "type": "github",
+                    "details": f"User: {data.get('login', 'unknown')} (scope: {resp.headers.get('X-OAuth-Scopes', 'unknown')})",
+                }
+            elif resp.status_code == 401:
+                return {"valid": False, "type": "github", "details": "Token invalid or revoked"}
+            elif resp.status_code == 403:
+                return {"valid": None, "type": "github", "details": "Rate limited — retry later"}
+            return {"valid": False, "type": "github", "details": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            return {"valid": None, "type": "github", "details": f"Error: {e}"}
+
+    @staticmethod
+    def validate_slack_token(token: str) -> Dict[str, Any]:
+        """Test Slack token via auth.test."""
+        try:
+            resp = requests.get(
+                "https://slack.com/api/auth.test",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("ok"):
+                    return {
+                        "valid": True,
+                        "type": "slack",
+                        "details": f"Team: {data.get('team', 'unknown')}, User: {data.get('user', 'unknown')}",
+                    }
+                return {"valid": False, "type": "slack", "details": f"Not ok: {data.get('error', 'unknown')}"}
+            return {"valid": False, "type": "slack", "details": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            return {"valid": None, "type": "slack", "details": f"Error: {e}"}
+
+    @classmethod
+    def validate(cls, secret_type: str, value: str) -> Dict[str, Any]:
+        """Route validation based on secret type label."""
+        mapping = {
+            "aws_access_key": cls.validate_aws_key,
+            "aws_secret_key": cls.validate_aws_key,
+            "github_token": cls.validate_github_token,
+            "slack_token": cls.validate_slack_token,
+        }
+        handler = mapping.get(secret_type)
+        if not handler:
+            return {"valid": None, "type": secret_type, "details": "No validator available"}
+        return handler(value)
+
+
+# ── Technology Fingerprinter ───────────────────────────────────────────────
+
+TECH_SIGNATURES: Dict[str, List[Dict[str, Any]]] = {
+    "framework": [
+        {"name": "Django", "headers": {"x-frame-options": "DENY"}, "body": re.compile(r"django\.wsgi|csrfmiddlewaretoken|__admin_media_prefix__")},
+        {"name": "Laravel", "headers": {"x-powered-by": "Laravel"}, "body": re.compile(r"laravel_session|csrf_token|Livewire|__livewire")},
+        {"name": "Rails", "headers": {"x-powered-by": "Phusion|Passenger"}, "body": re.compile(r"csrf-token|rails-ujs|data-remote|data-method")},
+        {"name": "Spring", "headers": {"x-application-context": ""}, "body": re.compile(r"spring|_csrf|XSRF-TOKEN")},
+        {"name": "ASP.NET", "headers": {"x-aspnet-version": "", "x-powered-by": "ASP.NET"}, "body": re.compile(r"__viewstate|__eventvalidation|aspnetForm")},
+        {"name": "Express", "headers": {"x-powered-by": "Express"}, "body": re.compile(r"express|connect\.sid")},
+        {"name": "Flask", "headers": {}, "body": re.compile(r"flask|__debug__|secret_key")},
+        {"name": "FastAPI", "headers": {}, "body": re.compile(r"fastapi|openapi\.json|docs|redoc")},
+        {"name": "Next.js", "headers": {"x-powered-by": "Next.js"}, "body": re.compile(r"__NEXT_DATA__|/_next/static")},
+        {"name": "Nuxt.js", "headers": {}, "body": re.compile(r"nuxt\.config|__NUXT__")},
+        {"name": "Gatsby", "headers": {}, "body": re.compile(r"gatsby|___gatsby")},
+    ],
+    "cms": [
+        {"name": "WordPress", "headers": {}, "body": re.compile(r"/wp-content/|/wp-includes/|wp-json|wordpress_[a-f0-9]{32}")},
+        {"name": "Drupal", "headers": {}, "body": re.compile(r"drupal\.js|sites/default|/drupal|Drupal\.settings")},
+        {"name": "Joomla", "headers": {}, "body": re.compile(r"joomla|/components/|/modules/|/templates/")},
+        {"name": "Shopify", "headers": {"x-shopid": ""}, "body": re.compile(r"shopify|myshopify\.com|Shopify\.sdk")},
+        {"name": "Magento", "headers": {}, "body": re.compile(r"mage\.|Magento|/static/version")},
+    ],
+    "language": [
+        {"name": "PHP", "headers": {"x-powered-by": "PHP"}, "body": re.compile(r"php")},
+        {"name": "Python", "headers": {}, "body": re.compile(r"django|flask|python|bottle|tornado")},
+        {"name": "Ruby", "headers": {"x-powered-by": "Phusion|Passenger"}, "body": re.compile(r"ruby|\.erb")},
+        {"name": "Java", "headers": {}, "body": re.compile(r"servlet|jsp|java|spring|tomcat")},
+        {"name": "Node.js", "headers": {"x-powered-by": "Express"}, "body": re.compile(r"node|express|next\.js")},
+        {"name": "Go", "headers": {}, "body": re.compile(r"go\.(min\.)?js|gorilla")},
+    ],
+    "proxy": [
+        {"name": "Cloudflare", "headers": {"server": "cloudflare", "cf-ray": ""}, "body": re.compile(r"cloudflare|__cfduid")},
+        {"name": "Akamai", "headers": {}, "body": re.compile(r"akamai|akamaized")},
+        {"name": "Fastly", "headers": {"x-served-by": "", "x-cache": ""}, "body": re.compile(r"fastly")},
+        {"name": "CloudFront", "headers": {"x-amz-cf-id": "", "x-amz-cf-pop": ""}, "body": re.compile(r"cloudfront")},
+        {"name": "Varnish", "headers": {"x-varnish": "", "via": "varnish"}, "body": re.compile(r"varnish")},
+        {"name": "Nginx", "headers": {"server": "nginx"}, "body": re.compile(r"nginx")},
+        {"name": "Apache", "headers": {"server": "apache"}, "body": re.compile(r"apache")},
+        {"name": "IIS", "headers": {"server": "iis", "x-powered-by": "ASP.NET"}, "body": re.compile(r"iis")},
+    ],
+    "waf": [
+        {"name": "Cloudflare (WAF)", "headers": {"server": "cloudflare"}, "body": re.compile(r"cloudflare-nginx|attention: required|ray id:")},
+        {"name": "AWS WAF", "headers": {}, "body": re.compile(r"Request blocked|waf|AWS WAF")},
+        {"name": "ModSecurity", "headers": {}, "body": re.compile(r"ModSecurity|This error was generated by Mod_Security")},
+        {"name": "Akamai WAF", "headers": {}, "body": re.compile(r"akamai|reference number|#ref_")},
+        {"name": "F5 BIG-IP", "headers": {}, "body": re.compile(r"big-ip|F5|TS[0-9a-f]+")},
+        {"name": "Sucuri", "headers": {"x-sucuri-id": ""}, "body": re.compile(r"sucuri|cloudproxy")},
+    ],
+    "template_engine": [
+        {"name": "Jinja2", "body": re.compile(r"\{\{.*\}\}|jinja2")},
+        {"name": "Twig", "body": re.compile(r"twig|\.twig")},
+        {"name": "Smarty", "body": re.compile(r"smarty|\{\$.*\}")},
+        {"name": "FreeMarker", "body": re.compile(r"\$\{.*\}")},
+        {"name": "Velocity", "body": re.compile(r"velocity|#set\(|#if\(")},
+        {"name": "Mustache", "body": re.compile(r"mustache|\{\{.*\}\}")},
+        {"name": "Handlebars", "body": re.compile(r"handlebars|Handlebars\.")},
+        {"name": "EJS", "body": re.compile(r"<%|%=|ejs")},
+        {"name": "Pug/Jade", "body": re.compile(r"pug|jade")},
+    ],
+}
+
+
+class TechnologyFingerprinter:
+    """Identify web technologies (frameworks, CMS, languages, proxies, WAFs) from HTTP responses."""
+
+    def __init__(self, session: Any, timeout: int):
+        self.session = session
+        self.timeout = timeout
+        self.results: Dict[str, List[str]] = {}
+
+    def fingerprint(self, url: str) -> Dict[str, List[str]]:
+        """Fingerprint a URL by analyzing response headers and body."""
+        try:
+            resp = safe_get(self.session, url, self.timeout)
+            if not resp:
+                return {}
+        except Exception:
+            return {}
+
+        headers = {k.lower(): v.lower() for k, v in resp.headers.items()}
+        body = resp.text.lower()
+
+        for category, signatures in TECH_SIGNATURES.items():
+            if category not in self.results:
+                self.results[category] = []
+            for sig in signatures:
+                detected = self._match_signature(sig, headers, body)
+                if detected and sig["name"] not in self.results[category]:
+                    self.results[category].append(sig["name"])
+
+        return self.results
+
+    def _match_signature(self, sig: Dict[str, Any], headers: Dict[str, str], body: str) -> bool:
+        header_match = all(
+            key in headers and (not val or val in headers[key])
+            for key, val in sig.get("headers", {}).items()
+        )
+        body_pattern = sig.get("body")
+        body_match = body_pattern.search(body) if body_pattern else False
+        return header_match or bool(body_match)
+
+    def get(self, category: str, default: Optional[List[str]] = None) -> List[str]:
+        return self.results.get(category, default or [])
+
+    def all(self) -> Dict[str, List[str]]:
+        return self.results
+
+    def summary(self) -> str:
+        parts = []
+        for category, items in self.results.items():
+            if items:
+                parts.append(f"{category}: {', '.join(items)}")
+        return " | ".join(parts) if parts else "Unknown"
+
+
+# ── CVSS v3 metadata keyed by vuln type strings used in scanner.py ────────
 VULN_METADATA: Dict[str, Dict[str, Any]] = {
     "Reflected XSS": {
         "cvss_score": 6.1,
@@ -254,6 +986,40 @@ VULN_METADATA: Dict[str, Dict[str, Any]] = {
         ],
         "confidence": "probable",
     },
+    "Potential SSTI": {
+        "cvss_score": 6.1,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+        "what_is_it": "User input is reflected in a way that may indicate server-side template injection.",
+        "impact": "If confirmed, an attacker could achieve remote code execution or read sensitive server-side data.",
+        "remediation": "Validate that template engines do not evaluate user-supplied expressions. Use sandboxed environments and avoid rendering raw user input.",
+        "references": [
+            "https://portswigger.net/web-security/server-side-template-injection",
+            "https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Template_Injection_Prevention_Cheat_Sheet.html",
+        ],
+        "confidence": "tentative",
+    },
+    "Likely SSTI": {
+        "cvss_score": 8.6,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:L/A:N",
+        "what_is_it": "Server-side template injection is likely: payloads produced arithmetic results consistent with engine evaluation.",
+        "impact": "An attacker can execute arbitrary expressions on the server, potentially leading to RCE or data exfiltration.",
+        "remediation": "Never render user input through template engines. Use context-aware escaping and fixed templates without dynamic evaluation.",
+        "references": [
+            "https://portswigger.net/web-security/server-side-template-injection",
+        ],
+        "confidence": "probable",
+    },
+    "Confirmed SSTI": {
+        "cvss_score": 9.8,
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        "what_is_it": "Server-side template injection confirmed: engine-specific payloads executed and produced differentiated output.",
+        "impact": "Full server-side code execution within the template engine context. Attacker can read files, access internal services, or pivot deeper.",
+        "remediation": "Immediately replace dynamic template rendering of user input with static templates. Apply input sanitization and evaluate sandboxing options.",
+        "references": [
+            "https://portswigger.net/web-security/server-side-template-injection",
+        ],
+        "confidence": "confirmed",
+    },
     "JWT Vulnerability": {
         "cvss_score": 7.5,
         "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
@@ -276,6 +1042,12 @@ _VULN_ALIASES: Dict[str, str] = {
     "Information Disclosure (Server Banner)": "Information Disclosure (Server)",
     "Potential Subdomain Takeover": "Subdomain Takeover",
     "Insecure Direct Object Reference (IDOR)": "IDOR",
+    "Potential SSTI": "Potential SSTI",
+    "Likely SSTI": "Likely SSTI",
+    "Confirmed SSTI": "Confirmed SSTI",
+    "SSTI Detection": "Potential SSTI",
+    "SSTI Validation": "Likely SSTI",
+    "SSTI Exploitation": "Confirmed SSTI",
 }
 
 STEALTH_USER_AGENTS: List[str] = [
@@ -403,9 +1175,17 @@ def finding(
     details: str,
     evidence: str = "",
     confidence: Optional[str] = None,
+    proof: Optional[List[str]] = None,
+    validation_steps: Optional[List[str]] = None,
+    confidence_score: Optional[int] = None,
+    verification_stage: Optional[str] = None,
+    evidence_strength: Optional[str] = None,
+    false_positive_risk: Optional[str] = None,
+    exploitability_rating: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Build a standardized finding dict with CVSS metadata, fingerprint, and timestamp.
+    Supports both legacy confidence strings and new proof-based confidence fields.
     """
     dedupe_key = (vuln_type, url)
     with _seen_findings_lock:
@@ -425,6 +1205,21 @@ def finding(
         f"{vuln_type}:{url}:{evidence_str}".encode()
     ).hexdigest()
 
+    # Calculate confidence score from stage if not provided
+    if confidence_score is None:
+        stage = verification_stage or "detected"
+        confidence_score = calculate_confidence(
+            detection=True,
+            validation=stage in ("validated", "exploitable"),
+            exploitation=stage == "exploitable",
+        )
+
+    # Derive evidence strength and FPR from score if not provided
+    if evidence_strength is None:
+        evidence_strength = evidence_strength_from_score(confidence_score).value
+    if false_positive_risk is None:
+        false_positive_risk = false_positive_risk_from_score(confidence_score).value
+
     result: Dict[str, Any] = {
         "title": vuln_type,
         "type": vuln_type,
@@ -435,6 +1230,13 @@ def finding(
         "confidence": confidence,
         "fingerprint": fingerprint,
         "timestamp": timestamp,
+        "confidence_score": confidence_score,
+        "verification_stage": verification_stage or VerificationStage.DETECTED.value,
+        "evidence_strength": evidence_strength,
+        "false_positive_risk": false_positive_risk,
+        "proof": proof or [],
+        "validation_steps": validation_steps or [],
+        "exploitability_rating": exploitability_rating or "unknown",
     }
 
     for key in (
@@ -449,6 +1251,50 @@ def finding(
             result[key] = meta[key]
 
     return result
+
+
+def finding_v2(
+    title: str,
+    vuln_type: str,
+    url: str,
+    severity: str,
+    details: str,
+    evidence: str = "",
+    detection: bool = True,
+    validation: bool = False,
+    exploitation: bool = False,
+    extra_confidence_points: int = 0,
+    proof: Optional[List[str]] = None,
+    validation_steps: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """New-style finding with explicit stage-based confidence scoring."""
+    score = calculate_confidence(
+        detection=detection,
+        validation=validation,
+        exploitation=exploitation,
+        extra_points=extra_confidence_points,
+    )
+    if exploitation:
+        stage = VerificationStage.EXPLOITABLE.value
+    elif validation:
+        stage = VerificationStage.VALIDATED.value
+    else:
+        stage = VerificationStage.DETECTED.value
+
+    return finding(
+        vuln_type=vuln_type,
+        url=url,
+        severity=severity,
+        details=details,
+        evidence=evidence,
+        confidence=ConfidenceLevel.from_score(score).value,
+        proof=proof,
+        validation_steps=validation_steps,
+        confidence_score=score,
+        verification_stage=stage,
+        evidence_strength=evidence_strength_from_score(score).value,
+        false_positive_risk=false_positive_risk_from_score(score).value,
+    )
 
 
 # ── Baseline Fingerprinting ───────────────────────────────────────────

@@ -27,10 +27,10 @@ def parse_args():
     parser.add_argument("--config", "-C", help="Path to YAML configuration file")
     parser.add_argument("--target", "-t", help="Target URL (e.g. https://example.com)")
     parser.add_argument("--modules", "-m", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "all"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "all"],
         default=["all"])
     parser.add_argument("--output", "-o", default="reports")
-    parser.add_argument("--format", "-f", choices=["json", "html", "txt", "markdown-report"], default="html")
+    parser.add_argument("--format", "-f", choices=["json", "html", "txt", "markdown-report", "hackerone", "bugcrowd"], default="html")
     parser.add_argument("--threads", type=int, default=10)
     parser.add_argument("--timeout", type=int, default=10)
     parser.add_argument("--cookies", "-c", default=None)
@@ -50,7 +50,7 @@ def parse_args():
         help="Out-of-band callback host for SSRF and SQLi OOB verification (e.g. Burp Collaborator or interactsh URL)")
     parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
     parser.add_argument("--disable-modules", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api"],
         default=[], help="Disable specific modules when scanning all or default modules")
     parser.add_argument("--module-param", action="append", default=[],
         help="Override module settings using module.key=value")
@@ -330,6 +330,9 @@ def _active_module_map(scanner, recon):
     modules = {
         "xss": scanner.scan_xss, "sqli": scanner.scan_sqli,
         "lfi": scanner.scan_lfi, "ssrf": scanner.scan_ssrf,
+        "xxe": scanner.scan_xxe,
+        "cmd_injection": scanner.scan_command_injection,
+        "blind_xss": scanner.scan_blind_xss,
         "open_redirect": scanner.scan_open_redirect,
         "headers": scanner.scan_headers, "csrf": scanner.scan_csrf,
         "dirb": scanner.scan_directory_fuzz,
@@ -340,6 +343,7 @@ def _active_module_map(scanner, recon):
         "insecure_forms": scanner.scan_insecure_forms,
         "subdomain_takeover": scanner.scan_subdomain_takeover,
         "graphql": scanner.scan_graphql,
+        "idor": scanner.scan_idor,
     }
     if recon is not None:
         modules["js_secrets"] = recon.mine_js_bundles
@@ -374,14 +378,20 @@ def _write_report_and_summary(config, all_findings, recon_data) -> int:
     high = [f for f in all_findings if f.get("severity") == "high"]
     medium = [f for f in all_findings if f.get("severity") == "medium"]
     low = [f for f in all_findings if f.get("severity") == "low"]
+    confirmed = [f for f in all_findings if f.get("confidence_score", 0) >= 86]
+    validated = [f for f in all_findings if f.get("verification_stage") == "validated"]
+    exploitable = [f for f in all_findings if f.get("verification_stage") == "exploitable"]
     log(f"\n{'─'*50}", Colors.CYAN)
     log("  SCAN SUMMARY", Colors.BOLD)
     log(f"{'─'*50}", Colors.CYAN)
-    log(f"  Critical : {len(critical)}", Colors.RED if critical else Colors.WHITE)
-    log(f"  High     : {len(high)}", Colors.RED if high else Colors.WHITE)
-    log(f"  Medium   : {len(medium)}", Colors.YELLOW if medium else Colors.WHITE)
-    log(f"  Low      : {len(low)}", Colors.CYAN if low else Colors.WHITE)
-    log(f"  Total    : {len(all_findings)}", Colors.BOLD)
+    log(f"  Critical    : {len(critical)}", Colors.RED if critical else Colors.WHITE)
+    log(f"  High        : {len(high)}", Colors.RED if high else Colors.WHITE)
+    log(f"  Medium      : {len(medium)}", Colors.YELLOW if medium else Colors.WHITE)
+    log(f"  Low         : {len(low)}", Colors.CYAN if low else Colors.WHITE)
+    log(f"  Confirmed   : {len(confirmed)}", Colors.GREEN if confirmed else Colors.WHITE)
+    log(f"  Validated   : {len(validated)}", Colors.GREEN if validated else Colors.WHITE)
+    log(f"  Exploitable : {len(exploitable)}", Colors.RED if exploitable else Colors.WHITE)
+    log(f"  Total       : {len(all_findings)}", Colors.BOLD)
     log(f"{'─'*50}\n", Colors.CYAN)
     return 0 if not critical and not high else 1
 

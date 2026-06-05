@@ -608,28 +608,53 @@ class Recon:
                 continue
 
     def mine_js_bundles(self) -> list[dict]:
-        """Passively mine JavaScript bundles for secrets and hidden endpoints."""
+        """Passively mine JavaScript bundles for secrets, endpoints, and hidden functionality."""
+        from modules.js_intelligence import JSIntelligence
         findings = []
         for js_url in sorted(self.js_urls):
             try:
                 r = self.session.get(js_url, timeout=self.timeout)
             except Exception:
                 continue
-            for label, pattern in JS_SECRET_PATTERNS.items():
-                matches = pattern.findall(r.text)
-                for match in list(set(matches))[:5]:
-                    if isinstance(match, tuple):
-                        match = next((part for part in match if part), "")
-                    evidence = str(match)[:120]
-                    if not self._confirm_js_evidence(js_url, evidence):
-                        continue
-                    f = finding(
-                        f"JS Secret: {label}", js_url, "high",
-                        f"Pattern '{label}' matched in JS bundle",
-                        evidence
-                    )
-                    if f:
-                        findings.append(f)
+            if not r or not r.text:
+                continue
+
+            # Full AST-enhanced analysis
+            jsintel = JSIntelligence(base_url=self.target)
+            analysis = jsintel.analyze(r.text, source_url=js_url)
+
+            # Report secrets
+            for secret in analysis.get("secrets", []):
+                if not self._confirm_js_evidence(js_url, secret["value"]):
+                    continue
+                f = finding(
+                    f"JS Secret: {secret['type']}", js_url, "high",
+                    f"Pattern '{secret['type']}' matched in JS bundle",
+                    secret["value"],
+                )
+                if f:
+                    findings.append(f)
+
+            # Report hidden endpoints
+            for ep in analysis.get("hidden_endpoints", []):
+                if ep.get("url") and not ep["url"].startswith(("http://", "https://")):
+                    continue
+                f = finding(
+                    f"Hidden JS Endpoint ({ep['type']})", ep["url"], "medium",
+                    f"Hidden endpoint discovered via JS analysis in {js_url}",
+                    ep.get("match", "")[:120],
+                )
+                if f:
+                    findings.append(f)
+
+            # Report discovered routes
+            for route in analysis.get("routes", []):
+                if findings:
+                    pass  # Log routes in verbose mode only
+                if self.verbose:
+                    log(f"  [JS Route] {route['framework']}: {route['route']}", Colors.CYAN,
+                        verbose_only=True, verbose=self.verbose)
+
         return findings
 
     def _confirm_js_evidence(self, js_url: str, evidence: str) -> bool:
