@@ -710,11 +710,10 @@ class Recon:
 
     def _confirm_js_evidence(self, js_url: str, evidence: str) -> bool:
         """Re-request a bundle before reporting stable passive JS evidence."""
-        try:
-            r = self.session.get(js_url, timeout=self.timeout)
-            return evidence in r.text
-        except Exception:
+        r = safe_get(self.session, js_url, timeout=self.timeout, raise_for_status=False)
+        if r is None or r.status_code >= 400:
             return False
+        return evidence in r.text
 
     def _resolve_subdomain(self, subdomain, domain):
         """
