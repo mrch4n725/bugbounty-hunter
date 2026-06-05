@@ -331,7 +331,7 @@ class OOBDetectionFramework:
             import urllib.request
             poll_url = f"http://{self.oob_host}/poll?id={self.callback_token}"
             req = urllib.request.Request(poll_url, method="GET")
-            resp = urllib.request.urlopen(req, timeout=timeout)
+            resp = urllib.request.urlopen(req, timeout=5)
             if resp.status == 200:
                 data = json.loads(resp.read().decode())
                 return len(data.get("interactions", [])) > 0
@@ -413,8 +413,9 @@ class BrowserValidator:
         except Exception:
             return None, None
 
-    def check_xss_execution(self, url: str, payload: str) -> Optional[Dict[str, Any]]:
-        """Load URL in headless browser and check if JS executes."""
+    def check_xss_execution(self, url: str, payload: str,
+                            html_content: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Load URL (or HTML content for POST forms) in headless browser and check if JS executes."""
         pw, browser = self._get_browser()
         if not browser:
             return None
@@ -427,7 +428,10 @@ class BrowserValidator:
                 dialog.dismiss()
 
             page.on("dialog", on_dialog)
-            page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
+            if html_content:
+                page.set_content(html_content, wait_until="domcontentloaded")
+            else:
+                page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
 
             dom_evidence = page.evaluate("""() => {

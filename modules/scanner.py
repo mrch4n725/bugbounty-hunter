@@ -264,8 +264,10 @@ CMD_INJECTION_PAYLOADS = {
 }
 
 CMD_INJECTION_OUTPUT_SIGNATURES = [
-    "uid=", "gid=", "groups=", "Linux", "Microsoft",
-    "OS Version", "OS Name", "load average", "up ",
+    "uid=", "gid=", "groups=", "load average",
+]
+CMD_INJECTION_OUTPUT_SIGNATURES_WIN = [
+    "boot loader", "for 16-bit app support",
 ]
 
 SENSITIVE_PATTERNS = [
@@ -606,7 +608,7 @@ class VulnScanner:
 
     def _ssti_test_parameter(self, url: str, param: str) -> Optional[dict]:
         ssti_payloads = self._load_payloads("ssti")
-        # Stage 1: Arithmetic reflection detection
+            # Stage 1: Arithmetic reflection detection
         arithmetic_results = []
         for payload in ssti_payloads.get("arithmetic", SSTI_PAYLOADS.get("arithmetic", [])):
             test_url = self._inject_param(url, param, payload)
@@ -616,10 +618,11 @@ class VulnScanner:
             body = resp.text
 
             # Check for arithmetic result (7*7 → 49)
-            if "49" in body and "{{7*7}}" in body:
-                arithmetic_results.append(("arithmetic", "{{7*7}} → 49", test_url, body))
-            elif "49" in body and "${7*7}" in body:
-                arithmetic_results.append(("arithmetic", "${7*7} → 49", test_url, body))
+            arithmetic_expected = payload.replace("7*7", "49").replace("7+7", "14").replace("7-7", "0")
+            arithmetic_possible = any(e in body for e in ["49", "14", "0"])
+            raw_payload_absent = payload not in body
+            if arithmetic_possible and raw_payload_absent:
+                arithmetic_results.append(("arithmetic", f"{payload} → evaluated", test_url, body))
             elif payload in body:
                 arithmetic_results.append(("reflection", payload, test_url, body))
 
@@ -638,11 +641,17 @@ class VulnScanner:
             elif resp and payload in resp.text:
                 engine_sigs.append(f"reflected_{engine}")
 
-        # Stage 3: Verify evaluation
+        # Stage 3: Verify evaluation (match engine patterns against engine_fingerprint responses)
         verified_engine = None
+        engine_bodies = []
+        for engine_name, fp_payload, expected in ssti_payloads.get("engine_fingerprint", SSTI_PAYLOADS.get("engine_fingerprint", [])):
+            test_url = self._inject_param(url, param, fp_payload)
+            resp = safe_get(self.session, test_url, self.timeout)
+            if resp:
+                engine_bodies.append((engine_name, resp.text))
         for engine, pattern_list in SSTI_ENGINE_PATTERNS.items():
             for pattern in pattern_list:
-                for _, _, _, body in arithmetic_results:
+                for eng_name, body in engine_bodies:
                     if pattern.search(body):
                         verified_engine = engine
                         break
@@ -772,14 +781,17 @@ class VulnScanner:
                     false_hash = hashlib.md5(false_resp.text.encode()).hexdigest()
                     true_len = len(true_resp.text)
                     false_len = len(false_resp.text)
-                    true_normal = baseline_hash == true_hash or abs(baseline_len - true_len) <= 50
-                    false_diff = baseline_hash != false_hash and abs(baseline_len - false_len) > 50
+                    true_normal = baseline_hash == true_hash
+                    false_diff = baseline_hash != false_hash
                     if true_normal and false_diff:
                         signals["boolean"] = True
                         evidence_parts.append("boolean:AND 1=1 vs AND 1=2 diff")
                         break
 
-        # ── Time-based (repeatability check) ─────────────────────────
+        # ── Time-based (baseline comparison) ─────────────────────────
+        baseline_start = time.time()
+        safe_get(self.session, url, 15, raise_for_status=False)
+        baseline_delay = time.time() - baseline_start
         for payload in payloads.get("time_based", []):
             test_url = self._inject_param(url, param, payload)
             delays = []
@@ -787,9 +799,10 @@ class VulnScanner:
                 start = time.time()
                 safe_get(self.session, test_url, 15, raise_for_status=False)
                 delays.append(time.time() - start)
-            if all(delay > 4.5 for delay in delays):
+            min_delay = min(delays)
+            if min_delay > baseline_delay + 4 and all(d > baseline_delay + 3 for d in delays):
                 signals["time"] = True
-                evidence_parts.append(f"time:delays={delays}")
+                evidence_parts.append(f"time:delays={delays}, baseline={baseline_delay:.2f}s")
                 break
 
         # ── OOB ──────────────────────────────────────────────────────
@@ -799,8 +812,14 @@ class VulnScanner:
                 test_url = self._inject_param(url, param, formatted)
                 safe_get(self.session, test_url, self.timeout, raise_for_status=False)
                 self.oob.register_interaction("sqli", formatted, test_url)
-                evidence_parts.append(f"oob:sent to {oob_host}")
-                signals["oob"] = True
+                # Delay then poll for callback — OOB provides strongest evidence
+                time.sleep(1)
+                callbacks = self.oob.poll()
+                if callbacks:
+                    signals["oob"] = True
+                    evidence_parts.append(f"oob:callback received from {oob_host}")
+                else:
+                    evidence_parts.append(f"oob:sent to {oob_host} (no callback yet)")
                 break
 
         return signals
@@ -812,7 +831,12 @@ class VulnScanner:
             if v:
                 evidence_parts.append(k)
 
-        if signal_count >= 3:
+        # OOB confirmed is the strongest signal — critical regardless of other signals
+        if signals.get("oob"):
+            title = "Confirmed SQL Injection (OOB)"
+            severity = "critical"
+            stage = VerificationStage.EXPLOITABLE.value
+        elif signal_count >= 3:
             title = "SQL Injection"
             severity = "critical"
             stage = VerificationStage.VALIDATED.value
@@ -1120,8 +1144,16 @@ class VulnScanner:
                     signals["output"] = True
                     evidence_parts.append(f"output:{expected}")
                     break
+                for sig in CMD_INJECTION_OUTPUT_SIGNATURES_WIN:
+                    if sig in body:
+                        signals["output"] = True
+                        evidence_parts.append(f"output:{sig}")
+                        break
 
-        # Time-based detection
+        # Time-based detection (with baseline comparison)
+        baseline_start = time.time()
+        safe_get(self.session, url, timeout=15, raise_for_status=False)
+        baseline_delay = time.time() - baseline_start
         for payload, min_delay in cmdi_payloads.get("time_based", CMD_INJECTION_PAYLOADS.get("time_based", [])):
             test_url = self._inject_param(url, param, payload)
             delays = []
@@ -1129,20 +1161,26 @@ class VulnScanner:
                 start = time.time()
                 safe_get(self.session, test_url, timeout=15, raise_for_status=False)
                 delays.append(time.time() - start)
-            if all(d >= min_delay * 0.8 for d in delays):
+            min_delay = min(delays)
+            if min_delay > baseline_delay + 4 and all(d > baseline_delay + 3 for d in delays):
                 signals["time"] = True
-                evidence_parts.append(f"time:delays={[round(d, 1) for d in delays]}")
+                evidence_parts.append(f"time:delays={[round(d, 1) for d in delays]}, baseline={baseline_delay:.2f}s")
                 break
 
-        # OOB-based detection
-        if oob_host and not signals["output"]:
+        # OOB-based detection (always runs regardless of other signals)
+        if oob_host:
             for payload_template in cmdi_payloads.get("oob", CMD_INJECTION_PAYLOADS.get("oob", [])):
                 payload = payload_template.replace("{oob}", f"{self.oob.callback_token}.{oob_host}")
                 test_url = self._inject_param(url, param, payload)
                 safe_get(self.session, test_url, self.timeout, raise_for_status=False)
                 self.oob.register_interaction("cmd_injection", payload, test_url)
-                evidence_parts.append(f"oob:sent to {oob_host}")
-                signals["oob"] = True
+                time.sleep(1)
+                callbacks = self.oob.poll()
+                if callbacks:
+                    signals["oob"] = True
+                    evidence_parts.append(f"oob:callback received from {oob_host}")
+                else:
+                    evidence_parts.append(f"oob:sent to {oob_host} (no callback yet)")
                 break
 
         return signals
@@ -1152,7 +1190,11 @@ class VulnScanner:
         signal_count = sum(1 for v in signals.values() if v)
         evidence_parts = [k for k, v in signals.items() if v]
 
-        if signal_count >= 2:
+        if signals.get("oob"):
+            title = "Confirmed Command Injection (OOB)"
+            severity = "critical"
+            stage = VerificationStage.EXPLOITABLE.value
+        elif signal_count >= 2:
             title = "Command Injection"
             severity = "critical"
             stage = VerificationStage.VALIDATED.value
@@ -1306,7 +1348,7 @@ class VulnScanner:
 
             if method == "POST":
                 resp = safe_post(self.session, action, data, self.timeout)
-                confirm_url = action
+                confirm_url = action + "?" + urlencode(data)
             else:
                 confirm_url = action + "?" + urlencode(data)
                 resp = safe_get(self.session, confirm_url, self.timeout)
@@ -1333,7 +1375,7 @@ class VulnScanner:
                 if ctx_payload not in r.text and "49" not in r.text:
                     continue
 
-                exec_result = self.browser.check_xss_execution(confirm_url, ctx_payload)
+                exec_result = self.browser.check_xss_execution(confirm_url, ctx_payload, html_content=r.text if method == "POST" else None)
 
                 if exec_result and (exec_result.get("alert_fired") or exec_result.get("dom_mutation")):
                     f = finding(
