@@ -248,3 +248,32 @@ python main.py --config test-config.yaml --threads 10
 - Run with `--verbose` flag for debugging
 - See `IMPROVEMENTS.md` for comprehensive documentation
 
+---
+
+## Bug Fix Round — 5 Confirmed Bugs (June 5, 2026)
+
+### Bug 1 — `NameError: js_data` in autosave worker
+**File:** `main.py:300` | **Commit:** `b96b67a`
+
+`_start_autosave()`'s inner `worker()` closure referenced `js_data`, which was local to `main()` and out of scope. Fixed by passing `js_data=None` parameter with a local alias `_js_data` captured by the closure.
+
+### Bug 2 — `ssti` module silently never ran
+**File:** `main.py:362,343,32,55` | **Commit:** `b96b67a`
+
+`scan_ssti()` existed in scanner.py and `classify_endpoint()` returned `"ssti"`, but the module was never registered in `module_map`, `TARGET_LEVEL`, or argparse `--modules`/`--disable-modules` choices — so it was silently skipped every scan.
+
+### Bug 3 — `scan_ssti` returned all findings instead of its own
+**File:** `modules/scanner.py:885` | **Commit:** `b96b67a`
+
+Returned `self._get_findings()` (entire dedup pool) instead of the local `findings` list — inflating results and inconsistent with every other scan method. Fixed by adding `self._add(f)` loop then returning `findings`.
+
+### Bug 4 — `_apply_scalar_config` incorrectly detected CLI defaults
+**File:** `main.py:128-134` | **Commit:** `b96b67a`
+
+Used `cli_value in (10, 2, 3, 0, 5.0)` against a shared tuple — `--threads 5` matched `5.0` (= `crawl_depth`'s default), causing config file to silently override explicit user values. Fixed with per-key `arg_defaults` dict.
+
+### Bug 5 — Fingerprint-less findings bypassed deduplication
+**File:** `main.py:448-455` | **Commit:** `b96b67a`
+
+The merge step unconditionally appended findings without fingerprints, causing duplicates from TARGET_LEVEL VulnScanner modules. Fixed by adding `seen_urls_types` secondary dedup keyed on `(url, type)` for fingerprint-less findings.
+

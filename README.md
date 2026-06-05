@@ -11,6 +11,16 @@
 
 ---
 
+## Documentation
+
+| File | Contents |
+|------|----------|
+| `IMPLEMENTATION_SUMMARY.md` | Full implementation walkthrough — all phases, changes, and bug fix log |
+| `IMPROVEMENTS.md` | Detailed false-positive fixes, performance improvements, and technical depth |
+| `config.example.yaml` | All available options with annotations |
+
+---
+
 > **Authorized testing only.** Run BugBounty Hunter only against targets you have **explicit written permission** to assess. Unauthorized scanning may violate law and program rules.
 
 ---
@@ -275,6 +285,8 @@ Interim reports use the `.partial` suffix when `--autosave-interval` is set.
 bugbounty-hunter/
 ├── main.py                          # CLI and orchestration
 ├── config.example.yaml              # Sample YAML configuration
+├── IMPLEMENTATION_SUMMARY.md        # Implementation walkthrough & change log
+├── IMPROVEMENTS.md                  # Detailed false-positive fixes & improvements
 ├── requirements.txt
 ├── download.py                      # Payload download helper
 ├── Alternate_requirements_installer.py
