@@ -108,11 +108,11 @@ Recon and all active modules respect these rules.
 
 | Module | CLI name | Description |
 |--------|----------|-------------|
-| Recon | `recon` | Crawler, subdomain DNS, robots/sitemap |
+| Recon | `recon` | Crawler, subdomain DNS, robots/sitemap, JS endpoint mining |
 | XSS | `xss` | Reflected XSS (URL params + forms) |
 | SQLi | `sqli` | Error-based, boolean-based, time-based blind |
 | LFI | `lfi` | Path traversal / local file inclusion |
-| SSRF | `ssrf` | Internal/metadata URL probes |
+| SSRF | `ssrf` | Internal/metadata URL probes, OOB callback verification |
 | Open redirect | `open_redirect` | Redirect parameter abuse |
 | Headers | `headers` | Missing security headers, disclosure, CORS, cookies |
 | CSRF | `csrf` | POST forms without anti-CSRF tokens |
@@ -123,6 +123,10 @@ Recon and all active modules respect these rules.
 | HTTP methods | `http_methods` | Dangerous `Allow` / CORS methods |
 | Insecure forms | `insecure_forms` | HTTP actions, cross-origin password posts |
 | Subdomain takeover | `subdomain_takeover` | Dangling SaaS fingerprints |
+| GraphQL | `graphql` | Introspection, query batching, alias amplification |
+| IDOR | `idor` | Numeric/UUID parameter mutation and horizontal escalation |
+| API | `api` | OpenAPI/Swagger discovery, REST fuzzing, mass assignment |
+| JS secrets | `js_secrets` | Regex-based secret extraction from JS bundles (recon) |
 
 Use `--modules all` (default) or list modules explicitly. Disable with `--disable-modules sqli sensitive`.
 
@@ -137,18 +141,26 @@ Use `--modules all` (default) or list modules explicitly. Disable with `--disabl
 | `--modules` / `-m` | `all` | Modules to run (see table above) |
 | `--disable-modules` | — | Modules to skip when running `all` |
 | `--output` / `-o` | `reports` | Report output directory |
-| `--format` / `-f` | `html` | `html`, `json`, or `txt` |
+| `--format` / `-f` | `html` | `html`, `json`, `txt`, or `markdown-report` |
 | `--threads` | `10` | Worker threads |
 | `--timeout` | `10` | Request timeout (seconds) |
 | `--crawl-depth` | `2` | Recon crawl depth |
 | `--max-urls` | `200` | Max URLs to collect |
 | `--delay` | `0` | Delay between requests (seconds) |
 | `--cookies` / `-c` | — | Cookie header string |
+| `--cookies-alt` | — | Second account cookies for horizontal IDOR testing |
 | `--headers` / `-H` | — | Custom header (repeatable) |
 | `--auth` | — | Basic auth `user:pass` |
 | `--proxy` | — | HTTP(S) proxy URL |
 | `--no-verify-ssl` | off | Disable TLS verification |
 | `--wordlist` | — | Extra paths for directory fuzzing |
+| `--oob-host` | — | Out-of-band callback host for SSRF / SQLi OOB verification |
+| `--headless` | off | Use Playwright headless browser for JS-rendered crawling |
+| `--rps` | `5.0` | Requests per second (halved on 429, restored after 20 OK) |
+| `--stealth` | off | Rotate 20 User-Agent strings, random 0.5–2s delay, shuffle POST params |
+| `--scope` | — | Path to scope file (one domain/IP/CIDR per line) |
+| `--verify-only` / `-V` | — | Re-verify unconfirmed findings from a previous JSON report |
+| `--triage-assist` | off | Use OpenAI to enhance impact narrative in markdown reports |
 | `--module-param` | — | `module.key=value` overrides |
 | `--retries` | `3` | HTTP retry count |
 | `--autosave-interval` | `0` | Autosave partial report every N seconds |
@@ -163,6 +175,7 @@ Findings are produced by `finding()` in `modules/utils.py`:
 
 ```python
 {
+  "title": "Reflected XSS",
   "type": "Reflected XSS",
   "url": "https://example.com/?q=...",
   "severity": "high",           # critical | high | medium | low | info
@@ -192,6 +205,7 @@ The scanner deduplicates by **fingerprint** (same issue across modules) and can 
 | **HTML** | Dark-themed dashboard, severity summary, findings with evidence |
 | **JSON** | Machine-readable full scan payload |
 | **TXT** | Plain-text summary for terminals and CI |
+| **Markdown** (`markdown-report`) | Per-finding `.md` files with CVSS, evidence, impact, remediation |
 
 Interim reports use the `.partial` suffix when `--autosave-interval` is set.
 
@@ -208,27 +222,41 @@ Interim reports use the `.partial` suffix when `--autosave-interval` is set.
 
 ```
 bugbounty-hunter/
-├── main.py                 # CLI and orchestration
-├── config.example.yaml     # Sample YAML configuration
+├── main.py                          # CLI and orchestration
+├── config.example.yaml              # Sample YAML configuration
 ├── requirements.txt
+├── download.py                      # Payload download helper
+├── Alternate_requirements_installer.py
+├── payloads/
+│   ├── xss.yaml
+│   └── sqli.yaml
 ├── modules/
-│   ├── utils.py            # HTTP helpers, finding(), logging, scope
-│   ├── recon.py            # Crawler and subdomain discovery
-│   ├── scanner.py          # Vulnerability checks
-│   └── reporter.py         # Report generation
-└── reports/                # Output (gitignored)
+│   ├── __init__.py
+│   ├── utils.py                     # HTTP helpers, finding(), logging, scope, rate-limiter
+│   ├── recon.py                     # Crawler, subdomain discovery, JS secret mining
+│   ├── scanner.py                   # VulnScanner — active vulnerability checks
+│   ├── api_scanner.py               # ApiScanner — REST / GraphQL / OpenAPI checks
+│   ├── idor.py                      # IdorScanner — IDOR / BOLA detection
+│   └── reporter.py                  # HTML / JSON / TXT / Markdown reports
+└── reports/                         # Output (gitignored)
 ```
 
 ---
 
 ## Extending
 
-1. Add `scan_mycheck(self) -> list[dict]` on `VulnScanner` in `modules/scanner.py`.
-2. Return findings via `finding(...)` and end with `return self._deduplicate(findings)`.
-3. Register the module in `main.py` (`parse_args` choices + `active_modules` dict).
+**Inline scanner (add to `VulnScanner` in `modules/scanner.py`):**
+
+1. Add `scan_mycheck(self) -> list[dict]` on `VulnScanner`.
+2. Return findings via `self._record_confirmed(...)` or `finding(...)` and end with `return self._deduplicate(findings)`.
+3. Register the module in `main.py` (`parse_args` choices + `_active_module_map` dict).
 4. Optionally add metadata in `VULN_METADATA` inside `modules/utils.py`.
 
-Respect `_in_scope()` in every URL loop and use `_add()` so fingerprint deduplication applies.
+**Standalone scanner (subclass `VulnScanner`):**
+
+For complex modules (e.g., `ApiScanner`, `IdorScanner`), create a new file under `modules/` that subclasses `VulnScanner` and implements `run_all(self) -> list[dict]`. Import and instantiate it in `_active_module_map` inside `main.py`.
+
+Respect `url_in_scope()` in every URL loop and use `self._record_confirmed(...)` so fingerprint deduplication applies.
 
 ---
 
@@ -242,6 +270,9 @@ Respect `_in_scope()` in every URL loop and use `_add()` so fingerprint deduplic
 | `PyYAML` | Config files |
 | `rich` | Terminal UI (progress, tables, colored logs) |
 | `urllib3` | Retries and connection pooling |
+| `tqdm` | Progress bars |
+| `playwright` | Headless browser for JS-rendered crawling |
+| `openai` | LLM-assisted triage (markdown reports) |
 
 ---
 
