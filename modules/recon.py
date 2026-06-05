@@ -1,3 +1,4 @@
+import json
 import threading
 import queue
 import socket
@@ -9,6 +10,25 @@ from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 
 from modules.utils import make_session, safe_get, same_domain, log, Colors, url_in_scope, finding
+
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
+# Regex patterns to discover API endpoints inside JavaScript source code
+JS_API_PATTERNS = [
+    re.compile(r'''["'`](/api/[^\s"'`]{3,})["'`]'''),
+    re.compile(r'''["'`](/v\d+/[^\s"'`]{3,})["'`]'''),
+    re.compile(r'''["'`](/graphql)["'`]'''),
+    re.compile(r'''["'`](/rest/[^\s"'`]{3,})["'`]'''),
+    re.compile(r'''["'`](/[^\s"'`]{2,}\.(json|xml|yaml|yml))["'`]'''),
+    re.compile(r'''fetch\(["'`]([^"'`]+)["'`]'''),
+    re.compile(r'''\$\.[a-z]+\(["'`]([^"'`]+)["'`]'''),
+    re.compile(r'''axios\.[a-z]+\(["'`]([^"'`]+)["'`]'''),
+    re.compile(r'''["'`](/[\w./-]{8,})["'`]'''),  # any quoted path of 8+ chars (API, assets, etc.)
+]
 
 
 JS_SECRET_PATTERNS = {
@@ -53,10 +73,15 @@ class Recon:
         self.crawl_depth = config.get('crawl_depth', 2)
         self.request_delay = config.get('delay', 0.0)
         self.max_urls = config.get('max_urls', 250)
+        self.headless = config.get('headless', False)
+        if self.headless and not PLAYWRIGHT_AVAILABLE:
+            log("--headless requires playwright. Install: pip install playwright && python -m playwright install chromium", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+            self.headless = False
         
         self.session = make_session(config)
         self.urls = set()
         self.js_urls = set()
+        self._js_endpoints = set()
         self.forms = []
         self.params = set()
         self.subdomains = set()
@@ -74,6 +99,7 @@ class Recon:
         self.params_lock = threading.Lock()
         self.js_urls_lock = threading.Lock()
         self.subdomains_lock = threading.Lock()
+        self.js_endpoints_lock = threading.Lock()
         self.crawl_lock = threading.Lock()  # Shared lock for visited and depth data
         self._fingerprint_shell()
         self._validate_auth()
@@ -86,11 +112,16 @@ class Recon:
         
         # Start with subdomain enumeration and discover additional endpoints
         self._enumerate_subdomains()
+        self._crt_sh_lookup()
         self._discover_robots()
         self._discover_sitemap()
         
         # Crawl the target
         self._crawl()
+        
+        # Headless JS-rendered crawling (opt-in)
+        if self.headless:
+            self._crawl_headless()
         
         return {
             'urls': sorted(list(self.urls)),
@@ -98,6 +129,7 @@ class Recon:
             'params': sorted(list(self.params)),
             'subdomains': sorted(list(self.subdomains)),
             'js_urls': sorted(list(self.js_urls)),
+            'js_endpoints': sorted(list(self._js_endpoints)),
             'authenticated': self.authenticated,
         }
 
@@ -393,6 +425,187 @@ class Recon:
             return True
         path = urlparse(url).path.lower()
         return any(path.endswith(ext) for ext in self.EXCLUDED_EXTENSIONS)
+
+    # ── JS endpoint extraction ──────────────────────────────────────────
+
+    def _extract_js_endpoints(self, js_content: str) -> None:
+        """Parse JavaScript source for API endpoint paths and parameter names."""
+        if not js_content:
+            return
+        for pattern in JS_API_PATTERNS:
+            for match in pattern.findall(js_content):
+                if isinstance(match, tuple):
+                    match = match[0]
+                if not match or len(match) < 4:
+                    continue
+                abs_url = urljoin(self.base_url, match)
+                normalized = abs_url.split('#')[0].rstrip('/')
+                if url_in_scope(normalized, self.config) and same_domain(self.base_url, normalized):
+                    with self.js_endpoints_lock:
+                        self._js_endpoints.add(normalized)
+                    if urlparse(normalized).path.lower().endswith(".js"):
+                        with self.js_urls_lock:
+                            self.js_urls.add(normalized)
+
+    # ── crt.sh subdomain discovery ──────────────────────────────────────
+
+    def _crt_sh_lookup(self) -> None:
+        """Query crt.sh Certificate Transparency logs for subdomains."""
+        parsed = urlparse(self.target if '://' in self.target else f'http://{self.target}')
+        domain = parsed.netloc.split(':')[0]
+        try:
+            r = self.session.get(
+                f"https://crt.sh/?q=%.{domain}&output=json",
+                timeout=self.timeout,
+            )
+            if r.status_code != 200:
+                return
+            data = r.json()
+            if not isinstance(data, list):
+                return
+            for entry in data:
+                name = entry.get("name_value", "") or ""
+                if "\n" in name:
+                    for sub in name.split("\n"):
+                        sub = sub.strip()
+                        if sub.endswith(f".{domain}") or sub == domain:
+                            with self.subdomains_lock:
+                                self.subdomains.add(sub)
+                else:
+                    if name.endswith(f".{domain}") or name == domain:
+                        with self.subdomains_lock:
+                            self.subdomains.add(name)
+            log(f"[+] crt.sh: {len(self.subdomains)} subdomain(s) found", Colors.GREEN, verbose_only=True, verbose=self.verbose)
+        except json.JSONDecodeError:
+            pass
+        except Exception as e:
+            log(f"[!] crt.sh lookup failed: {e}", Colors.RED, verbose_only=True, verbose=self.verbose)
+
+    # ── Playwright headless crawling ────────────────────────────────────
+
+    def _crawl_headless(self) -> None:
+        """Crawl with Playwright: intercept XHR/fetch, click interactive
+        elements, and extract JS endpoints from bundled source."""
+        if not PLAYWRIGHT_AVAILABLE:
+            return
+        log("[*] Headless crawl started (Playwright) …", Colors.CYAN, verbose_only=True, verbose=self.verbose)
+        visited = set()
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                context = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1280, "height": 720},
+                    ignore_https_errors=not self.config.get("verify_ssl", True),
+                )
+                page = context.new_page()
+
+                # ── Intercept XHR / fetch ──
+                def _on_request(request):
+                    if request.resource_type in ("xhr", "fetch"):
+                        url = request.url.split("?")[0].rstrip("/")
+                        if url_in_scope(url, self.config) and same_domain(self.base_url, url):
+                            with self.urls_lock:
+                                if not self.max_urls or len(self.urls) < self.max_urls:
+                                    self.urls.add(url)
+                    elif request.resource_type == "script":
+                        js = request.url.split("?")[0].rstrip("/")
+                        if url_in_scope(js, self.config):
+                            with self.js_urls_lock:
+                                self.js_urls.add(js)
+
+                page.on("request", _on_request)
+
+                # ── Load initial page ──
+                page.goto(self.target, wait_until="networkidle", timeout=self.timeout * 1000)
+                page.wait_for_timeout(1500)
+
+                # ── Collect inline scripts ──
+                inline_scripts = page.evaluate("""() =>
+                    Array.from(document.querySelectorAll('script:not([src])'))
+                        .map(s => s.textContent)
+                """)
+                for script in inline_scripts:
+                    self._extract_js_endpoints(script)
+
+                # ── Interact with page elements (depth-aware) ──
+                visited.add(self.target.rstrip("/"))
+                self._spa_interact(page, visited, depth=1)
+
+                # ── Extract forms from final DOM ──
+                soup = BeautifulSoup(page.content(), "html.parser")
+                self._extract_forms(self.target, soup)
+
+                browser.close()
+                log(f"[+] Headless crawl: {len(self.urls)} URLs, {len(self.js_urls)} JS, "
+                    f"{len(self._js_endpoints)} JS endpoints",
+                    Colors.GREEN, verbose_only=True, verbose=self.verbose)
+        except Exception as e:
+            log(f"[!] Headless crawl error: {e}", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+
+    def _spa_interact(self, page, visited: set, depth: int) -> None:
+        """Click interactive elements (anchors, buttons) to discover SPA routes.
+        Respects crawl_depth — called recursively up to self.crawl_depth."""
+        if depth > self.crawl_depth:
+            return
+        elements = page.evaluate("""() => {
+            const anchors = Array.from(document.querySelectorAll('a[href]'));
+            const buttons = Array.from(
+                document.querySelectorAll('button[onclick], input[type=submit], [role=button]')
+            );
+            return [
+                ...anchors.map(a => ({
+                    tag: 'a', href: a.href, text: (a.textContent || '').trim().slice(0, 60)
+                })),
+                ...buttons.map(b => ({
+                    tag: 'button',
+                    selector: b.tagName.toLowerCase() +
+                        (b.id ? '#' + b.id : '') +
+                        (b.className ? '.' + b.className.split(' ').join('.') : ''),
+                    text: (b.textContent || b.value || '').trim().slice(0, 60)
+                }))
+            ];
+        }""")
+        for el in elements:
+            try:
+                if el["tag"] == "a":
+                    href = el.get("href", "")
+                    if not href:
+                        continue
+                    normalized = href.split("#")[0].rstrip("/")
+                    if (normalized in visited
+                            or not url_in_scope(normalized, self.config)
+                            or not same_domain(self.base_url, normalized)
+                            or self._should_skip_link(normalized)):
+                        continue
+                    visited.add(normalized)
+                    page.goto(href, wait_until="networkidle", timeout=self.timeout * 1000)
+                    page.wait_for_timeout(1000)
+
+                    inline = page.evaluate("""() =>
+                        Array.from(document.querySelectorAll('script:not([src])'))
+                            .map(s => s.textContent)
+                    """)
+                    for script in inline:
+                        self._extract_js_endpoints(script)
+
+                    soup = BeautifulSoup(page.content(), "html.parser")
+                    self._extract_forms(normalized, soup)
+                    self._spa_interact(page, visited, depth + 1)
+                elif el["tag"] == "button":
+                    selector = el.get("selector", "")
+                    if not selector:
+                        continue
+                    btn = page.query_selector(selector)
+                    if btn is None:
+                        continue
+                    btn.click()
+                    page.wait_for_timeout(2000)
+            except Exception:
+                continue
 
     def mine_js_bundles(self) -> list[dict]:
         """Passively mine JavaScript bundles for secrets and hidden endpoints."""

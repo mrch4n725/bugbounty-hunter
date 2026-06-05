@@ -1,0 +1,446 @@
+"""
+IdorScanner — Insecure Direct Object Reference / BOLA detection.
+
+Scans discovered URLs and form parameters for ID-like values (numeric,
+UUID, email, username, base64, JWT), then tests for horizontal privilege
+escalation, sequential enumeration, and encoded-ID manipulation.
+"""
+
+import base64
+import json
+import re
+from typing import Any, Optional
+from urllib.parse import urlparse, parse_qs
+
+from modules.scanner import VulnScanner
+from modules.utils import (
+    make_session, safe_get, safe_post, finding, log, Colors,
+)
+
+# ── ID parameter patterns ──────────────────────────────────────────────────────
+
+ID_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("numeric", re.compile(
+        r"[?&](?:id|userId|user_id|account|accountId|account_id|"
+        r"org|orgId|org_id|uid|gid|pid|item|itemId|page|number|"
+        r"num|asset|ref|document|doc|file|ticket|order|invoice|"
+        r"customer|client|product|group|role|team|project|object)"
+        r"(?:=|%3D)(\d+)",
+        re.IGNORECASE,
+    )),
+    ("uuid", re.compile(
+        r"(?:=|%3D)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12})",
+        re.IGNORECASE,
+    )),
+    ("email", re.compile(
+        r"[?&](?:email|mail|user|account|contact|login)"
+        r"(?:=|%3D)([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+        re.IGNORECASE,
+    )),
+    ("username", re.compile(
+        r"[?&](?:username|user|name|login|handle|nick|account)"
+        r"(?:=|%3D)([a-zA-Z][a-zA-Z0-9_.-]{2,})",
+        re.IGNORECASE,
+    )),
+    ("base64", re.compile(
+        r"(?:=|%3D)([A-Za-z0-9+/]{20,}={0,2})",
+    )),
+    ("jwt", re.compile(
+        r"(?:=|%3D)(eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)",
+    )),
+]
+
+# Fields to probe in form bodies
+FORM_ID_FIELDS = [
+    "id", "user_id", "userId", "account", "accountId", "uid",
+    "customer_id", "product_id", "order_id", "ticket_id", "ref",
+]
+
+SEQUENTIAL_DELTAS = [-1, 1, -100, 100]
+
+# ── Scanner class ──────────────────────────────────────────────────────────────
+
+class IdorScanner(VulnScanner):
+    """Scanner for Insecure Direct Object Reference vulnerabilities."""
+
+    def __init__(self, config: dict, recon_data: dict):
+        super().__init__(config, recon_data)
+        self.cookies_alt: Optional[dict] = self._parse_cookies_alt()
+        self.session_alt: Any = None
+        if self.cookies_alt:
+            self.session_alt = make_session(config)
+            self.session_alt.cookies.update(self.cookies_alt)
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _parse_cookies_alt(self) -> Optional[dict]:
+        cookies_str = self.config.get("cookies_alt", "")
+        if not cookies_str:
+            return None
+        cookies: dict[str, str] = {}
+        for part in cookies_str.split(";"):
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                cookies[k.strip()] = v.strip()
+        return cookies
+
+    def _try_decode_base64(self, value: str) -> Optional[str]:
+        try:
+            decoded = base64.b64decode(value).decode("utf-8", errors="ignore")
+            if decoded and any(c.isalpha() for c in decoded):
+                return decoded
+        except Exception:
+            pass
+        return None
+
+    def _try_decode_jwt(self, value: str) -> Optional[dict]:
+        parts = value.split(".")
+        if len(parts) != 3:
+            return None
+        try:
+            payload_b64 = parts[1]
+            missing = len(payload_b64) % 4
+            if missing:
+                payload_b64 += "=" * (4 - missing)
+            decoded = json.loads(base64.b64decode(payload_b64).decode("utf-8"))
+            return decoded
+        except Exception:
+            return None
+
+    def _find_user_id_refs(self, decoded: str) -> list[str]:
+        """Return substrings that look like numeric IDs or known ID field values."""
+        found: list[str] = []
+        for match in re.finditer(r'"(?:id|user_id|userId|uid|account|role|group)"\s*:\s*"?(\d+)"?', decoded):
+            found.append(match.group(1))
+        for match in re.finditer(r'(?<![A-Za-z0-9])(\d{2,9})(?![A-Za-z0-9])', decoded):
+            found.append(match.group(1))
+        return found
+
+    # ── Candidate discovery ───────────────────────────────────────────────
+
+    def _find_id_parameters(self) -> list[dict]:
+        """Scan all discovered URLs and form fields for ID-like values."""
+        candidates: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+
+        # URL parameters
+        for url in self.recon.get("urls", []):
+            if not self._in_scope(url):
+                continue
+            parsed = urlparse(url)
+            query_params = parse_qs(parsed.query, keep_blank_values=True)
+            for param, values in query_params.items():
+                val = values[0] if values else ""
+                if not val:
+                    continue
+                id_type = self._classify_param(param, val)
+                if id_type:
+                    key = (param, val)
+                    if key not in seen:
+                        seen.add(key)
+                        candidates.append({
+                            "source": "url",
+                            "url": url,
+                            "param": param,
+                            "value": val,
+                            "type": id_type,
+                            "method": "GET",
+                        })
+
+            # Path-based IDs (/users/123)
+            path_match = re.search(
+                r"/(?:users|accounts|orgs|organisations|entities|"
+                r"customers|products|orders|tickets|items|documents|"
+                r"files|profiles)/(\d+)",
+                url, re.IGNORECASE,
+            )
+            if path_match:
+                val = path_match.group(1)
+                key = ("__path__", val)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append({
+                        "source": "url_path",
+                        "url": url,
+                        "param": "__path__",
+                        "value": val,
+                        "type": "numeric",
+                        "method": "GET",
+                    })
+
+        # Form fields
+        for form in self.recon.get("forms", []):
+            action = form.get("action", "")
+            if action and not self._in_scope(action):
+                continue
+            method = form.get("method", "get").upper()
+            for field in form.get("fields", []):
+                fname = field.get("name", "")
+                fvalue = field.get("value", "")
+                if fname.lower() in FORM_ID_FIELDS and fvalue:
+                    id_type = self._classify_param(fname, fvalue)
+                    key = (fname, fvalue)
+                    if key not in seen:
+                        seen.add(key)
+                        candidates.append({
+                            "source": "form",
+                            "url": action or self.base_url,
+                            "param": fname,
+                            "value": fvalue,
+                            "type": id_type or "numeric",
+                            "method": method,
+                            "form": form,
+                        })
+
+        return candidates
+
+    def _classify_param(self, param: str, value: str) -> Optional[str]:
+        """Classify a parameter value by ID type."""
+        if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", value, re.IGNORECASE):
+            return "uuid"
+        if re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", value):
+            return "email"
+        if re.match(r"^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$", value):
+            return "jwt"
+        if re.match(r"^[A-Za-z0-9+/]{20,}={0,2}$", value):
+            decoded = self._try_decode_base64(value)
+            if decoded:
+                return "base64"
+        if value.isdigit() and 0 < len(value) <= 12:
+            return "numeric"
+        return None
+
+    # ── Horizontal privilege escalation ───────────────────────────────────
+
+    def scan_horizontal_privesc(self, findings: list[dict], candidates: list[dict]) -> None:
+        """Replay each candidate request with a second user's session
+        (--cookies-alt). A 200 response with different content suggests
+        horizontal privilege escalation.
+        """
+        if not self.session_alt:
+            return
+
+        for c in candidates:
+            url = c["url"]
+            if c["source"] == "url_path":
+                url = url
+
+            resp_self = safe_get(
+                self.session, url, self.timeout, raise_for_status=False,
+            )
+            if not resp_self or resp_self.status_code != 200:
+                continue
+
+            resp_alt = safe_get(
+                self.session_alt, url, self.timeout, raise_for_status=False,
+            )
+            if not resp_alt or resp_alt.status_code != 200:
+                continue
+
+            if resp_alt.text != resp_self.text:
+                self._append_finding(findings, finding(
+                    "IDOR - Horizontal Privilege Escalation",
+                    url, "critical",
+                    f"Parameter '{c['param']}' ({c['type']}) returned HTTP 200 "
+                    f"for second user with differing content.",
+                    f"Second user accessed: {resp_alt.text[:120]}",
+                    confidence="confirmed",
+                ))
+                log(f"  [IDOR Horiz] {url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
+
+    # ── Sequential ID enumeration ─────────────────────────────────────────
+
+    def scan_sequential_enum(self, findings: list[dict], candidates: list[dict]) -> None:
+        """For numeric ID candidates, test ID ±1 and ID ±100."""
+        for c in candidates:
+            if c["type"] not in ("numeric", "base64"):
+                continue
+            self._test_sequential(findings, c)
+
+    def _test_sequential(self, findings: list[dict], c: dict) -> None:
+        original_val = c["value"]
+        if c["type"] == "base64":
+            decoded = self._try_decode_base64(original_val)
+            if not decoded:
+                return
+            user_ids = self._find_user_id_refs(decoded)
+            if not user_ids:
+                return
+            for uid in user_ids[:2]:
+                for delta in SEQUENTIAL_DELTAS:
+                    try:
+                        new_uid = str(int(uid) + delta)
+                        new_decoded = decoded.replace(uid, new_uid, 1)
+                        new_val = base64.b64encode(new_decoded.encode()).decode()
+                        self._replay_and_check(findings, c, original_val, new_val)
+                    except ValueError:
+                        continue
+            return
+
+        if not original_val.isdigit():
+            return
+        for delta in SEQUENTIAL_DELTAS:
+            try:
+                new_val = str(int(original_val) + delta)
+            except ValueError:
+                continue
+            self._replay_and_check(findings, c, original_val, new_val)
+
+    def _replay_and_check(self, findings: list[dict], c: dict,
+                          original_val: str, new_val: str) -> None:
+        """Replace the parameter value and check if the mutated resource is
+        accessible, indicating an IDOR."""
+        url = c["url"]
+        param = c["param"]
+
+        if c["source"] == "form":
+            self._test_form_field(findings, c, original_val, new_val)
+            return
+
+        if param == "__path__":
+            original_url = url
+            test_url = url.replace(original_val, new_val, 1)
+        else:
+            original_url = self._inject_param(url, param, original_val)
+            test_url = self._inject_param(url, param, new_val)
+
+        baseline = safe_get(
+            self.session, original_url, self.timeout, raise_for_status=False,
+        )
+        if not baseline or baseline.status_code != 200:
+            return
+        baseline_len = len(baseline.text)
+
+        resp = safe_get(
+            self.session, test_url, self.timeout, raise_for_status=False,
+        )
+        if not resp:
+            return
+
+        if (resp.status_code == 200
+                and len(resp.text) > 300
+                and abs(len(resp.text) - baseline_len) < 5000
+                and resp.text != baseline.text):
+            self._append_finding(findings, finding(
+                "IDOR - Insecure Direct Object Reference",
+                test_url, "critical",
+                f"Parameter '{param}' changed from {original_val} to {new_val} "
+                f"and returned accessible content.",
+                f"HTTP {resp.status_code} - Response length: {len(resp.text)}",
+                confidence="confirmed",
+            ))
+            log(f"  [IDOR Seq] {test_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
+
+    def _test_form_field(self, findings: list[dict], c: dict,
+                         original_val: str, new_val: str) -> None:
+        form = c.get("form")
+        if not form:
+            return
+        action = form.get("action", c["url"])
+        method = form.get("method", "get").upper()
+        field_name = c["param"]
+
+        data = {
+            f["name"]: (new_val if f["name"] == field_name else f.get("value", "test"))
+            for f in form.get("fields", [])
+            if f.get("name")
+        }
+
+        if method == "POST":
+            resp = safe_post(self.session, action, data, self.timeout, raise_for_status=False)
+        else:
+            test_url = action + "?" + "&".join(f"{k}={v}" for k, v in data.items())
+            resp = safe_get(self.session, test_url, self.timeout, raise_for_status=False)
+
+        if resp and resp.status_code == 200 and len(resp.text) > 300:
+            self._append_finding(findings, finding(
+                "IDOR - Insecure Direct Object Reference",
+                action, "critical",
+                f"Form field '{field_name}' changed from {original_val} to {new_val} "
+                f"and returned accessible content.",
+                f"HTTP {resp.status_code}",
+                confidence="confirmed",
+            ))
+            log(f"  [IDOR Form] {action[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
+
+    # ── Encoded ID manipulation (base64 / JWT) ────────────────────────────
+
+    def scan_encoded_id_manipulation(self, findings: list[dict], candidates: list[dict]) -> None:
+        """Detect base64 or JWT-encoded IDs, decode, modify, re-encode, replay."""
+        for c in candidates:
+            if c["type"] == "base64":
+                self._test_base64_manipulation(findings, c)
+            elif c["type"] == "jwt":
+                self._test_jwt_manipulation(findings, c)
+
+    def _test_base64_manipulation(self, findings: list[dict], c: dict) -> None:
+        value = c["value"]
+        decoded = self._try_decode_base64(value)
+        if not decoded:
+            return
+        user_ids = self._find_user_id_refs(decoded)
+        if not user_ids:
+            return
+
+        for uid in user_ids[:2]:
+            try:
+                new_uid = str(int(uid) + 1)
+            except ValueError:
+                continue
+            if uid not in decoded:
+                continue
+            new_decoded = decoded.replace(uid, new_uid, 1)
+            new_val = base64.b64encode(new_decoded.encode()).decode()
+            self._replay_and_check(findings, c, value, new_val)
+
+    def _test_jwt_manipulation(self, findings: list[dict], c: dict) -> None:
+        value = c["value"]
+        payload = self._try_decode_jwt(value)
+        if not payload:
+            return
+
+        user_keys = ["id", "user_id", "userId", "sub", "uid", "account", "role", "group"]
+        target_key = None
+        target_val = None
+        for key in user_keys:
+            if key in payload and isinstance(payload[key], (int, str)):
+                target_key = key
+                target_val = payload[key]
+                break
+
+        if target_key is None:
+            return
+
+        try:
+            new_val = str(int(str(target_val)) + 1)
+        except (ValueError, TypeError):
+            return
+
+        modified = dict(payload)
+        modified[target_key] = int(new_val) if isinstance(target_val, int) else new_val
+        new_payload_b64 = base64.urlsafe_b64encode(
+            json.dumps(modified).encode()
+        ).decode().rstrip("=")
+        parts = value.split(".")
+        forged_jwt = f"{parts[0]}.{new_payload_b64}.{parts[2]}"
+
+        self._replay_and_check(findings, c, value, forged_jwt)
+
+    # ── Orchestrator ──────────────────────────────────────────────────────
+
+    def run_all(self) -> list[dict]:
+        """Run all IDOR detection scans."""
+        findings: list[dict] = []
+        candidates = self._find_id_parameters()
+
+        if candidates:
+            log(f"  [IDOR] Found {len(candidates)} ID candidate(s)", Colors.CYAN,
+                verbose_only=True, verbose=self.verbose)
+
+        self.scan_horizontal_privesc(findings, candidates)
+        self.scan_sequential_enum(findings, candidates)
+        self.scan_encoded_id_manipulation(findings, candidates)
+
+        return self._deduplicate(findings)

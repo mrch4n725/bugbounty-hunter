@@ -6,6 +6,8 @@ and standardized data structures used throughout the application.
 """
 
 import hashlib
+import os
+import random
 import re
 import threading
 import time
@@ -16,8 +18,6 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 try:
     from rich.console import Console
@@ -278,14 +278,45 @@ _VULN_ALIASES: Dict[str, str] = {
     "Insecure Direct Object Reference (IDOR)": "IDOR",
 }
 
+STEALTH_USER_AGENTS: List[str] = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:119.0) Gecko/20100101 Firefox/119.0",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 OPR/106.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+]
+
+_stealth_ua_counter: int = 0
+_stealth_ua_lock = threading.Lock()
+
 
 def url_in_scope(url: str, config: dict) -> bool:
     """
-    Return True if url is allowed by exclude_patterns and include_paths in config.
+    Return True if url is allowed by exclude_patterns, include_paths,
+    and the optional ScopeEnforcer (loaded from --scope).
     Used by the scanner and recon crawler.
     """
     parsed = urlparse(url)
     path = parsed.path + ("?" + parsed.query if parsed.query else "")
+
+    enforcer = config.get("scope_enforcer")
+    if enforcer is not None and not enforcer.check_url(url):
+        return False
 
     for pattern in config.get("exclude_patterns", []) or []:
         try:
@@ -420,6 +451,59 @@ def finding(
     return result
 
 
+# ── Baseline Fingerprinting ───────────────────────────────────────────
+
+class BaselineFingerprinter:
+    """Record a known-safe response baseline per (method, base_url) and
+    flag deviations >15% length, different status code, or error patterns."""
+
+    def __init__(self, session: requests.Session, timeout: int = 10):
+        self.session = session
+        self.timeout = timeout
+        self._baselines: dict[tuple[str, str], dict] = {}
+        self._lock = threading.Lock()
+
+    def _base_key(self, url: str, method: str = "GET") -> tuple[str, str]:
+        parsed = urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+        return (method, base)
+
+    def fingerprint(self, url: str, method: str = "GET") -> dict:
+        """Fetch a URL and store its baseline.  Returns the baseline dict."""
+        key = self._base_key(url, method)
+        with self._lock:
+            if key in self._baselines:
+                return self._baselines[key]
+        try:
+            r = self.session.get(url, timeout=self.timeout) if method == "GET" else self.session.post(url, timeout=self.timeout)
+        except Exception:
+            r = None
+        baseline = {
+            "status": r.status_code if r else 0,
+            "length": len(r.text) if r else 0,
+            "hash": hashlib.md5(r.text.encode()).hexdigest() if r else "",
+        }
+        with self._lock:
+            self._baselines[key] = baseline
+        return baseline
+
+    def is_anomalous(self, url: str, response, method: str = "GET") -> bool:
+        """Return True if the response meaningfully deviates from the baseline."""
+        key = self._base_key(url, method)
+        bl = self._baselines.get(key)
+        if bl is None:
+            return True
+        if response is None:
+            return False
+        length = len(response.text)
+        length_diff = abs(length - bl["length"])
+        if bl["length"] > 0 and length_diff / max(bl["length"], 1) > 0.15:
+            return True
+        if response.status_code != bl["status"] and response.status_code not in (0,):
+            return True
+        return False
+
+
 def parse_auth(auth_string: str):
     """Parse username:password basic auth string."""
     if not auth_string or ":" not in auth_string:
@@ -428,23 +512,164 @@ def parse_auth(auth_string: str):
     return username.strip(), password.strip()
 
 
-def _install_request_delay(session: requests.Session, delay: float) -> None:
-    """Wrap session.request with a thread-safe delay between requests."""
-    if delay <= 0:
-        return
-    original_request = session.request
-    delay_lock = threading.Lock()
-    last_request = {"at": 0.0}
+class RateLimiter:
+    """Adaptive rate limiter that halves throughput on 429 and restores gradually."""
 
-    def delayed_request(method, url, **kwargs):
-        with delay_lock:
-            elapsed = time.time() - last_request["at"]
+    def __init__(self, rps: float = 5.0):
+        self.max_rps = max(0.1, rps)
+        self.current_rps = self.max_rps
+        self._lock = threading.Lock()
+        self._last_request = 0.0
+        self._success_count = 0
+        self._backoff_until = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.time()
+            if now < self._backoff_until:
+                time.sleep(self._backoff_until - now)
+                now = time.time()
+            min_interval = 1.0 / self.current_rps
+            elapsed = now - self._last_request
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+            self._last_request = time.time()
+
+    def report_429(self) -> None:
+        with self._lock:
+            self.current_rps = max(0.1, self.current_rps / 2)
+            self._backoff_until = time.time() + 5.0
+            self._success_count = 0
+
+    def report_success(self) -> None:
+        with self._lock:
+            self._success_count += 1
+            if self._success_count >= 20 and self.current_rps < self.max_rps:
+                self.current_rps = min(self.max_rps, self.current_rps * 2)
+                self._success_count = 0
+
+
+class ScopeEnforcer:
+    """Load in-scope domains from a file and reject out-of-scope URLs."""
+
+    def __init__(self, scope_file: str, output_dir: str):
+        self._allowed: set = set()
+        self._oob_path = os.path.join(output_dir, "out_of_scope.log")
+        self._oob_lock = threading.Lock()
+        if scope_file:
+            self._load(scope_file)
+
+    def _load(self, path: str) -> None:
+        with open(path, "r") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                self._allowed.add(stripped.lower())
+
+    def check_url(self, url: str) -> bool:
+        if not self._allowed:
+            return True
+        try:
+            host = urlparse(url).netloc.lower().split(":")[0]
+            for allowed in self._allowed:
+                if host == allowed or host.endswith("." + allowed):
+                    return True
+                if "/" in allowed and self._ip_in_cidr(host, allowed):
+                    return True
+        except Exception:
+            pass
+        self._log_oob(url)
+        return False
+
+    @staticmethod
+    def _ip_in_cidr(host: str, cidr: str) -> bool:
+        try:
+            import ipaddress
+            return ipaddress.ip_address(host) in ipaddress.ip_network(cidr, strict=False)
+        except (ValueError, ImportError):
+            return False
+
+    def _log_oob(self, url: str) -> None:
+        with self._oob_lock:
+            try:
+                with open(self._oob_path, "a") as f:
+                    f.write(url + "\n")
+            except OSError:
+                pass
+
+
+# ── Request pipeline wrappers ────────────────────────────────────────
+
+def _wrap_jitter_retry(request_fn, retries: int):
+    """Exponential backoff + random jitter for connection errors and 5xx."""
+    if retries <= 0:
+        return request_fn
+    def wrapper(method, url, **kwargs):
+        max_attempts = retries + 1
+        last_exc = None
+        for attempt in range(max_attempts):
+            try:
+                resp = request_fn(method, url, **kwargs)
+                if resp.status_code >= 500 and attempt < max_attempts - 1:
+                    delay = 0.5 * (2 ** attempt) + random.random()
+                    time.sleep(delay)
+                    continue
+                return resp
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                last_exc = e
+                if attempt == max_attempts - 1:
+                    raise
+                delay = 0.5 * (2 ** attempt) + random.random()
+                time.sleep(delay)
+        raise last_exc
+    return wrapper
+
+
+def _wrap_stealth(request_fn):
+    """Rotate User-Agent, randomise POST param order, add 0.5–2 s delay."""
+    def wrapper(method, url, **kwargs):
+        global _stealth_ua_counter
+        with _stealth_ua_lock:
+            idx = _stealth_ua_counter % len(STEALTH_USER_AGENTS)
+            _stealth_ua_counter += 1
+        kwargs.setdefault("headers", {})["User-Agent"] = STEALTH_USER_AGENTS[idx]
+        if method.upper() == "POST" and "data" in kwargs and isinstance(kwargs["data"], dict):
+            items = list(kwargs["data"].items())
+            random.shuffle(items)
+            kwargs["data"] = dict(items)
+        time.sleep(0.5 + random.random() * 1.5)
+        return request_fn(method, url, **kwargs)
+    return wrapper
+
+
+def _wrap_fixed_delay(request_fn, delay: float):
+    """Legacy fixed inter-request delay."""
+    if delay <= 0:
+        return request_fn
+    _lock = threading.Lock()
+    _last = {"at": 0.0}
+    def wrapper(method, url, **kwargs):
+        with _lock:
+            elapsed = time.time() - _last["at"]
             if elapsed < delay:
                 time.sleep(delay - elapsed)
-            last_request["at"] = time.time()
-        return original_request(method, url, **kwargs)
+            _last["at"] = time.time()
+        return request_fn(method, url, **kwargs)
+    return wrapper
 
-    session.request = delayed_request
+
+def _wrap_rate_limiter(request_fn, limiter: RateLimiter):
+    """Acquire rate-limit slot, report 429 / success."""
+    def wrapper(method, url, **kwargs):
+        limiter.wait()
+        resp = request_fn(method, url, **kwargs)
+        if resp.status_code == 429:
+            limiter.report_429()
+        else:
+            limiter.report_success()
+        return resp
+    return wrapper
 
 
 def make_session(config: Dict[str, Any]) -> requests.Session:
@@ -480,22 +705,28 @@ def make_session(config: Dict[str, Any]) -> requests.Session:
     if auth_info:
         session.auth = auth_info
 
-    retries = config.get("retries", 3)
-    retry_strategy = Retry(
-        total=retries,
-        backoff_factor=0.3,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-
     session.verify = config.get("verify_ssl", True)
     if not session.verify:
         warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
-    _install_request_delay(session, float(config.get("delay", 0.0) or 0.0))
+    pipeline = session.request
+
+    pipeline = _wrap_jitter_retry(pipeline, int(config.get("retries", 3)))
+
+    if config.get("stealth", False):
+        pipeline = _wrap_stealth(pipeline)
+
+    delay = float(config.get("delay", 0.0) or 0.0)
+    pipeline = _wrap_fixed_delay(pipeline, delay)
+
+    rps = float(config.get("rps", 5.0) or 5.0)
+    limiter = RateLimiter(rps)
+    pipeline = _wrap_rate_limiter(pipeline, limiter)
+
+    session.request = pipeline
+    session._rate_limiter = limiter
+    session._stealth = config.get("stealth", False)
+
     return session
 
 

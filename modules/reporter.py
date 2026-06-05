@@ -1,8 +1,27 @@
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
+
+
+# Severity → CVSS 3.1 base score mapping (fallback when finding lacks cvss_score)
+CVSS_BY_SEVERITY: Dict[str, float] = {
+    "critical": 9.0,
+    "high": 7.5,
+    "medium": 5.0,
+    "low": 2.5,
+    "info": 0.0,
+}
+
+CVSS_VECTORS: Dict[str, str] = {
+    "critical": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H",
+    "high": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "medium": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N",
+    "low": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N",
+    "info": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N",
+}
 
 
 class Reporter:
@@ -109,6 +128,11 @@ class Reporter:
             if severity in counts:
                 counts[severity] += 1
         return counts
+
+    def _get_confirmed_counts(self) -> Dict[str, int]:
+        """Return (confirmed, unconfirmed) counts."""
+        confirmed = sum(1 for f in self.findings if f.get("confirmed"))
+        return {"confirmed": confirmed, "unconfirmed": len(self.findings) - confirmed}
     
     def _create_findings_table_html(self, sorted_findings: List[Dict[str, Any]]) -> str:
         """
@@ -123,9 +147,13 @@ class Reporter:
         if not sorted_findings:
             return '<div class="empty-message">No vulnerabilities found.</div>'
         
-        rows = '<table><thead><tr><th>Title</th><th>URL</th><th>Severity</th><th>Details</th></tr></thead><tbody>'
+        rows = '<table><thead><tr><th>Title</th><th>URL</th><th>Severity</th><th>Confirmed</th><th>Details</th></tr></thead><tbody>'
         for finding in sorted_findings:
             severity = finding.get('severity', 'info').lower()
+            confirmed = finding.get('confirmed', False)
+            conf_badge = ('<span style="color:#2ecc71;font-weight:bold">YES</span>'
+                          if confirmed else
+                          '<span style="color:#e74c3c;font-weight:bold">NO</span>')
             details = finding.get('details', 'N/A')
             evidence = finding.get('evidence', '')
             recommendation = finding.get('recommendation', '')
@@ -139,6 +167,7 @@ class Reporter:
                     <td>{finding.get('title', 'N/A')}</td>
                     <td><span class="url">{finding.get('url', 'N/A')}</span></td>
                     <td><span class="severity-badge severity-{severity}">{severity.upper()}</span></td>
+                    <td style="text-align:center">{conf_badge}</td>
                     <td><div class="detail-text">{details_html}</div></td>
                 </tr>'''
         rows += '</tbody></table>'
@@ -212,6 +241,7 @@ class Reporter:
         """
         sorted_findings = self._sort_findings()
         severity_counts = self._get_severity_counts()
+        confirm_counts = self._get_confirmed_counts()
         subdomains = self.recon_data.get('subdomains', [])
         urls = self.recon_data.get('urls', [])
         
@@ -454,6 +484,14 @@ class Reporter:
                 <div class="card-label">Info</div>
                 <div class="card-value">{severity_counts['info']}</div>
             </div>
+            <div class="card" style="background:#2a2a2a;border-left:5px solid #2ecc71;padding:20px;border-radius:4px">
+                <div class="card-label">Confirmed</div>
+                <div class="card-value">{confirm_counts['confirmed']}</div>
+            </div>
+            <div class="card" style="background:#2a2a2a;border-left:5px solid #e74c3c;padding:20px;border-radius:4px">
+                <div class="card-label">Unconfirmed</div>
+                <div class="card-value">{confirm_counts['unconfirmed']}</div>
+            </div>
         </section>
         
         {config_section}
@@ -483,6 +521,7 @@ class Reporter:
         """
         sorted_findings = self._sort_findings()
         severity_counts = self._get_severity_counts()
+        confirm_counts = self._get_confirmed_counts()
         
         report_data = {
             'metadata': {
@@ -504,6 +543,7 @@ class Reporter:
                 'module_params': self.config.get('module_params', {})
             },
             'summary': severity_counts,
+            'verification': confirm_counts,
             'findings': sorted_findings,
             'recon_data': {
                 'subdomains': self.recon_data.get('subdomains', []),
@@ -522,6 +562,7 @@ class Reporter:
         """
         sorted_findings = self._sort_findings()
         severity_counts = self._get_severity_counts()
+        confirm_counts = self._get_confirmed_counts()
         subdomains = self.recon_data.get('subdomains', [])
         urls = self.recon_data.get('urls', [])
         
@@ -553,6 +594,8 @@ Low: {severity_counts['low']}
 Info: {severity_counts['info']}
 
 Total Findings: {len(self.findings)}
+Confirmed: {confirm_counts['confirmed']}
+Unconfirmed: {confirm_counts['unconfirmed']}
 
 {'='*80}
 VULNERABILITY FINDINGS
@@ -568,6 +611,7 @@ VULNERABILITY FINDINGS
 [{i}] {finding.get('title', 'N/A')}
     Severity: {finding.get('severity', 'N/A').upper()}
     URL: {finding.get('url', 'N/A')}
+    Confirmed: {'YES' if finding.get('confirmed') else 'NO'}
     Details: {finding.get('details', 'N/A')}
 """
                 if finding.get('evidence'):
@@ -606,6 +650,225 @@ End of Report
         
         return txt_content
     
+    # ------------------------------------------------------------------
+    # Markdown-per-finding report generation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_affected_component(url: str) -> str:
+        """Extract a meaningful component name from a URL path."""
+        cleaned = url.split("?")[0].split("#")[0]
+        path = cleaned.rstrip("/")
+        parts = [p for p in path.split("/") if p]
+        # Skip protocol/host parts: try to return last 2 meaningful path segments
+        if not parts:
+            return "root"
+        # Heuristic: skip TLD-looking parts if the URL is short
+        candidates = [p for p in parts if not p.startswith("http") and "." not in p]
+        if len(candidates) >= 2:
+            return "/".join(candidates[-2:])
+        if candidates:
+            return candidates[-1]
+        # Last resort – return the final path segment as-is
+        return parts[-1] if parts else "root"
+
+    def _get_cvss_score(self, finding: Dict[str, Any]) -> float:
+        sev = finding.get("severity", "info").lower()
+        score = finding.get("cvss_score")
+        if score is not None:
+            return float(score)
+        return CVSS_BY_SEVERITY.get(sev, 0.0)
+
+    def _get_cvss_vector(self, finding: Dict[str, Any]) -> str:
+        sev = finding.get("severity", "info").lower()
+        vec = finding.get("cvss_vector")
+        if vec:
+            return str(vec)
+        return CVSS_VECTORS.get(sev, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N")
+
+    def _severity_rating(self, score: float) -> str:
+        if score >= 9.0:
+            return "Critical"
+        elif score >= 7.0:
+            return "High"
+        elif score >= 4.0:
+            return "Medium"
+        elif score >= 0.1:
+            return "Low"
+        return "None"
+
+    def _format_evidence(self, evidence: Any, max_lines: int = 15) -> str:
+        if not evidence:
+            return ""
+        text = str(evidence)
+        lines = text.splitlines()
+        if len(lines) > max_lines:
+            lines = lines[:max_lines] + ["... (truncated)"]
+        return "\n".join(lines)
+
+    def _build_impact_narrative(self, finding: Dict[str, Any]) -> str:
+        """Construct an impact paragraph from available metadata."""
+        what = finding.get("what_is_it") or finding.get("details", "")
+        impact = finding.get("impact", "")
+        sev = finding.get("severity", "info").lower()
+
+        if impact:
+            return impact
+        # Fallback template-based impact
+        templates = {
+            "critical": "This vulnerability poses a severe risk to the confidentiality, "
+                       "integrity, and availability of the affected system. "
+                       "Successful exploitation could lead to complete compromise of the "
+                       "application, including arbitrary code execution, data exfiltration, "
+                       "or full account takeover.",
+            "high": "This vulnerability can lead to significant data disclosure, "
+                    "privilege escalation, or partial system compromise. "
+                    "Immediate remediation is strongly recommended.",
+            "medium": "Exploitation may lead to limited information disclosure, "
+                      "minor privilege escalation, or degraded security posture. "
+                      "Should be addressed in the next maintenance cycle.",
+            "low": "Limited practical impact under normal conditions. "
+                   "Risk is minimal but may be chained with other vulnerabilities.",
+        }
+        return templates.get(sev, "See details for impact information.")
+
+    def _build_remediation(self, finding: Dict[str, Any]) -> str:
+        rem = finding.get("remediation") or finding.get("recommendation", "")
+        if rem:
+            return rem
+        # Generic fallback per severity
+        fallbacks = {
+            "critical": "Immediately review and fix the root cause. "
+                        "Apply input validation, output encoding, proper authentication "
+                        "checks, and access controls. Conduct a focused security review "
+                        "of the affected component.",
+            "high": "Review and fix the vulnerability. Apply appropriate security "
+                    "controls such as input sanitization, parameterized queries, "
+                    "or access control hardening.",
+            "medium": "Review the affected functionality and apply standard security "
+                      "best practices including input validation and proper authorization checks.",
+        }
+        return fallbacks.get(finding.get("severity", "").lower(),
+                             "Follow security best practices for the affected component.")
+
+    def _call_triage_assist(self, finding: Dict[str, Any]) -> Dict[str, str]:
+        """Use OpenAI to enhance the impact narrative if the API key is set."""
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            return {}
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+            prompt = (
+                f"You are a senior application security engineer triaging findings.\n\n"
+                f"Vulnerability: {finding.get('title', 'Unknown')}\n"
+                f"Severity: {finding.get('severity', 'info').upper()}\n"
+                f"URL: {finding.get('url', 'N/A')}\n"
+                f"Details: {finding.get('details', 'N/A')}\n"
+                f"Evidence: {finding.get('evidence', 'N/A')}\n\n"
+                f"Return a JSON object with exactly two keys:\n"
+                f"  - impact: a 2–4 sentence business-impact description\n"
+                f"  - remediation: a 2–4 sentence actionable fix recommendation\n"
+                f"Return ONLY the JSON object, no markdown fences."
+            )
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=500,
+            )
+            text = resp.choices[0].message.content.strip()
+            # Attempt to strip any accidental markdown fences
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1]
+                text = text.rsplit("```", 1)[0].strip()
+            result = json.loads(text)
+            if not isinstance(result, dict):
+                return {}
+            return {k: v for k, v in result.items() if isinstance(v, str)}
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        return {}
+
+    def _create_markdown_report(self) -> str:
+        """Generate one Markdown file per finding and return the output directory path."""
+        md_dir = os.path.join(self.output_dir, "markdown")
+        Path(md_dir).mkdir(parents=True, exist_ok=True)
+
+        sorted_findings = self._sort_findings()
+        triage_assist_enabled = self.config.get("triage_assist", False)
+
+        for finding in sorted_findings:
+            cvss_score = self._get_cvss_score(finding)
+            cvss_vector = self._get_cvss_vector(finding)
+            rating = self._severity_rating(cvss_score)
+            component = self._get_affected_component(finding.get("url", ""))
+            confirmed = finding.get("confirmed", False)
+
+            # Optionally enhance with LLM
+            if triage_assist_enabled:
+                llm = self._call_triage_assist(finding)
+            else:
+                llm = {}
+
+            impact = llm.get("impact") or self._build_impact_narrative(finding)
+            remediation = llm.get("remediation") or self._build_remediation(finding)
+
+            # Steps to reproduce – build from available metadata
+            details = finding.get("details", "")
+            evidence = self._format_evidence(finding.get("evidence", ""))
+            steps = f"""
+1.  Navigate to the affected endpoint: `{finding.get('url', 'N/A')}`
+2.  {details}
+3.  Observe the evidence below to confirm the vulnerability.
+"""
+            if evidence:
+                steps += f"\n## Evidence\n\n```\n{evidence}\n```\n"
+
+            vuln_type = finding.get("title", "finding").replace(" ", "_").replace("/", "_")
+            safe_target = self._sanitize_target()
+            filename = f"{vuln_type}_{safe_target}.md"
+            filepath = os.path.join(md_dir, filename)
+
+            content = f"""# {finding.get('title', 'Vulnerability Report')}
+
+**Target:** `{self.target}`
+**Component:** `{component}`
+**Severity:** {finding.get('severity', 'info').upper()}
+**Confirmed:** {"Yes" if confirmed else "No"}
+**CVSS Score:** {cvss_score} ({rating})
+**CVSS Vector:** `{cvss_vector}`
+
+---
+
+## Summary
+
+{finding.get('what_is_it') or details}
+
+## Steps to Reproduce
+{steps}
+
+## Impact
+
+{impact}
+
+## Recommended Fix
+
+{remediation}
+"""
+            if finding.get("references"):
+                refs = finding["references"]
+                if isinstance(refs, list):
+                    refs = "\n".join(f"- {r}" for r in refs)
+                content += f"\n## References\n\n{refs}\n"
+
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(content)
+
+        return md_dir
+
     def generate(self, suffix: str | None = None) -> str:
         """
         Generate report in specified format and save to file.
@@ -629,21 +892,25 @@ End of Report
             if self.report_format == 'html':
                 report_content = self._create_html_report()
                 file_extension = 'html'
+                file_path = self._get_report_path(file_extension, suffix)
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(report_content)
             elif self.report_format == 'json':
                 report_content = self._create_json_report()
                 file_extension = 'json'
+                file_path = self._get_report_path(file_extension, suffix)
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(report_content)
             elif self.report_format == 'txt':
                 report_content = self._create_txt_report()
                 file_extension = 'txt'
+                file_path = self._get_report_path(file_extension, suffix)
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(report_content)
+            elif self.report_format == 'markdown-report':
+                file_path = self._create_markdown_report()
             else:
                 raise ValueError(f"Unsupported report format: {self.report_format}")
-            
-            # Generate filename
-            file_path = self._get_report_path(file_extension, suffix)
-            
-            # Write report to file
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(report_content)
             
             return file_path
             

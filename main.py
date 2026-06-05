@@ -13,8 +13,10 @@ from datetime import datetime
 
 from modules.recon import Recon
 from modules.scanner import VulnScanner
+from modules.api_scanner import ApiScanner
+from modules.idor import IdorScanner
 from modules.reporter import Reporter
-from modules.utils import banner, log, Colors
+from modules.utils import banner, log, Colors, ScopeEnforcer
 
 
 def parse_args():
@@ -25,13 +27,15 @@ def parse_args():
     parser.add_argument("--config", "-C", help="Path to YAML configuration file")
     parser.add_argument("--target", "-t", help="Target URL (e.g. https://example.com)")
     parser.add_argument("--modules", "-m", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "all"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "all"],
         default=["all"])
     parser.add_argument("--output", "-o", default="reports")
-    parser.add_argument("--format", "-f", choices=["json", "html", "txt"], default="html")
+    parser.add_argument("--format", "-f", choices=["json", "html", "txt", "markdown-report"], default="html")
     parser.add_argument("--threads", type=int, default=10)
     parser.add_argument("--timeout", type=int, default=10)
     parser.add_argument("--cookies", "-c", default=None)
+    parser.add_argument("--cookies-alt", default=None,
+        help="Second account's session cookies for horizontal IDOR testing (e.g. 'session=xyz')")
     parser.add_argument("--headers", "-H", nargs="+", default=[])
     parser.add_argument("--auth", help="Basic auth credentials username:password")
     parser.add_argument("--proxy", help="Proxy URL for outgoing requests")
@@ -43,10 +47,10 @@ def parse_args():
     parser.add_argument("--delay", type=float, default=0.0,
         help="Delay between requests in seconds")
     parser.add_argument("--oob-host", default=None,
-        help="Out-of-band callback host for SSRF verification (e.g. Burp Collaborator or interactsh URL)")
+        help="Out-of-band callback host for SSRF and SQLi OOB verification (e.g. Burp Collaborator or interactsh URL)")
     parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
     parser.add_argument("--disable-modules", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api"],
         default=[], help="Disable specific modules when scanning all or default modules")
     parser.add_argument("--module-param", action="append", default=[],
         help="Override module settings using module.key=value")
@@ -56,6 +60,18 @@ def parse_args():
         help="Autosave interim report every N seconds (0 = disabled)")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--passive", action="store_true")
+    parser.add_argument("--headless", action="store_true",
+        help="Use Playwright headless browser for JS-rendered crawling (network intercept, SPA route discovery)")
+    parser.add_argument("--verify-only", "-V",
+        help="Re-verify unconfirmed findings from a previous JSON report. Path to report file.")
+    parser.add_argument("--triage-assist", action="store_true",
+        help="Use OpenAI to enhance impact narrative in markdown reports (requires OPENAI_API_KEY env var)")
+    parser.add_argument("--rps", type=float, default=5.0,
+        help="Requests per second (default: 5). Halved on 429, restored after 20 OK.")
+    parser.add_argument("--stealth", action="store_true",
+        help="Stealth mode: rotate 20 User-Agent strings, random 0.5-2s delay, shuffle POST params.")
+    parser.add_argument("--scope",
+        help="Path to scope file (one domain/IP/CIDR per line). Out-of-scope URLs are rejected & logged.")
     return parser.parse_args()
 
 
@@ -88,18 +104,25 @@ def _apply_scalar_config(cli_args, config_file: dict) -> None:
     yaml_to_arg = {
         'target': 'target', 'output': 'output', 'format': 'format',
         'threads': 'threads', 'timeout': 'timeout', 'cookies': 'cookies',
+        'cookies_alt': 'cookies_alt',
         'auth': 'auth', 'proxy': 'proxy', 'verify_ssl': 'verify_ssl',
         'crawl_depth': 'crawl_depth', 'max_urls': 'max_urls',
         'delay': 'delay', 'oob_host': 'oob_host', 'wordlist': 'wordlist',
         'retries': 'retries', 'verbose': 'verbose', 'passive': 'passive',
+        'headless': 'headless',
+        'verify_only': 'verify_only',
+        'triage_assist': 'triage_assist',
+        'rps': 'rps',
+        'stealth': 'stealth',
+        'scope': 'scope',
         'autosave_interval': 'autosave_interval',
     }
-    defaulted = {'threads', 'timeout', 'retries', 'crawl_depth', 'autosave_interval'}
+    defaulted = {'threads', 'timeout', 'retries', 'crawl_depth', 'autosave_interval', 'rps'}
     for yaml_key, arg_key in yaml_to_arg.items():
         if yaml_key not in config_file:
             continue
         cli_value = getattr(cli_args, arg_key, None)
-        if cli_value is None or (arg_key in defaulted and cli_value in (10, 2, 3, 0)):
+        if cli_value is None or (arg_key in defaulted and cli_value in (10, 2, 3, 0, 5.0)):
             setattr(cli_args, arg_key, config_file[yaml_key])
 
 
@@ -196,6 +219,7 @@ def build_config(args):
         "threads": args.threads,
         "timeout": args.timeout,
         "cookies": cookies,
+        "cookies_alt": args.cookies_alt or "",
         "headers": custom_headers,
         "auth": args.auth,
         "proxy": args.proxy,
@@ -210,6 +234,13 @@ def build_config(args):
         "module_params": module_params,
         "verbose": args.verbose,
         "passive": args.passive,
+        "headless": getattr(args, "headless", False),
+        "verify_only": getattr(args, "verify_only", None),
+        "triage_assist": getattr(args, "triage_assist", False),
+        "rps": args.rps,
+        "stealth": args.stealth,
+        "scope": args.scope or "",
+        "scope_enforcer": ScopeEnforcer(args.scope, args.output) if args.scope else None,
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
     }
 
@@ -222,8 +253,16 @@ def _log_startup(config: dict) -> None:
         log(f"Disabled    : {', '.join(config['disable_modules'])}", Colors.CYAN)
     log(f"Threads     : {config['threads']}", Colors.CYAN)
     log(f"Max URLs    : {config['max_urls']}", Colors.CYAN)
+    log(f"RPS         : {config.get('rps', 5.0)}", Colors.CYAN)
     log(f"Delay       : {config['delay']}s", Colors.CYAN)
-    log(f"Mode        : {'Passive' if config['passive'] else 'Active'}", Colors.CYAN)
+    mode_parts = ['Passive' if config['passive'] else 'Active']
+    if config.get('headless'):
+        mode_parts.append('Headless')
+    if config.get('stealth'):
+        mode_parts.append('Stealth')
+    log(f"Mode        : {' + '.join(mode_parts)}", Colors.CYAN)
+    if config.get('scope'):
+        log(f"Scope       : {config['scope']}", Colors.CYAN)
     log(f"Report      : {config['report_format'].upper()}\n", Colors.CYAN)
 
 
@@ -300,10 +339,14 @@ def _active_module_map(scanner, recon):
         "http_methods": scanner.scan_http_methods,
         "insecure_forms": scanner.scan_insecure_forms,
         "subdomain_takeover": scanner.scan_subdomain_takeover,
-        "graphql": scanner.scan_graphql, "idor": scanner.scan_idor,
+        "graphql": scanner.scan_graphql,
     }
     if recon is not None:
         modules["js_secrets"] = recon.mine_js_bundles
+    _api_scanner = ApiScanner(scanner.config, scanner.recon)
+    modules["api"] = _api_scanner.run_all
+    _idor_scanner = IdorScanner(scanner.config, scanner.recon)
+    modules["idor"] = _idor_scanner.run_all
     return modules
 
 
@@ -354,6 +397,25 @@ def main():
         sys.exit(1)
 
     config = build_config(args)
+    verify_path = config.get("verify_only")
+    if verify_path:
+        from modules.scanner import VulnScanner
+        log(f"[*] Verify-only mode: re-checking findings from {verify_path}", Colors.CYAN)
+        verified = VulnScanner.verify_report(verify_path, config)
+        if not verified:
+            log("[!] No findings to verify; exiting.", Colors.YELLOW)
+            return 0
+        out_path = verify_path.replace(".json", "_verified.json")
+        import json
+        with open(out_path, "w") as f:
+            json.dump({"findings": verified, "verification": {
+                "total": len(verified),
+                "confirmed": sum(1 for v in verified if v.get("confirmed")),
+                "report_date": config.get("timestamp"),
+            }}, f, indent=2)
+        log(f"[+] Verified report saved to {out_path}", Colors.GREEN)
+        return 0
+
     os.makedirs(config["output_dir"], exist_ok=True)
     _log_startup(config)
 
