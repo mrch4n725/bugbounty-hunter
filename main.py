@@ -73,6 +73,10 @@ def parse_args():
         help="Stealth mode: rotate 20 User-Agent strings, random 0.5-2s delay, shuffle POST params.")
     parser.add_argument("--scope",
         help="Path to scope file (one domain/IP/CIDR per line). Out-of-scope URLs are rejected & logged.")
+    parser.add_argument("--exclude-patterns", nargs="*", default=[],
+        help="Regex patterns for URL exclusions (e.g. '/admin' '/logout')")
+    parser.add_argument("--include-paths", nargs="*", default=[],
+        help="Regex patterns for URL inclusion (e.g. '/api' '/graphql'). All others excluded.")
     return parser.parse_args()
 
 
@@ -116,6 +120,8 @@ def _apply_scalar_config(cli_args, config_file: dict) -> None:
         'rps': 'rps',
         'stealth': 'stealth',
         'scope': 'scope',
+        'exclude_patterns': 'exclude_patterns',
+        'include_paths': 'include_paths',
         'autosave_interval': 'autosave_interval',
     }
     defaulted = {'threads', 'timeout', 'retries', 'crawl_depth', 'autosave_interval', 'rps'}
@@ -242,6 +248,8 @@ def build_config(args):
         "stealth": args.stealth,
         "scope": args.scope or "",
         "scope_enforcer": ScopeEnforcer(args.scope, args.output) if args.scope else None,
+        "exclude_patterns": args.exclude_patterns or [],
+        "include_paths": args.include_paths or [],
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
     }
 
@@ -364,6 +372,32 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         scanner = VulnScanner(config, recon_data)
         modules = _active_module_map(scanner, recon)
     _collect_module_findings(modules, config, run_all, disabled_modules, all_findings, lock)
+
+    # ── Post-scan triage pipeline ───────────────────────────────────
+    if not config["passive"]:
+        # Re-verification loop: promote STAGE 1 findings
+        log("[*] Running re-verification loop...", Colors.CYAN)
+        scanner._run_reverification_loop()
+
+        # Collect updated findings
+        updated = scanner._get_findings()
+
+        # Chain analysis
+        log("[*] Running chain analysis...", Colors.CYAN)
+        updated = VulnScanner.chain_analysis(updated)
+
+        # Self-halting check
+        log("[*] Checking self-halting conditions...", Colors.CYAN)
+        updated = VulnScanner.check_self_halt(updated)
+
+        # Re-prioritize
+        from modules.utils import prioritize_findings
+        updated = prioritize_findings(updated)
+
+        # Replace findings in shared list
+        with lock:
+            all_findings.clear()
+            all_findings.extend(updated)
 
 
 def _write_report_and_summary(config, all_findings, recon_data, js_data=None) -> int:

@@ -83,6 +83,7 @@ class VerificationStage(str, enum.Enum):
     DETECTED = "detected"
     VALIDATED = "validated"
     EXPLOITABLE = "exploitable"
+    VERIFIED = "verified"
 
 class EvidenceStrength(str, enum.Enum):
     WEAK = "weak"
@@ -1284,6 +1285,10 @@ def finding(
     evidence_strength: Optional[str] = None,
     false_positive_risk: Optional[str] = None,
     exploitability_rating: Optional[str] = None,
+    parameter: Optional[str] = None,
+    request: Optional[str] = None,
+    response_excerpt: Optional[str] = None,
+    steps_to_reproduce: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Build a standardized finding dict with CVSS metadata, fingerprint, and timestamp.
@@ -1339,6 +1344,10 @@ def finding(
         "proof": proof or [],
         "validation_steps": validation_steps or [],
         "exploitability_rating": exploitability_rating or "unknown",
+        "parameter": parameter or "",
+        "request": request or "",
+        "response_excerpt": response_excerpt or "",
+        "steps_to_reproduce": steps_to_reproduce or [],
     }
 
     for key in (
@@ -1704,13 +1713,30 @@ def safe_get(
     timeout: int = 10,
     allow_redirects: bool = True,
     raise_for_status: bool = True,
+    config: Optional[dict] = None,
     **kwargs,
 ) -> Optional[requests.Response]:
-    """HTTP GET with logging on failure."""
+    """HTTP GET with logging on failure and scope-checked redirects."""
     try:
         response = session.get(
             url, timeout=timeout, allow_redirects=allow_redirects, **kwargs
         )
+        # Check redirect targets against scope
+        if config and allow_redirects and response.history:
+            enforcer = config.get("scope_enforcer")
+            if enforcer is not None:
+                for resp in response.history:
+                    if resp.headers.get("Location"):
+                        redirect_target = resp.headers["Location"]
+                        if not redirect_target.startswith("/") and not enforcer.check_url(redirect_target):
+                            log(f"[!] Redirect to out-of-scope URL blocked: {redirect_target}", Colors.YELLOW)
+                            return None
+                        if redirect_target.startswith("/"):
+                            from urllib.parse import urljoin
+                            redirect_target = urljoin(url, redirect_target)
+                            if not enforcer.check_url(redirect_target):
+                                log(f"[!] Redirect to out-of-scope URL blocked: {redirect_target}", Colors.YELLOW)
+                                return None
         if raise_for_status:
             response.raise_for_status()
         return response
@@ -1739,13 +1765,30 @@ def safe_post(
     timeout: int = 10,
     allow_redirects: bool = True,
     raise_for_status: bool = True,
+    config: Optional[dict] = None,
     **kwargs,
 ) -> Optional[requests.Response]:
-    """HTTP POST with logging on failure."""
+    """HTTP POST with logging on failure and scope-checked redirects."""
     try:
         response = session.post(
             url, data=data, timeout=timeout, allow_redirects=allow_redirects, **kwargs
         )
+        # Check redirect targets against scope
+        if config and allow_redirects and response.history:
+            enforcer = config.get("scope_enforcer")
+            if enforcer is not None:
+                for resp in response.history:
+                    if resp.headers.get("Location"):
+                        redirect_target = resp.headers["Location"]
+                        if not redirect_target.startswith("/") and not enforcer.check_url(redirect_target):
+                            log(f"[!] Redirect to out-of-scope URL blocked: {redirect_target}", Colors.YELLOW)
+                            return None
+                        if redirect_target.startswith("/"):
+                            from urllib.parse import urljoin
+                            redirect_target = urljoin(url, redirect_target)
+                            if not enforcer.check_url(redirect_target):
+                                log(f"[!] Redirect to out-of-scope URL blocked: {redirect_target}", Colors.YELLOW)
+                                return None
         if raise_for_status:
             response.raise_for_status()
         return response

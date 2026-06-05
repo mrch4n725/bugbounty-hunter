@@ -105,7 +105,9 @@ class ApiScanner(VulnScanner):
         findings.extend(self.scan_bola(endpoints))
         findings.extend(self.scan_mass_assignment(endpoints))
 
-        return self._deduplicate(findings)
+        # Final scope filter on all results
+        in_scope = [f for f in findings if self._in_scope(f.get("url", ""))]
+        return self._deduplicate(in_scope)
 
     # ── OpenAPI / Swagger Discovery ────────────────────────────────────────
 
@@ -116,6 +118,8 @@ class ApiScanner(VulnScanner):
 
         for path in OPENAPI_PATHS:
             url = self.base_url + path
+            if not self._in_scope(url):
+                continue
             if url in seen_paths:
                 continue
             seen_paths.add(url)
@@ -130,9 +134,10 @@ class ApiScanner(VulnScanner):
 
             parsed = self._parse_openapi(spec, url)
             if parsed:
-                log(f"  [API] Loaded spec → {url} ({len(parsed)} endpoints)", Colors.CYAN,
+                in_scope = [p for p in parsed if self._in_scope(p.get("url", ""))]
+                log(f"  [API] Loaded spec → {url} ({len(in_scope)}/{len(parsed)} endpoints)", Colors.CYAN,
                     verbose_only=True, verbose=self.verbose)
-                endpoints.extend(parsed)
+                endpoints.extend(in_scope)
 
         return endpoints
 
@@ -219,6 +224,8 @@ class ApiScanner(VulnScanner):
 
         for path in GQL_ENDPOINTS:
             url = self.base_url + path
+            if not self._in_scope(url):
+                continue
             if url in seen:
                 continue
             seen.add(url)

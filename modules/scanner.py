@@ -486,6 +486,141 @@ class VulnScanner:
         raw = self.dedup.get_findings()
         return prioritize_findings(raw)
 
+    # ── Re-verification Loop ──────────────────────────────────────────
+
+    def _run_reverification_loop(self) -> None:
+        """Re-attempt STAGE 1 (detected, 1 signal) findings with alternative signal types."""
+        all_findings = self.dedup.get_findings()
+        attempt_count: dict[str, int] = {}
+        for f in all_findings:
+            fp = f.get("fingerprint", "")
+            stage = f.get("verification_stage", "").lower()
+            if stage not in ("detected",):
+                continue
+            vuln_type = f.get("type", "").lower()
+            url = f.get("url", "")
+            param = f.get("parameter", "")
+            signal_count = len(f.get("validation_steps", []))
+            if signal_count >= 2:
+                continue
+
+            # Track attempts; discard after 3
+            attempt_count[fp] = attempt_count.get(fp, 0) + 1
+            if attempt_count[fp] > 3:
+                log(f"  [Re-verify] Discarding {vuln_type} at {url} after 3 failed re-verifications", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+                continue
+
+            if "sqli" in vuln_type.lower():
+                # Try time-based if error-based was used
+                payloads = self._load_payloads("sqli")
+                signals = self._sqli_test_parameter(url, param or "id", "1", payloads, self.config.get("oob_host"))
+                if signals.get("time") or signals.get("union") or signals.get("oob"):
+                    f["verification_stage"] = VerificationStage.VALIDATED.value
+                    log(f"  [Re-verify] SQLi at {url} promoted to VALIDATED via alternative signal", Colors.GREEN, verbose_only=True, verbose=self.verbose)
+
+            elif "xss" in vuln_type.lower():
+                # Retry with simpler payload
+                simple_payloads = ["<script>alert(1)</script>", "<img src=x onerror=alert(1)>"]
+                for sp in simple_payloads:
+                    test_url = self._inject_param(url, param or "q", sp)
+                    exec_result = self.browser.check_xss_execution(test_url, sp)
+                    if exec_result and (exec_result.get("alert_fired") or exec_result.get("dom_mutation")):
+                        f["verification_stage"] = VerificationStage.EXPLOITABLE.value
+                        log(f"  [Re-verify] XSS at {url} promoted to EXPLOITABLE via Playwright re-check", Colors.GREEN, verbose_only=True, verbose=self.verbose)
+                        break
+
+    # ── Chain Analysis ────────────────────────────────────────────────
+
+    @staticmethod
+    def chain_analysis(findings: list[dict]) -> list[dict]:
+        """Detect exploitable chains and enrich impact fields."""
+        types = {f.get("type", "").lower(): f for f in findings}
+        chains_found = []
+
+        # CSRF + XSS → ATO
+        csrf = [f for f in findings if "csrf" in f.get("type", "").lower() and f.get("url")]
+        xss = [f for f in findings if "xss" in f.get("type", "").lower() and f.get("url")]
+        if csrf and xss:
+            chain_finding = {
+                "title": "Chained: CSRF + XSS → Account Takeover",
+                "type": "chain",
+                "severity": "critical",
+                "details": "CSRF vulnerabilities allow an attacker to forge requests; combined with stored XSS, this enables silent account takeover without user interaction beyond visiting a page.",
+                "impact": "Full account takeover via CSRF-triggered stored XSS payload injection.",
+                "url": csrf[0].get("url") + " & " + xss[0].get("url"),
+                "verification_stage": VerificationStage.VALIDATED.value,
+                "evidence": f"CSRF: {len(csrf)} findings | XSS: {len(xss)} findings",
+                "chains": True,
+            }
+            chains_found.append(chain_finding)
+
+        # SSRF + internal service → RCE potential
+        ssrf = [f for f in findings if "ssrf" in f.get("type", "").lower()]
+        if ssrf:
+            chain_finding = {
+                "title": "Chained: SSRF → Internal Service Enumeration / RCE",
+                "type": "chain",
+                "severity": "critical",
+                "details": "SSRF can be leveraged to probe internal services, access cloud metadata endpoints, or exploit internal-facing RCE (e.g., Jenkins, Hadoop, Consul).",
+                "impact": "Potential lateral movement and remote code execution on internal infrastructure.",
+                "url": ssrf[0].get("url"),
+                "verification_stage": VerificationStage.VALIDATED.value,
+                "evidence": f"SSRF: {len(ssrf)} findings",
+                "chains": True,
+            }
+            chains_found.append(chain_finding)
+
+        # IDOR + sensitive data → PII breach
+        idor = [f for f in findings if "idor" in f.get("type", "").lower() or "id" in f.get("parameter", "").lower()]
+        sensitive = [f for f in findings if "sensitive" in f.get("type", "").lower()]
+        if idor and sensitive:
+            chain_finding = {
+                "title": "Chained: IDOR + Sensitive Data Exposure → PII Breach",
+                "type": "chain",
+                "severity": "critical",
+                "details": "IDOR vulnerabilities allow enumerating user/object identifiers; combined with sensitive data exposure, this enables mass PII harvesting.",
+                "impact": "Massive personal data breach via predictable ID enumeration.",
+                "url": idor[0].get("url") + " & " + sensitive[0].get("url"),
+                "verification_stage": VerificationStage.VALIDATED.value,
+                "evidence": f"IDOR: {len(idor)} findings | Sensitive Data: {len(sensitive)} findings",
+                "chains": True,
+            }
+            chains_found.append(chain_finding)
+
+        findings.extend(chains_found)
+        return findings
+
+    # ── Self-Halting Conditions ───────────────────────────────────────
+
+    @staticmethod
+    def check_self_halt(findings: list[dict]) -> list[dict]:
+        """Check for dangerous findings that should halt active testing and flag for human review."""
+        halted = []
+        for f in findings:
+            vuln_type = f.get("type", "").lower()
+            severity = f.get("severity", "").lower()
+            stage = f.get("verification_stage", "").lower()
+
+            # Dangerous patterns: SQLi OOB confirmed + critical severity
+            if "sqli" in vuln_type and stage in ("exploitable", "verified") and "oob" in f.get("evidence", "").lower():
+                f["title"] = f["title"] + " — Identified: exploitation withheld pending human review"
+                f["details"] = f["details"] + " | ⚠ This finding was confirmed via OOB. Further exploitation (data extraction, writes) withheld pending human review per self-halting policy."
+                f["impact"] = "CRITICAL: SQL injection confirmed with out-of-band data exfiltration capability. Automated exploitation withheld — requires manual review."
+                f["self_halted"] = True
+                halted.append(f)
+
+            # Critical SSRF with cloud metadata access
+            if "ssrf" in vuln_type and stage in ("exploitable", "verified"):
+                f["title"] = f["title"] + " — Identified: exploitation withheld pending human review"
+                f["details"] = f["details"] + " | ⚠ SSRF confirmed. Further exploitation (cloud metadata, internal port scanning) withheld pending human review."
+                f["impact"] = "CRITICAL: SSRF with out-of-band confirmation. Automated exploitation withheld — requires manual review."
+                f["self_halted"] = True
+                halted.append(f)
+
+        if halted:
+            log(f"  [Self-Halt] {len(halted)} finding(s) flagged for human review — exploitation withheld.", Colors.RED)
+        return findings
+
     # ── Legacy Backward-Compat Helpers (used by ApiScanner, IdorScanner) ──
 
     def _append_finding(self, findings_list: list, f: Optional[dict]) -> None:
@@ -1467,6 +1602,13 @@ class VulnScanner:
         self._prepare_scan()
         payloads = self._load_payloads("xss")
 
+        # Auto-inject WAF bypass payloads when WAF is detected
+        if self.waf_detected:
+            bypass = payloads.get("waf_bypass", WAF_BYPASS_XSS)
+            reflected = payloads.setdefault("reflected", list(XSS_PAYLOADS))
+            reflected.extend(bypass)
+            log(f"  [WAF] WAF detected — {len(bypass)} bypass payloads injected into XSS scan", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+
         for url in self.recon.get("urls", []):
             if not self._in_scope(url):
                 continue
@@ -2056,6 +2198,8 @@ class VulnScanner:
             target = self.config.get("target", "")
             if not target:
                 return self._get_findings()
+            if not self._in_scope(target):
+                return self._get_findings()
             resp = safe_get(self.session, target, self.timeout)
             if not resp:
                 return self._get_findings()
@@ -2173,6 +2317,8 @@ class VulnScanner:
     def scan_clickjacking(self) -> list[dict]:
         findings: list[dict] = []
         target = self.config.get("target", "")
+        if not target or not self._in_scope(target):
+            return self._get_findings()
         try:
             resp = safe_get(self.session, target, self.timeout, raise_for_status=False)
             if not resp:
@@ -2204,6 +2350,8 @@ class VulnScanner:
     def scan_http_methods(self) -> list[dict]:
         findings: list[dict] = []
         target = self.config.get("target", "")
+        if not target or not self._in_scope(target):
+            return self._get_findings()
         try:
             resp = self.session.options(target, timeout=self.timeout)
             if not resp:
@@ -2282,6 +2430,8 @@ class VulnScanner:
             try:
                 for scheme in ("http://", "https://"):
                     target_url = f"{scheme}{subdomain}"
+                    if not self._in_scope(target_url):
+                        continue
                     resp = safe_get(self.session, target_url, self.timeout, raise_for_status=False)
                     if not resp or not resp.text:
                         continue
@@ -2361,6 +2511,8 @@ class VulnScanner:
         # ── STEP 2–3: Probe each candidate ──────────────────────────────
         for candidate in candidates:
             test_url = candidate["url"]
+            if not self._in_scope(test_url):
+                continue
             form_fields = candidate["form_fields"]
             severity = candidate["severity"]
 
@@ -2467,6 +2619,8 @@ class VulnScanner:
 
         for sp in spec_paths:
             url = self.base_url + sp
+            if not self._in_scope(url):
+                continue
             try:
                 resp = safe_get(self.session, url, self.timeout)
                 if not resp:
@@ -2504,8 +2658,10 @@ class VulnScanner:
                 continue
 
         if discovered_endpoints:
-            self.recon.setdefault("urls", []).extend(discovered_endpoints)
-            log(f"  [OpenAPI] {len(discovered_endpoints)} endpoints discovered from spec files", Colors.GREEN)
+            # Only inject in-scope endpoints
+            in_scope = [ep for ep in discovered_endpoints if self._in_scope(ep)]
+            self.recon.setdefault("urls", []).extend(in_scope)
+            log(f"  [OpenAPI] {len(in_scope)}/{len(discovered_endpoints)} endpoints discovered from spec files", Colors.GREEN)
 
         return self._get_findings()
 
@@ -2521,6 +2677,8 @@ class VulnScanner:
 
         for ep in endpoints:
             url = self.base_url + ep
+            if not self._in_scope(url):
+                continue
 
             # ── 1. Introspection ──────────────────────────────────────
             try:
