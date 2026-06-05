@@ -10,6 +10,7 @@ import os
 import threading
 import yaml
 from datetime import datetime
+from typing import Any
 
 from modules.recon import Recon
 from modules.scanner import VulnScanner
@@ -17,7 +18,7 @@ from modules.api_scanner import ApiScanner
 from modules.idor import IdorScanner
 from modules.reporter import Reporter
 from modules.js_intelligence import JSIntelligence
-from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session
+from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score
 
 
 def parse_args():
@@ -335,8 +336,25 @@ def _collect_module_findings(modules, config, run_all, disabled_modules, all_fin
             log(f"[+] {mod_name.upper()} — nothing found", Colors.GREEN)
 
 
-def _active_module_map(scanner, recon):
-    modules = {
+def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, lock):
+    # ── TARGET_LEVEL: modules that run once per target, not per URL ──
+    TARGET_LEVEL: set[str] = {
+        "headers", "dirb", "exposed_files", "clickjacking",
+        "subdomain_takeover", "graphql", "blind_xss", "js_secrets", "api",
+    }
+
+    if config["passive"]:
+        log("[*] Passive mode — skipping active fuzzing.", Colors.YELLOW)
+        scanner = VulnScanner(config, recon_data)
+        modules = {"headers": scanner.scan_headers}
+        _collect_module_findings(modules, config, run_all, disabled_modules, all_findings, lock)
+        return
+
+    scanner = VulnScanner(config, recon_data)
+    all_findings_local: list[dict] = []
+
+    # ── Step 1: Build module map (same keys as original _active_module_map) ──
+    module_map: dict[str, Any] = {
         "openapi": scanner.scan_openapi,
         "xss": scanner.scan_xss, "sqli": scanner.scan_sqli,
         "lfi": scanner.scan_lfi, "ssrf": scanner.scan_ssrf,
@@ -357,47 +375,72 @@ def _active_module_map(scanner, recon):
         "rate_limiting": scanner.scan_rate_limiting,
     }
     _api_scanner = ApiScanner(scanner.config, scanner.recon)
-    modules["api"] = _api_scanner.run_all
+    module_map["api"] = _api_scanner.run_all
     _idor_scanner = IdorScanner(scanner.config, scanner.recon)
-    modules["idor"] = _idor_scanner.run_all
-    return modules
+    module_map["idor"] = _idor_scanner.run_all
 
+    # ── Step 2: Run TARGET_LEVEL modules first ───────────────────────────
+    target_modules = {k: v for k, v in module_map.items() if k in TARGET_LEVEL}
+    _collect_module_findings(target_modules, config, run_all, disabled_modules, all_findings_local, lock)
 
-def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, lock):
-    if config["passive"]:
-        log("[*] Passive mode — skipping active fuzzing.", Colors.YELLOW)
-        scanner = VulnScanner(config, recon_data)
-        modules = {"headers": scanner.scan_headers}
-    else:
-        scanner = VulnScanner(config, recon_data)
-        modules = _active_module_map(scanner, recon)
-    _collect_module_findings(modules, config, run_all, disabled_modules, all_findings, lock)
+    # ── Step 3: Score and sort URLs ──────────────────────────────────────
+    urls = recon_data.get("urls", [])
+    forms = recon_data.get("forms", [])
+    scored = [(compute_endpoint_score(u, forms, recon_data), u) for u in urls]
+    scored.sort(key=lambda x: -x[0])
+    sorted_urls = [u for _, u in scored]
 
-    # ── Post-scan triage pipeline ───────────────────────────────────
-    if not config["passive"]:
-        # Re-verification loop: promote STAGE 1 findings
-        log("[*] Running re-verification loop...", Colors.CYAN)
-        scanner._run_reverification_loop()
+    top_n = scored[:10]
+    log("\n[*] Top 10 scored endpoints (highest attack surface first):", Colors.BOLD)
+    for rank, (score, url) in enumerate(top_n, 1):
+        log(f"    {rank:>2}. [{score:>3}] {url}", Colors.CYAN)
 
-        # Collect updated findings
-        updated = scanner._get_findings()
+    # ── Step 4: Per-URL intelligent module selection ─────────────────────
+    per_url_modules = {k: v for k, v in module_map.items() if k not in TARGET_LEVEL}
 
-        # Chain analysis
-        log("[*] Running chain analysis...", Colors.CYAN)
-        updated = VulnScanner.chain_analysis(updated)
+    for url in sorted_urls:
+        applicable = classify_endpoint(url, forms, recon_data)
+        # Respect --modules filter
+        if not run_all:
+            applicable &= set(config["modules"])
+        # Remove disabled modules
+        applicable -= disabled_modules
+        # Keep only modules available in the per-URL map
+        applicable &= per_url_modules.keys()
 
-        # Self-halting check
-        log("[*] Checking self-halting conditions...", Colors.CYAN)
-        updated = VulnScanner.check_self_halt(updated)
+        if not applicable:
+            continue
 
-        # Re-prioritize
-        from modules.utils import prioritize_findings
-        updated = prioritize_findings(updated)
+        log(f"[*] {url} → {len(applicable)} modules selected: {sorted(applicable)}", Colors.YELLOW, verbose_only=True, verbose=config.get("verbose", False))
 
-        # Replace findings in shared list
-        with lock:
-            all_findings.clear()
-            all_findings.extend(updated)
+        for mod_name in applicable:
+            try:
+                mod_fn = per_url_modules[mod_name]
+                findings = mod_fn(target_urls=[url])
+                if findings:
+                    with lock:
+                        all_findings_local.extend(findings)
+            except Exception as e:
+                log(f"  [!] {mod_name} error on {url}: {e}", Colors.RED, verbose_only=True, verbose=config.get("verbose", False))
+
+    # ── Step 5: Post-scan triage pipeline ───────────────────────────────
+    log("[*] Running re-verification loop...", Colors.CYAN)
+    scanner._run_reverification_loop()
+
+    updated = scanner._get_findings()
+
+    log("[*] Running chain analysis...", Colors.CYAN)
+    updated = VulnScanner.chain_analysis(updated)
+
+    log("[*] Checking self-halting conditions...", Colors.CYAN)
+    updated = VulnScanner.check_self_halt(updated)
+
+    from modules.utils import prioritize_findings
+    updated = prioritize_findings(updated)
+
+    with lock:
+        all_findings.clear()
+        all_findings.extend(updated)
 
 
 def _write_report_and_summary(config, all_findings, recon_data, js_data=None) -> int:

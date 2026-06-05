@@ -992,7 +992,7 @@ class VulnScanner:
     # SQLi — Multi-Signal Detection
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_sqli(self) -> list[dict]:
+    def scan_sqli(self, target_urls: list[str] | None = None) -> list[dict]:
         """
         Multi-signal SQLi detection:
         1. Error-based (must match SQL error strings)
@@ -1000,12 +1000,16 @@ class VulnScanner:
         3. Time-based (requires >4.5s delay, repeatable)
         4. OOB (requires callback verification)
         Requires multiple signals before marking Confirmed.
+
+        Args:
+            target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
         """
         self._prepare_scan()
         payloads = self._load_payloads("sqli")
         oob_host = self.config.get("oob_host")
+        urls = self.recon.get("urls", []) if target_urls is None else target_urls
 
-        for url in self.recon.get("urls", []):
+        for url in urls:
             if not self._in_scope(url):
                 continue
             try:
@@ -1022,7 +1026,7 @@ class VulnScanner:
                 log(f"  [SQLi] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
 
         # ── POST body SQLi (JSON, XML, form-encoded) ─────────────────
-        for url in self.recon.get("urls", []):
+        for url in urls:
             if not self._in_scope(url):
                 continue
             try:
@@ -1264,17 +1268,21 @@ class VulnScanner:
     # SSRF — OOB-Only Confirmation
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_ssrf(self) -> list[dict]:
+    def scan_ssrf(self, target_urls: list[str] | None = None) -> list[dict]:
         """
         SSRF detection with OOB-only confirmation.
         Parameter-name heuristics (url=, uri=, path=, dest=) alone never
         produce findings. Only OOB-confirmed or cloud-metadata-proven
         interactions become findings.
+
+        Args:
+            target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
         """
         oob_host = self.config.get("oob_host")
         findings: list[dict] = []
+        urls = self.recon.get("urls", []) if target_urls is None else target_urls
 
-        for url in self.recon.get("urls", []):
+        for url in urls:
             if not self._in_scope(url):
                 continue
             try:
@@ -1349,18 +1357,22 @@ class VulnScanner:
     # XXE — In-Band + OOB Detection
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_xxe(self) -> list[dict]:
+    def scan_xxe(self, target_urls: list[str] | None = None) -> list[dict]:
         """
         XML External Entity (XXE) detection.
 
         In-Band: Submit XML with entity that reads /etc/passwd, check for file contents.
         OOB:     Submit XML that triggers callback to OOB host.
         Error:   Submit malformed XML that leaks file contents via error messages.
+
+        Args:
+            target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
         """
         findings: list[dict] = []
         oob_host = self.config.get("oob_host")
+        urls = self.recon.get("urls", []) if target_urls is None else target_urls
 
-        for url in self.recon.get("urls", []):
+        for url in urls:
             if not self._in_scope(url):
                 continue
             signals = {"in_band": False, "error": False, "oob": False}
@@ -1463,18 +1475,22 @@ class VulnScanner:
     # Command Injection — Output + Time-Based + OOB Detection
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_command_injection(self) -> list[dict]:
+    def scan_command_injection(self, target_urls: list[str] | None = None) -> list[dict]:
         """
         Command injection detection with multi-signal confirmation.
 
         Output-based: Inject OS commands and check for command output in response.
         Time-based:   Inject sleep/ping payloads and measure response delay.
         OOB:          Inject commands that trigger DNS/HTTP callbacks.
+
+        Args:
+            target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
         """
         oob_host = self.config.get("oob_host")
         findings: list[dict] = []
+        urls = self.recon.get("urls", []) if target_urls is None else target_urls
 
-        for url in self.recon.get("urls", []):
+        for url in urls:
             if not self._in_scope(url):
                 continue
             try:
@@ -1618,16 +1634,20 @@ class VulnScanner:
     # XSS — Context Detection + Headless Validation
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_xss(self) -> list[dict]:
+    def scan_xss(self, target_urls: list[str] | None = None) -> list[dict]:
         """
         Context-aware XSS detection with headless browser validation.
         1. Detect reflection context (HTML, attribute, JS, URL)
         2. Inject context-aware payloads
         3. Verify execution with Playwright (alert/DOM mutation)
         4. Report only execution-verified XSS as Confirmed
+
+        Args:
+            target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
         """
         self._prepare_scan()
         payloads = self._load_payloads("xss")
+        urls = self.recon.get("urls", []) if target_urls is None else target_urls
 
         # Auto-inject WAF bypass payloads when WAF is detected
         if self.waf_detected:
@@ -1636,7 +1656,7 @@ class VulnScanner:
             reflected.extend(bypass)
             log(f"  [WAF] WAF detected — {len(bypass)} bypass payloads injected into XSS scan", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
 
-        for url in self.recon.get("urls", []):
+        for url in urls:
             if not self._in_scope(url):
                 continue
             try:
@@ -1661,7 +1681,7 @@ class VulnScanner:
 
         # ── DOM XSS scanning via Playwright sink injection ──────────
         dom_probes = payloads.get("dom_probes", DOM_XSS_PROBES)
-        for url in self.recon.get("urls", []):
+        for url in urls:
             if not self._in_scope(url):
                 continue
             try:
@@ -1936,10 +1956,11 @@ class VulnScanner:
     # LFI
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_lfi(self) -> list[dict]:
+    def scan_lfi(self, target_urls: list[str] | None = None) -> list[dict]:
         findings: list[dict] = []
         lfi_payloads = self._load_payloads("lfi")
-        for url in self._urls_with_params():
+        raw_urls = self._urls_with_params() if target_urls is None else [u for u in target_urls if "?" in u]
+        for url in raw_urls:
             if not self._in_scope(url):
                 continue
             try:
@@ -1977,9 +1998,10 @@ class VulnScanner:
     # Open Redirect
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_open_redirect(self) -> list[dict]:
+    def scan_open_redirect(self, target_urls: list[str] | None = None) -> list[dict]:
         findings: list[dict] = []
-        for url in self.recon.get("urls", []):
+        urls = self.recon.get("urls", []) if target_urls is None else target_urls
+        for url in urls:
             if not self._in_scope(url):
                 continue
             try:
@@ -2019,9 +2041,16 @@ class VulnScanner:
     # CSRF
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_csrf(self) -> list[dict]:
+    def scan_csrf(self, target_urls: list[str] | None = None) -> list[dict]:
         findings: list[dict] = []
-        for form in self.recon.get("forms", []):
+        forms = self.recon.get("forms", [])
+        if target_urls is not None:
+            origins = {urlparse(u).scheme + "://" + urlparse(u).netloc for u in target_urls}
+            forms = [
+                f for f in forms
+                if any(urlparse(f.get("action", f.get("url", ""))).scheme + "://" + urlparse(f.get("action", f.get("url", ""))).netloc == o for o in origins)
+            ]
+        for form in forms:
             try:
                 form_action = form.get("action", form.get("url", ""))
                 if form_action and not self._in_scope(form_action):
@@ -2151,10 +2180,11 @@ class VulnScanner:
     # Sensitive Data
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_sensitive_data(self) -> list[dict]:
+    def scan_sensitive_data(self, target_urls: list[str] | None = None) -> list[dict]:
         from modules.utils import SecretValidator
         findings: list[dict] = []
-        for url in self.recon.get("urls", []):
+        urls = self.recon.get("urls", []) if target_urls is None else target_urls
+        for url in urls:
             if not self._in_scope(url):
                 continue
             try:
@@ -2374,9 +2404,9 @@ class VulnScanner:
     # HTTP Methods
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_http_methods(self) -> list[dict]:
+    def scan_http_methods(self, target_urls: list[str] | None = None) -> list[dict]:
         findings: list[dict] = []
-        target = self.config.get("target", "")
+        target = target_urls[0] if target_urls else self.config.get("target", "")
         if not target or not self._in_scope(target):
             return self._get_findings()
         try:
@@ -2408,9 +2438,16 @@ class VulnScanner:
     # Insecure Forms
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_insecure_forms(self) -> list[dict]:
+    def scan_insecure_forms(self, target_urls: list[str] | None = None) -> list[dict]:
         findings: list[dict] = []
-        for form in self.recon.get("forms", []):
+        forms = self.recon.get("forms", [])
+        if target_urls is not None:
+            origins = {urlparse(u).scheme + "://" + urlparse(u).netloc for u in target_urls}
+            forms = [
+                f for f in forms
+                if any(urlparse(f.get("action", "")).scheme + "://" + urlparse(f.get("action", "")).netloc == o for o in origins)
+            ]
+        for form in forms:
             try:
                 method = form.get("method", "get").lower()
                 action = form.get("action", "")
@@ -2487,12 +2524,16 @@ class VulnScanner:
     # Rate Limiting
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_rate_limiting(self) -> list[dict]:
+    def scan_rate_limiting(self, target_urls: list[str] | None = None) -> list[dict]:
         """Test auth-related endpoints for missing or weak rate limiting.
 
         Builds a candidate list from known auth paths AND forms discovered
         during recon that contain password/secret fields.  Sends 20 rapid
         POST requests with probe credentials, skipping 404/410 endpoints.
+
+        Args:
+            target_urls: Optional list of specific URLs. If provided, filters
+                        candidates to those matching the given target origin.
         """
         findings: list[dict] = []
 
@@ -2515,12 +2556,25 @@ class VulnScanner:
             seen_urls.add(url)
             candidates.append({"url": url, "severity": sev, "form_fields": form_fields or []})
 
+        base = self.base_url
+        if target_urls:
+            # Use the first target URL's origin as base
+            parsed_target = urlparse(target_urls[0])
+            base = f"{parsed_target.scheme}://{parsed_target.netloc}"
+
         for path in hardcoded_paths:
-            full = urljoin(self.base_url, path)
+            full = urljoin(base, path)
             sev = "high" if any(k in path for k in ("login", "auth", "signin", "reset", "password", "token")) else "medium"
             _add_candidate(full, sev)
 
-        for form in self.recon.get("forms", []):
+        forms = self.recon.get("forms", [])
+        if target_urls is not None:
+            target_origins = {urlparse(u).scheme + "://" + urlparse(u).netloc for u in target_urls}
+            forms = [
+                f for f in forms
+                if any(urlparse(f.get("action", "")).scheme + "://" + urlparse(f.get("action", "")).netloc == o for o in target_origins)
+            ]
+        for form in forms:
             method = form.get("method", "GET").upper()
             if method != "POST":
                 continue
@@ -2808,15 +2862,16 @@ class VulnScanner:
     # IDOR (legacy, kept for backward compat in scanner.py)
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_idor(self) -> list[dict]:
+    def scan_idor(self, target_urls: list[str] | None = None) -> list[dict]:
         findings: list[dict] = []
         id_patterns = [
             (re.compile(r"[?&](account|accountId|account_id|user|userId|user_id|org|orgId|org_id|id|guid|uuid|ref)=([0-9a-f\-]{4,36})", re.IGNORECASE), "param"),
             (re.compile(r"/(accounts|users|orgs|organisations|entities)/([0-9a-f\-]{4,36})", re.IGNORECASE), "path"),
         ]
         candidates = []
+        urls = self.recon.get("urls", []) if target_urls is None else target_urls
 
-        for url in self.recon.get("urls", []):
+        for url in urls:
             for pattern, ref_type in id_patterns:
                 for m in pattern.finditer(url):
                     candidates.append({"url": url, "param": m.group(1), "value": m.group(2), "type": ref_type})

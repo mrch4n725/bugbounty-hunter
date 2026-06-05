@@ -1945,3 +1945,259 @@ def get_rich_table(title: str, columns: List[str]) -> Optional["Table"]:
     for col in columns:
         table.add_column(col)
     return table
+
+
+# ── Intelligence-led module selection ──────────────────────────────────
+
+
+def classify_endpoint(
+    url: str,
+    forms: list[dict],
+    recon_data: dict,
+) -> set[str]:
+    """Classify a URL into applicable scan module names based on signals.
+
+    Args:
+        url: The URL to classify.
+        forms: List of form dicts from recon_data (each has ``action``, ``fields``, etc).
+        recon_data: Full recon data dict (used for ``js_endpoints`` lookups).
+
+    Returns:
+        A set of module name strings (keys used in ``_active_module_map``).
+    """
+    modules: set[str] = _CLASSIFY_ALWAYS.copy()
+    parsed = urlparse(url)
+    qs_raw = parsed.query
+    param_keys = [kv.split("=")[0] for kv in qs_raw.split("&") if "=" in kv]
+    path = parsed.path.lower()
+    params_lower = [p.lower() for p in param_keys]
+
+    # ── Signal detection ───────────────────────────────────────────────
+    signals: set[str] = set()
+
+    if qs_raw:
+        signals.add("has_params")
+
+    file_param_names = (
+        "file", "path", "doc", "upload", "attachment", "img",
+        "src", "url", "load", "template", "view", "page", "include",
+    )
+    if any(any(fn in p for fn in file_param_names) for p in params_lower):
+        signals.add("has_file_param")
+
+    url_param_names = (
+        "url", "redirect", "next", "return", "goto", "dest",
+        "target", "link", "href", "continue", "forward", "redir", "location",
+    )
+    if any(any(un in p for un in url_param_names) for p in params_lower):
+        signals.add("has_url_param")
+
+    id_param_names = (
+        "id", "uid", "user", "account", "profile", "order",
+        "item", "object", "record", "uuid", "guid", "ref",
+    )
+    if any(any(in_ in p for in_ in id_param_names) for p in params_lower):
+        signals.add("has_id_param")
+
+    form_is_post = any(
+        form.get("method", "").upper() == "POST"
+        for form in forms
+        if form.get("action", "") in parsed.path or parsed.path in form.get("action", "")
+    )
+    if form_is_post:
+        signals.add("is_form_post")
+
+    js_endpoints = recon_data.get("js_endpoints", []) if isinstance(recon_data, dict) else []
+
+    if (
+        "/api/" in path
+        or "/v1/" in path
+        or "/v2/" in path
+        or "/v3/" in path
+        or "/rest/" in path
+        or "/graphql" in path
+        or "/gql" in path
+        or url in js_endpoints
+    ):
+        signals.add("is_json_api")
+
+    if path.endswith(".xml") or "/soap/" in path or "/wsdl" in path or "/xmlrpc" in path:
+        signals.add("is_xml_endpoint")
+
+    if "/graphql" in path or "/gql" in path:
+        signals.add("is_graphql")
+
+    file_upload_paths = ("upload", "import", "ingest", "attach", "file", "media", "asset")
+    path_segments = path.split("/")
+    if any(fp in path_segments for fp in file_upload_paths):
+        signals.add("is_file_upload")
+
+    admin_paths = (
+        "/admin", "/manage", "/dashboard", "/internal", "/staff",
+        "/superuser", "/console", "/portal", "/backoffice", "/ops",
+    )
+    if any(ap in path for ap in admin_paths):
+        signals.add("is_admin_path")
+
+    cmd_param_names = (
+        "cmd", "exec", "command", "shell", "run", "ping",
+        "eval", "query", "process", "system",
+    )
+    if any(any(cn in p for cn in cmd_param_names) for p in params_lower):
+        signals.add("has_cmd_param")
+
+    # ── Signal → module mapping ───────────────────────────────────────
+    has_params = "has_params" in signals
+    has_file_param = "has_file_param" in signals
+    has_url_param = "has_url_param" in signals
+    has_id_param = "has_id_param" in signals
+    is_form_post = "is_form_post" in signals
+    is_json_api = "is_json_api" in signals
+    is_xml = "is_xml_endpoint" in signals
+    is_graphql = "is_graphql" in signals
+    is_file_upload = "is_file_upload" in signals
+    is_admin = "is_admin_path" in signals
+    has_cmd = "has_cmd_param" in signals
+
+    if has_params:
+        modules.update({"xss", "sqli", "ssti"})
+    if has_file_param:
+        modules.update({"lfi", "xxe", "ssrf"})
+    if has_url_param:
+        modules.update({"ssrf", "open_redirect"})
+    if has_id_param:
+        modules.update({"idor", "sqli"})
+    if is_form_post:
+        modules.update({"csrf", "xss", "sqli", "insecure_forms"})
+    if is_json_api:
+        modules.update({"sqli", "idor", "rate_limiting", "api"})
+    if is_xml:
+        modules.add("xxe")
+    if is_graphql:
+        modules.add("graphql")
+    if is_file_upload:
+        modules.update({"xxe", "lfi", "cmd_injection"})
+    if is_admin:
+        modules.update({"idor", "csrf", "http_methods"})
+    if has_cmd:
+        modules.update({"cmd_injection", "ssrf"})
+
+    return modules
+
+
+def compute_endpoint_score(url: str, forms: list[dict], recon_data: dict) -> int:
+    """Score a URL by signals present; higher = more attack surface.
+
+    Args:
+        url: The URL to score.
+        forms: List of form dicts from recon_data.
+        recon_data: Full recon data dict.
+
+    Returns:
+        An integer score (higher is more interesting).
+    """
+    signals = _get_signal_set(url, forms, recon_data)
+    weights = {
+        "has_params": 30,
+        "is_form_post": 20,
+        "has_id_param": 25,
+        "has_url_param": 20,
+        "has_file_param": 15,
+        "is_admin_path": 35,
+        "is_json_api": 25,
+        "is_file_upload": 10,
+        "has_cmd_param": 10,
+        "is_graphql": 5,
+    }
+    return sum(weights[s] for s in signals if s in weights)
+
+
+def _get_signal_set(
+    url: str,
+    forms: list[dict],
+    recon_data: dict,
+) -> set[str]:
+    """Extract the raw signal set from a URL (shared by classify + scoring)."""
+    signals: set[str] = set()
+    parsed = urlparse(url)
+    qs_raw = parsed.query
+    param_keys = [kv.split("=")[0] for kv in qs_raw.split("&") if "=" in kv]
+    path = parsed.path.lower()
+    params_lower = [p.lower() for p in param_keys]
+
+    if qs_raw:
+        signals.add("has_params")
+
+    file_param_names = (
+        "file", "path", "doc", "upload", "attachment", "img",
+        "src", "url", "load", "template", "view", "page", "include",
+    )
+    if any(any(fn in p for fn in file_param_names) for p in params_lower):
+        signals.add("has_file_param")
+
+    url_param_names = (
+        "url", "redirect", "next", "return", "goto", "dest",
+        "target", "link", "href", "continue", "forward", "redir", "location",
+    )
+    if any(any(un in p for un in url_param_names) for p in params_lower):
+        signals.add("has_url_param")
+
+    id_param_names = (
+        "id", "uid", "user", "account", "profile", "order",
+        "item", "object", "record", "uuid", "guid", "ref",
+    )
+    if any(any(in_ in p for in_ in id_param_names) for p in params_lower):
+        signals.add("has_id_param")
+
+    form_is_post = any(
+        form.get("method", "").upper() == "POST"
+        for form in forms
+        if form.get("action", "") in parsed.path or parsed.path in form.get("action", "")
+    )
+    if form_is_post:
+        signals.add("is_form_post")
+
+    if (
+        "/api/" in path
+        or "/v1/" in path
+        or "/v2/" in path
+        or "/v3/" in path
+        or "/rest/" in path
+        or "/graphql" in path
+        or "/gql" in path
+        or url in (recon_data.get("js_endpoints", []) if isinstance(recon_data, dict) else [])
+    ):
+        signals.add("is_json_api")
+
+    if path.endswith(".xml") or "/soap/" in path or "/wsdl" in path or "/xmlrpc" in path:
+        signals.add("is_xml_endpoint")
+
+    if "/graphql" in path or "/gql" in path:
+        signals.add("is_graphql")
+
+    file_upload_paths = ("upload", "import", "ingest", "attach", "file", "media", "asset")
+    path_segments = path.split("/")
+    if any(fp in path_segments for fp in file_upload_paths):
+        signals.add("is_file_upload")
+
+    admin_paths = (
+        "/admin", "/manage", "/dashboard", "/internal", "/staff",
+        "/superuser", "/console", "/portal", "/backoffice", "/ops",
+    )
+    if any(ap in path for ap in admin_paths):
+        signals.add("is_admin_path")
+
+    cmd_param_names = (
+        "cmd", "exec", "command", "shell", "run", "ping",
+        "eval", "query", "process", "system",
+    )
+    if any(any(cn in p for cn in cmd_param_names) for p in params_lower):
+        signals.add("has_cmd_param")
+
+    return signals
+
+
+# Modules that run on every URL regardless of signals
+_CLASSIFY_ALWAYS: set[str] = {
+    "headers", "sensitive", "exposed_files", "clickjacking",
+}
