@@ -774,6 +774,34 @@ class SecretValidator:
         except Exception as e:
             return {"valid": None, "type": "slack", "details": f"Error: {e}"}
 
+    @staticmethod
+    def validate_twilio_sid(sid: str) -> Dict[str, Any]:
+        """Validate Twilio Account SID format and entropy (offline)."""
+        if not sid.startswith("AC") or len(sid) != 34:
+            return {"valid": False, "type": "twilio_sid", "details": "Invalid format"}
+        body = sid[2:]
+        # Reject base64 padding characters
+        if "=" in body:
+            return {"valid": False, "type": "twilio_sid", "details": "Base64 padding detected — not a real SID"}
+        # Entropy check: must have at least 20 unique characters
+        unique_chars = len(set(body))
+        if unique_chars < 20:
+            return {"valid": False, "type": "twilio_sid", "details": f"Too few unique chars ({unique_chars}/20) — likely garbage"}
+        return {"valid": True, "type": "twilio_sid", "details": "Format and entropy pass"}
+
+    @staticmethod
+    def validate_twilio_token(token: str) -> Dict[str, Any]:
+        """Validate Twilio Auth Token format and entropy (offline)."""
+        if not token.startswith("SK") or len(token) != 34:
+            return {"valid": False, "type": "twilio_token", "details": "Invalid format"}
+        body = token[2:]
+        if "=" in body:
+            return {"valid": False, "type": "twilio_token", "details": "Base64 padding detected — not a real token"}
+        unique_chars = len(set(body))
+        if unique_chars < 20:
+            return {"valid": False, "type": "twilio_token", "details": f"Too few unique chars ({unique_chars}/20) — likely garbage"}
+        return {"valid": True, "type": "twilio_token", "details": "Format and entropy pass"}
+
     @classmethod
     def validate(cls, secret_type: str, value: str) -> Dict[str, Any]:
         """Route validation based on secret type label."""
@@ -782,6 +810,8 @@ class SecretValidator:
             "aws_secret_key": cls.validate_aws_key,
             "github_token": cls.validate_github_token,
             "slack_token": cls.validate_slack_token,
+            "twilio_sid": cls.validate_twilio_sid,
+            "twilio_token": cls.validate_twilio_token,
         }
         handler = mapping.get(secret_type)
         if not handler:

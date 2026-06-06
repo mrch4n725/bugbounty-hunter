@@ -1043,14 +1043,19 @@ class VulnScanner:
         signals = {"error": False, "boolean": False, "time": False, "union": False, "oob": False}
         evidence_parts = []
 
-        # ── Error-based ───────────────────────────────────────────────
+        # ── Error-based (with baseline comparison) ────────────────────
+        baseline_resp = safe_get(self.session, url, self.timeout)
+        baseline_sql_errors: set[str] = set()
+        if baseline_resp:
+            lower_baseline = baseline_resp.text.lower()
+            baseline_sql_errors = {err for err in SQLI_ERRORS if err in lower_baseline}
         for payload in payloads.get("error_based", []):
             test_url = self._inject_param(url, param, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if not resp:
                 continue
             lower_body = resp.text.lower()
-            matched = [err for err in SQLI_ERRORS if err in lower_body]
+            matched = [err for err in SQLI_ERRORS if err in lower_body and err not in baseline_sql_errors]
             if matched:
                 signals["error"] = True
                 evidence_parts.append(f"error:{matched[0]}")
@@ -1270,12 +1275,24 @@ class VulnScanner:
     # SSRF — OOB-Only Confirmation
     # ═════════════════════════════════════════════════════════════════════
 
+    def _calculate_ssrf_confidence(self, matched: list[str], baseline_diff: bool,
+                                    json_detected: bool, credentials_found: bool) -> int:
+        """Evidence-based confidence scoring for SSRF findings."""
+        score = 0
+        if matched:
+            score += 10
+        if baseline_diff:
+            score += 20
+        if json_detected:
+            score += 30
+        if credentials_found:
+            score += 40
+        return min(score, 100)
+
     def scan_ssrf(self, target_urls: list[str] | None = None) -> list[dict]:
         """
         SSRF detection with OOB-only confirmation.
-        Parameter-name heuristics (url=, uri=, path=, dest=) alone never
-        produce findings. Only OOB-confirmed or cloud-metadata-proven
-        interactions become findings.
+        Groups all vulnerable parameters per endpoint into a single finding.
 
         Args:
             target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
@@ -1293,12 +1310,16 @@ class VulnScanner:
                 params = list(dict.fromkeys(list(original_params.keys()) + SSRF_PARAM_NAMES))
 
                 baseline_resp = safe_get(self.session, url, self.timeout)
-                baseline = (
-                    hashlib.md5(baseline_resp.text.encode()).hexdigest() if baseline_resp else None,
-                    len(baseline_resp.text) if baseline_resp else 0,
-                )
+                baseline_hash = hashlib.md5(baseline_resp.text.encode()).hexdigest() if baseline_resp else None
+                baseline_len = len(baseline_resp.text) if baseline_resp else 0
 
                 ssrf_payloads = self._load_payloads("ssrf")
+                vulnerable_params: list[str] = []
+                all_matched_sigs: set[str] = set()
+                all_test_urls: list[str] = []
+                json_detected = False
+                credentials_found = False
+
                 for param in params:
                     for payload in ssrf_payloads:
                         test_url = self._build_ssrf_url(url, parsed, original_params, param, payload)
@@ -1310,17 +1331,15 @@ class VulnScanner:
                         body = resp.text
                         matched = [sig for sig in SSRF_SIGNATURES if sig in body]
                         if matched and len(matched) >= 2:
-                            f = finding(
-                                vuln_type="Confirmed SSRF",
-                                url=test_url,
-                                severity="critical",
-                                details=f"Parameter '{param}' returned internal cloud metadata ({len(matched)} signatures)",
-                                evidence=f"Signatures: {', '.join(matched[:3])}",
-                                verification_stage=VerificationStage.VALIDATED.value,
-                                validation_steps=[f"Cloud metadata signature matched: {s}" for s in matched],
-                            )
-                            if f:
-                                self._add(f)
+                            vulnerable_params.append(param)
+                            all_matched_sigs.update(matched)
+                            all_test_urls.append(test_url)
+                            # Detect actual JSON metadata structure
+                            if body.strip().startswith("{"):
+                                json_detected = True
+                            # Detect credentials in metadata
+                            if "secret" in body.lower() or "token" in body.lower() or "password" in body.lower():
+                                credentials_found = True
 
                         # OOB callback
                         if oob_host:
@@ -1328,6 +1347,25 @@ class VulnScanner:
                                                            f"http://{self.oob.callback_token}.{oob_host}/ssrf")
                             safe_get(self.session, oob_url, self.timeout, raise_for_status=False)
                             self.oob.register_interaction("ssrf", oob_url, test_url)
+
+                if vulnerable_params:
+                    resp_hash = hashlib.md5(resp.text.encode()).hexdigest()
+                    baseline_diff = baseline_hash is not None and resp_hash != baseline_hash
+                    confidence_score = self._calculate_ssrf_confidence(
+                        list(all_matched_sigs), baseline_diff, json_detected, credentials_found,
+                    )
+                    f = finding(
+                        vuln_type="Confirmed SSRF",
+                        url=url,
+                        severity="critical",
+                        details=f"Vulnerable parameters ({len(vulnerable_params)}): {', '.join(vulnerable_params[:10])}",
+                        evidence=f"Signatures: {', '.join(list(all_matched_sigs)[:5])}",
+                        verification_stage=VerificationStage.VALIDATED.value,
+                        validation_steps=[f"Cloud metadata signature matched: {s}" for s in all_matched_sigs],
+                        confidence_score=confidence_score,
+                    )
+                    if f:
+                        self._add(f)
 
             except Exception as e:
                 log(f"  [SSRF] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)

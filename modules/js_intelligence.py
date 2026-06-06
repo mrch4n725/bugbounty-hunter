@@ -232,6 +232,8 @@ class JSIntelligence:
             "Slack Bot Token": ("slack_token", secret_entry["value"]),
             "Slack App Token": ("slack_token", secret_entry["value"]),
             "Slack User Token": ("slack_token", secret_entry["value"]),
+            "Twilio Account SID": ("twilio_sid", secret_entry["value"]),
+            "Twilio Auth Token": ("twilio_token", secret_entry["value"]),
         }
         entry_type = secret_entry["type"]
         if entry_type not in type_map:
