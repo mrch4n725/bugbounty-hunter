@@ -16,7 +16,8 @@ import yaml
 
 from modules.scanner import VulnScanner
 from modules.utils import (
-    safe_get, safe_post, finding, log, Colors, _build_curl,
+    make_session, safe_get, safe_post, finding, log, Colors, _build_curl,
+    build_role_sessions, get_role_session,
 )
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -83,6 +84,8 @@ class ApiScanner(VulnScanner):
 
     def __init__(self, config: dict, recon_data: dict):
         super().__init__(config, recon_data)
+        self.role_sessions = build_role_sessions(config, base_session=self.session)
+        self.current_role = config.get("role", None) or "default"
 
     # ── Orchestrator ──────────────────────────────────────────────────────
 
@@ -102,6 +105,8 @@ class ApiScanner(VulnScanner):
 
         findings.extend(self.scan_graphql_introspection(gql_endpoints))
         findings.extend(self.scan_graphql_injection(gql_endpoints))
+        findings.extend(self.scan_graphql_auth_bypass(gql_endpoints))
+        findings.extend(self.scan_graphql_query_depth(gql_endpoints))
         findings.extend(self.scan_bola(endpoints))
         findings.extend(self.scan_mass_assignment(endpoints))
 
@@ -581,6 +586,123 @@ class ApiScanner(VulnScanner):
                         break
                 except Exception as e:
                     log(f"  [MASS] Error {method.upper()} {url}: {e}", Colors.WHITE,
+                        verbose_only=True, verbose=self.verbose)
+
+        return self._deduplicate(findings)
+
+    # ── GraphQL Auth Bypass (Phase 5) ─────────────────────────────────────
+
+    def scan_graphql_auth_bypass(self, gql_endpoints: list[str]) -> list[dict]:
+        """Test GraphQL mutations with alternative role sessions to detect
+        authorization bypass. Sends the same operation with different roles
+        and compares responses."""
+        findings: list[dict] = []
+
+        if len(gql_endpoints) < 1 or len(self.role_sessions) < 2:
+            return findings
+
+        mutations = self._discover_mutations(gql_endpoints)
+        if not mutations:
+            return findings
+
+        roles = list(self.role_sessions.keys())
+        default_role = self.current_role if self.current_role in self.role_sessions else roles[0]
+        other_roles = [r for r in roles if r != default_role and r != "alt"]
+        if not other_roles:
+            return findings
+
+        alt_role = other_roles[0]
+
+        for mut in mutations[:5]:
+            url = mut["url"]
+            mut_name = mut["name"]
+            args = mut.get("args", [])
+            if not args:
+                continue
+
+            variables: dict[str, str] = {}
+            for arg in args[:2]:
+                variables[arg["name"]] = "test"
+            if not variables:
+                variables["input"] = "test"
+
+            gql_query = f"mutation {{ {mut_name}({', '.join(f'{k}: ${k}' for k in variables)}) {{ __typename }} }}"
+            body = {"query": gql_query, "variables": variables}
+
+            default_sess = self.role_sessions[default_role]
+            alt_sess = self.role_sessions[alt_role]
+
+            try:
+                resp_a = default_sess.post(url, json=body, timeout=self.timeout)
+                resp_b = alt_sess.post(url, json=body, timeout=self.timeout)
+
+                if resp_a.status_code != 200 and resp_b.status_code == 200:
+                    self._append_finding(findings, finding(
+                        "GraphQL Auth Bypass",
+                        url, "critical",
+                        f"Mutation '{mut_name}' rejected for '{default_role}' "
+                        f"(HTTP {resp_a.status_code}) but accepted for '{alt_role}' "
+                        f"(HTTP {resp_b.status_code}) — authorization bypass.",
+                        f"Role '{default_role}': HTTP {resp_a.status_code} | "
+                        f"Role '{alt_role}': HTTP {resp_b.status_code}",
+                        verification_stage="validated",
+                        request=_build_curl("POST", url, dict(default_sess.headers)),
+                        response_excerpt=resp_b.text[:500],
+                        steps_to_reproduce=[
+                            f"Authenticate as '{alt_role}'",
+                            f"Send mutation '{mut_name}' to {url}",
+                            "Observe HTTP 200 vs the expected rejection",
+                        ],
+                    ))
+                    log(f"  [GQL Auth] {mut_name} — {alt_role} bypassed auth",
+                        Colors.RED, verbose_only=True, verbose=self.verbose)
+            except Exception as e:
+                log(f"  [GQL Auth] Error: {e}", Colors.WHITE,
+                    verbose_only=True, verbose=self.verbose)
+
+        return self._deduplicate(findings)
+
+    # ── GraphQL Query Depth Attack (Phase 5) ──────────────────────────────
+
+    def scan_graphql_query_depth(self, gql_endpoints: list[str]) -> list[dict]:
+        """Test for deep/aliased/recursive queries that could cause DoS."""
+        findings: list[dict] = []
+
+        if not gql_endpoints:
+            return findings
+
+        deep_query = "{ __typename " + " ".join(f"a{i}: __typename" for i in range(50)) + " }"
+        recursive_query = "query q { __typename ... { __typename ... { __typename ... { __typename } } } }"
+
+        for url in gql_endpoints:
+            for label, query in [("deep alias", deep_query), ("recursive", recursive_query)]:
+                try:
+                    resp = self.session.post(url, json={"query": query}, timeout=self.timeout)
+                    if resp.status_code == 200:
+                        try:
+                            data = resp.json()
+                            if data and data.get("data"):
+                                self._append_finding(findings, finding(
+                                    "GraphQL Query Depth Attack",
+                                    url, "medium",
+                                    f"Server accepted a {label} query with high nesting — "
+                                    f"potential for DoS via deep/aliased queries.",
+                                    f"Query: {label} | Response: {resp.text[:200]}",
+                                    verification_stage="validated",
+                                    request=_build_curl("POST", url, dict(self.session.headers),
+                                                        cookies=dict(self.session.cookies)),
+                                    response_excerpt=resp.text[:500],
+                                    steps_to_reproduce=[
+                                        f"Send POST request to {url} with a deeply aliased/recursive query",
+                                        "Observe that the server processes and returns data without rejection",
+                                    ],
+                                ))
+                                log(f"  [GQL Depth] {url} — {label} accepted",
+                                    Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                except Exception as e:
+                    log(f"  [GQL Depth] Error: {e}", Colors.WHITE,
                         verbose_only=True, verbose=self.verbose)
 
         return self._deduplicate(findings)

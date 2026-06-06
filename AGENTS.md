@@ -109,9 +109,17 @@ HTML reports use `html.escape()` on every user-provided field at render time. Co
 | `main.py` | CLI parsing, orchestration, module_map, TARGET_LEVEL, autosave, `--dry-run`, `--resume` | `parse_args()`, `run()`, `main()` |
 | `modules/scanner.py` | All scan methods, `VulnScanner` class, chain analysis, `_add()` | `VulnScanner` (23 scan methods), `chain_analysis()` |
 | `modules/utils.py` | Shared utilities, finding engine, dedup, OOB, BrowserValidator, curl builder, classify, safe HTTP | `finding()`, `_build_curl()`, `BrowserValidator`, `OOBDetectionFramework`, `RateLimiter`, `DeduplicationEngine`, `SecretValidator`, `safe_get()`, `safe_post()` |
-| `modules/reporter.py` | Report generation in all formats | `Reporter` class, `assess_finding_impact()` |
-| `modules/api_scanner.py` | API-specific vulnerability scanning | `ApiScanner(VulnScanner)` |
-| `modules/idor.py` | Parameter-based IDOR detection | `IdorScanner(VulnScanner)` |
+| `modules/reporter.py` | Legacy wrapper — delegates to `reporting/` package | `Reporter` class |
+| `reporting/__init__.py` | Reporter package exports | Package init |
+| `reporting/base.py` | Shared reporter utilities, impact analysis, root-cause grouping | `ReporterBase`, `assess_finding_impact()`, `group_by_root_cause()` |
+| `reporting/html.py` | HTML report generation | `HTMLReporter(ReporterBase)` |
+| `reporting/json_report.py` | JSON report generation | `JSONReporter(ReporterBase)` |
+| `reporting/txt.py` | Plain-text report generation | `TXTReporter(ReporterBase)` |
+| `reporting/markdown.py` | Per-finding Markdown files | `MarkdownReporter(ReporterBase)` |
+| `reporting/hackerone.py` | HackerOne submission format | `HackerOneReporter(ReporterBase)` |
+| `reporting/bugcrowd.py` | Bugcrowd submission format | `BugcrowdReporter(ReporterBase)` |
+| `modules/api_scanner.py` | API-specific vulnerability scanning | `ApiScanner(VulnScanner)` with role-based sessions, GraphQL auth bypass, query depth |
+| `modules/idor.py` | Parameter-based IDOR detection | `IdorScanner(VulnScanner)` with ownership validation (`verify_ownership()`), role sessions |
 | `modules/recon.py` | Crawling, subdomain discovery, JS analysis | Recon class |
 
 ---
@@ -189,6 +197,7 @@ log("message", Colors.RED, verbose_only=True, verbose=self.verbose)
 - Tests exercise all imports, enums, finding dedup, curl building, confidence mapping, reporter rendering, and module structure
 - Run with: `python3 tests/run.py`
 - `--dry-run` against real targets for integration: `python3 main.py --target https://example.com --dry-run --passive`
+- Multi-role auth: `python3 main.py --target https://example.com --role user_a --auth-header user_b:'Authorization:Bearer tok_b'`
 
 ---
 
@@ -201,6 +210,7 @@ log("message", Colors.RED, verbose_only=True, verbose=self.verbose)
 | POST form XSS | Browser validation passes `r.text` via `set_content()`, not `goto()` |
 | DOM XSS except indentation | The `try/except` block for `scan_dom_xss` uses a nested `try` with `except` at same indent as the `try` |
 | Rate limiting probe | Threads copy session state at definition time, use stateless `requests.post()` — never share `self.session` across threads |
+| Role sessions | `build_role_sessions()` in utils.py creates a `{role_name: Session}` dict from `--auth-header` args. `IdorScanner` and `ApiScanner` auto-initialize `self.role_sessions`. Ownership validation needs >=2 roles. |
 | Scan state JSON | Uses `.scan_state.json` in CWD for `--resume` |
 | `_build_curl_command` fallback | Calls `_build_curl(method, url, {})` when no request field is on finding |
 | TARGET_LEVEL not on VulnScanner | `module_map` and `TARGET_LEVEL` are local variables in `main.py`'s `run()`, not class attributes |

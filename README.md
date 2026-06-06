@@ -197,6 +197,12 @@ python3 main.py --target https://example.com \
   --cookies "session=USER_A_TOKEN" \
   --cookies-alt "session=USER_B_TOKEN"
 
+# Multi-role authorization testing (Phase 5)
+python3 main.py --target https://example.com \
+  --role user_a \
+  --auth-header user_b:'Authorization:Bearer tok_b' \
+  --auth-header admin:'Cookie:session=admin'
+
 # Full authenticated scan
 python3 main.py --target https://example.com \
   --cookies "session=valid_token" \
@@ -310,6 +316,8 @@ module_params:
 | `--no-mask-curl` | off | Show sensitive headers (Authorization, Cookie, etc.) in curl commands |
 | `--dry-run` | off | Recon + attack surface summary only; skip all active fuzzing |
 | `--passive` | off | No active fuzzing (headers, recon, and passive checks only) |
+| `--role` | — | Current user role name for authorization testing (e.g. `user_a`, `admin`) |
+| `--auth-header` | — | Auth header for a role in format `role_name:Header:Value` (repeatable). E.g. `--auth-header user_b:'Authorization:Bearer tok_b'` |
 | `--verbose`, `-v` | off | Per-request and per-finding diagnostic output |
 
 ---
@@ -428,6 +436,8 @@ Only validated secrets appear in findings. Invalid or unverifiable secrets are f
 | **HackerOne** (`hackerone`) | Ready-to-submit format with per-finding sections, CVSS vector, evidence, impact, and reproduction steps |
 | **Bugcrowd** (`bugcrowd`) | Summary table plus per-finding detail with verification stage and confidence |
 
+Root-cause grouping can be enabled via config (`--module-param reporter.group_by_root_cause=true`) to group findings by their root-cause fingerprint. Enriched findings include `grouped_urls`, `group_severity`, and `group_verification_stage` fields used by HackerOne and Bugcrowd reporters.
+
 Additional report features:
 
 - **One-click curl copy** — each finding card has a copy button for the curl reproduction command
@@ -505,15 +515,40 @@ bugbounty-hunter/
 │   ├── __init__.py
 │   ├── utils.py                     # finding(), _build_curl(), RateLimiter, OOBDetectionFramework,
 │   │                                # BrowserValidator, SecretValidator, classify_endpoint(),
-│   │                                # safe_get/safe_post, DeduplicationEngine
+│   │                                # safe_get/safe_post, DeduplicationEngine, build_role_sessions()
 │   ├── recon.py                     # Recon — crawler, subdomain discovery, JS intelligence
 │   ├── scanner.py                   # VulnScanner — 25+ scan methods, chain analysis, _add()
-│   ├── api_scanner.py               # ApiScanner — OpenAPI/Swagger, REST fuzzing, BOLA, mass assignment
-│   ├── idor.py                      # IdorScanner — parameter mutation, horizontal escalation
+│   ├── api_scanner.py               # ApiScanner — OpenAPI/Swagger, REST fuzzing, BOLA, mass assignment,
+│   │                                # GraphQL auth bypass, query depth attacks
+│   ├── idor.py                      # IdorScanner — parameter mutation, horizontal escalation,
+│   │                                # ownership validation (role-based)
 │   ├── js_intelligence.py           # JSIntelligence — AST + regex endpoint/secret extraction
-│   └── reporter.py                  # Reporter — HTML, JSON, TXT, Markdown, HackerOne, Bugcrowd
+│   └── reporter.py                  # Legacy wrapper — delegates to reporting/ package
+├── models/
+│   ├── __init__.py
+│   ├── finding.py                   # Canonical Finding dataclass (UUIDv7, SHA-256 fingerprints, enums)
+│   ├── evidence.py                  # EvidenceBase + 10 polymorphic subclasses
+│   └── config.py                    # ScanConfig typed dataclass
+├── engines/
+│   ├── __init__.py
+│   ├── validation_engine.py         # Centralized OOB, browser, timing, secret, auth, GraphQL validation
+│   └── evidence_engine.py           # Evidence storage, linking, snapshot/restore
+├── scanners/
+│   ├── __init__.py
+│   ├── base.py                      # ScannerBase — shared lifecycle (detect/validate/collect/reproduce/confidence)
+│   ├── xss.py                       # XSSScanner — context-aware XSS with browser validation (Level 4)
+│   └── headers.py                   # HeadersScanner — security header analysis (Level 2)
+├── reporting/
+│   ├── __init__.py
+│   ├── base.py                      # ReporterBase — shared utilities, impact analysis, root-cause grouping
+│   ├── html.py                      # HTMLReporter — dark-themed dashboard with Chart.js
+│   ├── json_report.py               # JSONReporter — structured output
+│   ├── txt.py                       # TXTReporter — plain-text summary
+│   ├── markdown.py                  # MarkdownReporter — per-finding .md files
+│   ├── hackerone.py                 # HackerOneReporter — submission-ready format
+│   └── bugcrowd.py                  # BugcrowdReporter — summary + per-finding detail
 ├── tests/
-│   └── run.py                       # 107 standalone tests (zero external dependencies)
+│   └── run.py                       # 128 standalone tests (zero external dependencies)
 └── reports/                         # Output directory (gitignored)
 ```
 
@@ -521,37 +556,61 @@ bugbounty-hunter/
 
 ## Extending
 
-### Adding a New Scan Module
+### Adding a New Scan Module (Phase 3 style)
 
-1. **Add a `scan_*` method** to `VulnScanner` in `modules/scanner.py`. Return a `list[dict]` of findings.
+New scanners should follow the **5-phase lifecycle** using `ScannerBase` from `scanners/base.py`:
 
-   ```python
-   def scan_mycheck(self, target_urls: list[str] | None = None) -> list[dict]:
-       findings: list[dict] = []
-       urls = self.recon.get("urls", []) if target_urls is None else target_urls
-       for url in urls:
-           if not self._in_scope(url):
-               continue
-           # ... detection logic ...
-           f = finding("My Vuln Type", url, "high", "Description", "Evidence",
-                       verification_stage="detected",
-                       parameter=param,
-                       request=_build_curl("GET", url, dict(self.session.headers)))
-           if f and self._add(f):
-               findings.append(f)
-       return findings
-   ```
+```python
+from scanners.base import ScannerBase, DetectionResult
+
+class MyCheckScanner(ScannerBase):
+    SCANNER_NAME = "mycheck"
+    SCANNER_MATURITY = 3   # 1=detect, 2=validate, 3=exploit, 4=verify
+
+    def detect(self, url: str, parameter: str | None = None) -> DetectionResult | None:
+        # Phase 1: Find the vulnerability signal
+        ...
+        return DetectionResult(url=url, parameter=param, payload=..., context=...)
+
+    def validate(self, detection: DetectionResult) -> dict | None:
+        # Phase 2: Confirm the finding (OOB, browser, timing, etc.)
+        ...
+        return {"confirmed": True, "method": "oob"}
+
+    def collect_evidence(self, detection: DetectionResult,
+                         validation_result: dict | None = None) -> list:
+        # Phase 3: Collect evidenced requests, responses, screenshots
+        ...
+
+    def generate_reproduction(self, detection: DetectionResult) -> list[str]:
+        # Phase 4: Produce step-by-step reproduction instructions
+        ...
+
+    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+        self._prepare_scan()
+        urls = ...   # resolve URLs
+        for url in urls:
+            detection = self.detect(url)
+            if not detection:
+                continue
+            validation = self.validate(detection)
+            evidence = self.collect_evidence(detection, validation)
+            f = finding("My Vuln Type", url, "high", ...)
+            if f:
+                self._add_finding(f)
+        return self._get_findings()
+```
 
 2. **Register in `main.py`:**
    - Add the module name to `parse_args()` `choices` for `--modules` and `--disable-modules`
-   - Add to `module_map` in `run()` with `(VulnScanner, "scan_mycheck")`
+   - Add to `module_map` in `run()`
    - If it runs once per target (not per URL), add to `TARGET_LEVEL`
 
-3. **Configure per-URL dispatch** (optional) — Add to `classify_endpoint()` in `utils.py` so it only runs on applicable URLs.
+3. **Configure per-URL dispatch** — Add to `classify_endpoint()` in `utils.py` so it only runs on applicable URLs.
 
-4. **Add impact narrative** — Add an entry to `IMPACT_MATRIX` in `modules/reporter.py`.
+4. **Add impact narrative** — Add an entry to `IMPACT_MATRIX` in `reporting/base.py`.
 
-### Standalone Scanner (Subclass)
+### Legacy Method (VulnScanner subclass)
 
 For complex modules, subclass `VulnScanner` in a new file under `modules/`:
 
@@ -562,9 +621,9 @@ from modules.utils import finding, _build_curl
 class MyScanner(VulnScanner):
     def run_all(self) -> list[dict]:
         findings: list[dict] = []
-        # ... scanning logic ...
+        # ... scanning logic with self.session, self._in_scope(), etc. ...
         self._append_finding(findings, f)
-        return findings
+        return self._deduplicate(findings)
 ```
 
 Import and instantiate in `module_map` in `main.py`.

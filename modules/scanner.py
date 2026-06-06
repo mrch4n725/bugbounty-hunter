@@ -27,6 +27,7 @@ from modules.utils import (
     prioritize_findings, compute_priority_score,
     TechnologyFingerprinter, reset_seen_findings, _build_curl,
 )
+from engines import ValidationEngine, EvidenceEngine
 
 try:
     from playwright.sync_api import sync_playwright
@@ -465,6 +466,15 @@ class VulnScanner:
         self.dedup     = DeduplicationEngine()
         self.oob       = OOBDetectionFramework(config)
         self.browser   = BrowserValidator(config)
+
+        # Phase 2: centralized validation and evidence engines
+        self.validation = ValidationEngine(config)
+        self.evidence   = EvidenceEngine()
+
+        # Phase 3: new scanner delegates (scanners/ package)
+        self._use_new_scanners = config.get("use_new_scanners", False)
+        self._xss_scanner   = None
+        self._headers_scanner = None
 
         self.waf_detected = False
         self.baselines    = BaselineFingerprinter(self.session, self.timeout)
@@ -1868,6 +1878,18 @@ class VulnScanner:
             target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
         """
         self._prepare_scan()
+
+        # Phase 3: delegate to XSSScanner when enabled
+        if self._use_new_scanners:
+            from scanners import XSSScanner
+            if self._xss_scanner is None:
+                self._xss_scanner = XSSScanner(self.config, self.recon)
+                self._xss_scanner.session = self.session
+            results = self._xss_scanner.scan(target_urls)
+            for f in results:
+                self._add(f)
+            return self._get_findings()
+
         payloads = self._load_payloads("xss")
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
 
@@ -2592,6 +2614,17 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_headers(self) -> list[dict]:
+        # Phase 3: delegate to HeadersScanner when enabled
+        if self._use_new_scanners:
+            from scanners import HeadersScanner
+            if self._headers_scanner is None:
+                self._headers_scanner = HeadersScanner(self.config, self.recon)
+                self._headers_scanner.session = self.session
+            results = self._headers_scanner.scan()
+            for f in results:
+                self._add(f)
+            return self._get_findings()
+
         findings: list[dict] = []
         try:
             target = self.config.get("target", "")

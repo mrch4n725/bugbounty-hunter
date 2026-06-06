@@ -15,6 +15,7 @@ from urllib.parse import urlparse, parse_qs
 from modules.scanner import VulnScanner
 from modules.utils import (
     make_session, safe_get, safe_post, finding, log, Colors, _build_curl,
+    build_role_sessions, get_role_session,
 )
 
 # ── ID parameter patterns ──────────────────────────────────────────────────────
@@ -71,6 +72,10 @@ class IdorScanner(VulnScanner):
         if self.cookies_alt:
             self.session_alt = make_session(config)
             self.session_alt.cookies.update(self.cookies_alt)
+
+        # Phase 5: role-based sessions for ownership validation
+        self.role_sessions = build_role_sessions(config, base_session=self.session)
+        self.current_role = config.get("role", None) or "default"
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -450,6 +455,73 @@ class IdorScanner(VulnScanner):
 
         self._replay_and_check(findings, c, value, forged_jwt)
 
+    # ── Ownership validation (Phase 5) ────────────────────────────────────
+
+    def verify_ownership(self, findings: list[dict], candidates: list[dict]) -> None:
+        """Explicit User A ↔ User B ownership comparison.
+        
+        For each candidate, sends the request as two different roles and
+        compares responses. A 200 with different content indicates a
+        verified IDOR (not merely detected).
+        """
+        if len(self.role_sessions) < 2:
+            return
+
+        roles = list(self.role_sessions.keys())
+        default_role = self.current_role if self.current_role in self.role_sessions else roles[0]
+        other_roles = [r for r in roles if r != default_role and r != "alt"]
+        if not other_roles:
+            return
+
+        alt_role = other_roles[0]
+
+        for c in candidates[:20]:
+            url = c["url"]
+            param = c["param"]
+
+            if c["source"] == "form":
+                continue
+
+            test_url = url
+            if param != "__path__":
+                test_url = self._inject_param(url, param, c["value"])
+
+            resp_a = safe_get(
+                self.role_sessions[default_role], test_url,
+                self.timeout, raise_for_status=False,
+            )
+            if not resp_a or resp_a.status_code != 200:
+                continue
+
+            resp_b = safe_get(
+                self.role_sessions[alt_role], test_url,
+                self.timeout, raise_for_status=False,
+            )
+            if not resp_b or resp_b.status_code != 200:
+                continue
+
+            if resp_b.text != resp_a.text and len(resp_b.text) > 300:
+                self._append_finding(findings, finding(
+                    "IDOR - Ownership Verification",
+                    test_url, "critical",
+                    f"Parameter '{param}' accessible by both '{default_role}' and "
+                    f"'{alt_role}' with differing content — verified ownership violation.",
+                    f"Role A ({default_role}): {len(resp_a.text)} chars | "
+                    f"Role B ({alt_role}): {len(resp_b.text)} chars",
+                    verification_stage="verified",
+                    parameter=param,
+                    request=_build_curl("GET", test_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                    response_excerpt=resp_b.text[:500],
+                    steps_to_reproduce=[
+                        f"Authenticate as '{alt_role}'",
+                        f"Send GET request to {test_url}",
+                        "Observe that the endpoint returns another user's private data",
+                        f"Compare with '{default_role}' response — content differs, confirming IDOR",
+                    ],
+                ))
+                log(f"  [IDOR Owner] {test_url[:80]} — {default_role} vs {alt_role}",
+                    Colors.RED, verbose_only=True, verbose=self.verbose)
+
     # ── Orchestrator ──────────────────────────────────────────────────────
 
     def run_all(self) -> list[dict]:
@@ -464,5 +536,6 @@ class IdorScanner(VulnScanner):
         self.scan_horizontal_privesc(findings, candidates)
         self.scan_sequential_enum(findings, candidates)
         self.scan_encoded_id_manipulation(findings, candidates)
+        self.verify_ownership(findings, candidates)
 
         return self._deduplicate(findings)

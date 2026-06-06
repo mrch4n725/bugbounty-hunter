@@ -88,6 +88,12 @@ def parse_args():
         help="Disable sensitive header masking in curl commands within reports (shows Authorization, Cookie, etc.)")
     parser.add_argument("--dry-run", action="store_true",
         help="Run recon and JS intelligence only, then print attack-surface summary and exit. Skips all active fuzzing.")
+    parser.add_argument("--role", default=None,
+        help="Current user role name for authorization testing (e.g. 'user_a', 'admin')")
+    parser.add_argument("--auth-header", action="append", default=[],
+        help="Auth header for a role in format 'role_name:HeaderName:HeaderValue'. "
+             "Can be specified multiple times. "
+             "E.g. --auth-header user_b:Authorization:'Bearer tok_b'")
     return parser.parse_args()
 
 
@@ -135,6 +141,8 @@ def _apply_scalar_config(cli_args, config_file: dict) -> None:
         'include_paths': 'include_paths',
         'autosave_interval': 'autosave_interval',
         'max_js_files': 'max_js_files',
+        'role': 'role',
+        'auth_header': 'auth_header',
     }
     arg_defaults = {
         'threads': 10, 'timeout': 10, 'retries': 3,
@@ -276,6 +284,8 @@ def build_config(args):
         "exclude_patterns": args.exclude_patterns or [],
         "include_paths": args.include_paths or [],
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "role": getattr(args, "role", None),
+        "auth_header": getattr(args, "auth_header", []),
     }
 
 

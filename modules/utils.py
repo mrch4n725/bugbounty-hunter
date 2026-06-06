@@ -123,80 +123,38 @@ class Colors:
     END = "\033[0m"
 
 
-# ── Enums ──────────────────────────────────────────────────────────────────────
+# ── Core model imports ─────────────────────────────────────────────────────────
+# Phase 1: re-export from canonical models module.
+# Phases 2-4: migrate callers to import from models directly.
 
-class VerificationStage(str, enum.Enum):
-    DETECTED = "detected"
-    VALIDATED = "validated"
-    EXPLOITABLE = "exploitable"
-    VERIFIED = "verified"
-
-class EvidenceStrength(str, enum.Enum):
-    WEAK = "weak"
-    MODERATE = "moderate"
-    STRONG = "strong"
-    VERIFIED = "verified"
-
-class FalsePositiveRisk(str, enum.Enum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-
-class ConfidenceLevel(str, enum.Enum):
-    UNVERIFIED = "Unverified"
-    LIKELY = "Likely"
-    HIGH_CONFIDENCE = "High Confidence"
-    CONFIRMED = "Confirmed"
-
-    @staticmethod
-    def from_score(score: int) -> "ConfidenceLevel":
-        if score >= 86:
-            return ConfidenceLevel.CONFIRMED
-        if score >= 61:
-            return ConfidenceLevel.HIGH_CONFIDENCE
-        if score >= 31:
-            return ConfidenceLevel.LIKELY
-        return ConfidenceLevel.UNVERIFIED
-
-# ── Confidence Scoring ─────────────────────────────────────────────────────
-
-CONFIDENCE_WEIGHTS = {
-    "detection_signal": 25,
-    "validation_signal": 35,
-    "exploitation_proof": 40,
-}
-
-def calculate_confidence(
-    detection: bool = False,
-    validation: bool = False,
-    exploitation: bool = False,
-    extra_points: int = 0,
-) -> int:
-    score = 0
-    if detection:
-        score += CONFIDENCE_WEIGHTS["detection_signal"]
-    if validation:
-        score += CONFIDENCE_WEIGHTS["validation_signal"]
-    if exploitation:
-        score += CONFIDENCE_WEIGHTS["exploitation_proof"]
-    score = min(100, score + extra_points)
-    return score
-
-def evidence_strength_from_score(score: int) -> EvidenceStrength:
-    if score >= 86:
-        return EvidenceStrength.VERIFIED
-    if score >= 61:
-        return EvidenceStrength.STRONG
-    if score >= 31:
-        return EvidenceStrength.MODERATE
-    return EvidenceStrength.WEAK
-
-def false_positive_risk_from_score(score: int) -> FalsePositiveRisk:
-    if score >= 86:
-        return FalsePositiveRisk.LOW
-    if score >= 61:
-        return FalsePositiveRisk.MEDIUM
-    return FalsePositiveRisk.HIGH
+from models.finding import (
+    VerificationStage,
+    EvidenceStrength,
+    FalsePositiveRisk,
+    ConfidenceLevel,
+    CONFIDENCE_WEIGHTS,
+    calculate_confidence,
+    evidence_strength_from_score,
+    false_positive_risk_from_score,
+    compute_fingerprint,
+    compute_root_cause_fingerprint,
+)
+from models.evidence import (
+    EvidenceType,
+    EvidenceStatus,
+    EvidenceBase,
+    HttpRequestEvidence,
+    HttpResponseEvidence,
+    ResponseExcerptEvidence,
+    ScreenshotEvidence,
+    OOBCallbackEvidence,
+    TimingEvidence,
+    SecretValidationEvidence,
+    BrowserExecutionEvidence,
+    GraphQLSchemaEvidence,
+    AuthorizationComparisonEvidence,
+)
+from models.finding import Finding as _CanonicalFinding
 
 # ── Prioritization Scoring Engine ────────────────────────────────────────────
 
@@ -236,15 +194,17 @@ def prioritize_findings(findings: list[dict]) -> list[dict]:
     return sorted(findings, key=lambda f: f.get("priority_score", 0), reverse=True)
 
 
-# ── Vulnerability Finding Model ─────────────────────────────────────────────
+# ── Vulnerability Finding Model (Legacy Wrapper) ─────────────────────────────
+# Phase 1: backward-compat wrapper around models.Finding.
+# Will be removed in Phase 4 after all consumers migrate.
 
 @dataclass
 class VulnerabilityFinding:
-    title: str
-    vuln_type: str
-    url: str
-    severity: str
-    details: str
+    title: str = ""
+    vuln_type: str = ""
+    url: str = ""
+    severity: str = "info"
+    details: str = ""
     evidence: str = ""
     confidence_score: int = 0
     confidence_label: str = "Unverified"
@@ -265,60 +225,33 @@ class VulnerabilityFinding:
     exploitability_rating: str = "unknown"
 
     def to_dict(self) -> Dict[str, Any]:
-        result = {
-            "title": self.title,
-            "type": self.vuln_type,
-            "url": self.url,
-            "severity": self.severity,
-            "details": self.details,
-            "evidence": self.evidence,
-            "confidence": self.confidence_label,
-            "confidence_score": self.confidence_score,
-            "evidence_strength": self.evidence_strength,
-            "verification_stage": self.verification_stage,
-            "false_positive_risk": self.false_positive_risk,
-            "proof": self.proof,
-            "fingerprint": self.fingerprint,
-            "timestamp": self.timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "validation_steps": self.validation_steps,
-            "exploitability_rating": self.exploitability_rating,
-        }
-        if self.grouped_urls:
-            result["grouped_urls"] = self.grouped_urls
-        if self.cvss_score is not None:
-            result["cvss_score"] = self.cvss_score
-        if self.cvss_vector is not None:
-            result["cvss_vector"] = self.cvss_vector
-        if self.what_is_it:
-            result["what_is_it"] = self.what_is_it
-        if self.impact:
-            result["impact"] = self.impact
-        if self.remediation:
-            result["remediation"] = self.remediation
-        if self.references:
-            result["references"] = self.references
-        return result
-
-    def _compute_fingerprint(self) -> str:
-        return hashlib.sha256(
-            f"{self.vuln_type}:{self._extract_param_name()}:{self._extract_root_cause()}".encode()
-        ).hexdigest()
-
-    def _extract_param_name(self) -> str:
-        for text in (self.details, self.evidence):
-            if "Parameter '" in text:
-                return text.split("Parameter '")[1].split("'")[0]
-            if "Form field '" in text:
-                return text.split("Form field '")[1].split("'")[0]
-        if "?" in self.url:
-            from urllib.parse import parse_qs, urlparse
-            params = parse_qs(urlparse(self.url).query)
-            if params:
-                return next(iter(params.keys()))
-        return ""
-
-    def _extract_root_cause(self) -> str:
-        return self.details[:80] if self.details else self.evidence[:80]
+        canonical = _CanonicalFinding(
+            title=self.title,
+            vuln_type=self.vuln_type,
+            url=self.url,
+            severity=self.severity,
+            details=self.details,
+            confidence_score=self.confidence_score or 25,
+            confidence_label=self.confidence_label,
+            verification_stage=self.verification_stage,
+            evidence_strength=self.evidence_strength,
+            false_positive_risk=self.false_positive_risk,
+            fingerprint=self.fingerprint,
+            impact=self.impact,
+            remediation=self.remediation,
+            references=self.references,
+            grouped_urls=self.grouped_urls,
+            timestamp=self.timestamp,
+            exploitability_rating=self.exploitability_rating,
+            cvss_score=self.cvss_score,
+            cvss_vector=self.cvss_vector,
+            request=self.what_is_it,
+        )
+        d = canonical.to_dict()
+        d["proof"] = self.proof
+        d["validation_steps"] = self.validation_steps
+        d["evidence"] = self.evidence
+        return d
 
     @staticmethod
     def from_legacy(f: Dict[str, Any]) -> "VulnerabilityFinding":
@@ -350,8 +283,36 @@ class VulnerabilityFinding:
             grouped_urls=f.get("grouped_urls", []),
         )
         if not vf.fingerprint:
-            vf.fingerprint = vf._compute_fingerprint()
+            vf.fingerprint = hashlib.sha256(
+                f"{vf.vuln_type}:{vf._legacy_extract_param()}:{vf.details[:80]}".encode()
+            ).hexdigest()
         return vf
+
+    # ── Backward-compat methods used by DeduplicationEngine ────────────
+
+    def _extract_param_name(self) -> str:
+        return self._legacy_extract_param()
+
+    def _extract_root_cause(self) -> str:
+        return self.details[:80] if self.details else self.evidence[:80]
+
+    def _compute_fingerprint(self) -> str:
+        return hashlib.sha256(
+            f"{self.vuln_type}:{self._extract_param_name()}:{self._extract_root_cause()}".encode()
+        ).hexdigest()
+
+    def _legacy_extract_param(self) -> str:
+        for text in (self.details, self.evidence):
+            if "Parameter '" in text:
+                return text.split("Parameter '")[1].split("'")[0]
+            if "Form field '" in text:
+                return text.split("Form field '")[1].split("'")[0]
+        if "?" in self.url:
+            from urllib.parse import parse_qs, urlparse
+            params = parse_qs(urlparse(self.url).query)
+            if params:
+                return next(iter(params.keys()))
+        return ""
 
 
 # ── OOB Detection Framework ───────────────────────────────────────────────
@@ -2316,3 +2277,57 @@ def _get_signal_set(
 _CLASSIFY_ALWAYS: set[str] = {
     "headers", "sensitive", "exposed_files", "clickjacking",
 }
+
+
+# ── Role-based session helpers (Phase 5: Authorization) ──────────────────
+
+def build_role_sessions(config: dict, base_session=None) -> dict[str, Any]:
+    """Build a dict of {role_name: requests.Session} from --auth-header args.
+    
+    Parses entries like:
+      --auth-header user_b:Authorization:'Bearer tok_b'
+      --auth-header admin:Cookie:'session=admin123'
+    
+    Returns at minimum {"default": base_session or make_session(config)}.
+    """
+    result: dict[str, Any] = {}
+    if base_session is not None:
+        result["default"] = base_session
+
+    raw = config.get("auth_header", [])
+    if isinstance(raw, str):
+        raw = [raw]
+    for entry in raw:
+        try:
+            parts = entry.split(":", 2)
+            if len(parts) != 3:
+                continue
+            role, header_name, header_value = parts
+            role = role.strip()
+            sess = make_session(config)
+            sess.headers.update({header_name.strip(): header_value.strip()})
+            result[role] = sess
+        except Exception:
+            continue
+
+    # If --cookies-alt is set, build an 'alt' session for backward compat
+    cookies_alt = config.get("cookies_alt", "")
+    if cookies_alt and "alt" not in result:
+        sess = make_session(config)
+        for part in cookies_alt.split(";"):
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                sess.cookies[k.strip()] = v.strip()
+        result["alt"] = sess
+
+    # Ensure at least a default session
+    if "default" not in result:
+        result["default"] = make_session(config)
+
+    return result
+
+
+def get_role_session(role_sessions: dict, role: str = "default"):
+    """Get a session for a given role, falling back to default."""
+    return role_sessions.get(role, role_sessions.get("default"))

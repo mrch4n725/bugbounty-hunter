@@ -1,0 +1,344 @@
+import json
+import html
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from reporting.base import ReporterBase
+
+
+REPORT_CSS = """
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+        --bg: #0f0f0f; --surface: #1e1e1e; --surface2: #2a2a2a;
+        --text: #e0e0e0; --text2: #999; --border: #333;
+        --critical: #e74c3c; --high: #e67e22; --medium: #f1c40f;
+        --low: #3498db; --info: #95a5a6; --confirmed: #2ecc71;
+    }
+    .light {
+        --bg: #f5f5f5; --surface: #ffffff; --surface2: #f0f0f0;
+        --text: #222; --text2: #666; --border: #ddd;
+    }
+    body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; line-height: 1.6; padding: 20px; transition: background .3s, color .3s; }
+    .container { max-width: 1200px; margin: 0 auto; }
+    header { text-align: center; margin-bottom: 40px; border-bottom: 2px solid var(--border); padding-bottom: 20px; }
+    header h1 { font-size: 2.2em; color: var(--text); }
+    .timestamp { color: var(--text2); font-size: .9em; }
+    .top-bar { display: flex; justify-content: flex-end; gap: 10px; margin-bottom: 20px; }
+    .theme-btn { background: var(--surface2); color: var(--text); border: 1px solid var(--border); padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: .85em; }
+    .theme-btn:hover { opacity: .8; }
+    .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; margin-bottom: 40px; }
+    .stat-card { background: var(--surface); border-radius: 8px; padding: 16px; text-align: center; box-shadow: 0 2px 8px rgba(0,0,0,.2); border-top: 4px solid var(--border); }
+    .stat-card .val { font-size: 2em; font-weight: 700; }
+    .stat-card .lbl { font-size: .8em; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; }
+    .stat-card.crit { border-top-color: var(--critical); } .stat-card.crit .val { color: var(--critical); }
+    .stat-card.high { border-top-color: var(--high); } .stat-card.high .val { color: var(--high); }
+    .stat-card.med { border-top-color: var(--medium); } .stat-card.med .val { color: var(--medium); }
+    .stat-card.low { border-top-color: var(--low); } .stat-card.low .val { color: var(--low); }
+    .stat-card.info { border-top-color: var(--info); } .stat-card.info .val { color: var(--info); }
+    .stat-card.conf { border-top-color: var(--confirmed); } .stat-card.conf .val { color: var(--confirmed); }
+    .stat-card.exploit { border-top-color: #9b59b6; } .stat-card.exploit .val { color: #9b59b6; }
+    .stat-card.detect { border-top-color: #e74c3c; } .stat-card.detect .val { color: #e74c3c; }
+    .stat-card.valid { border-top-color: #f39c12; } .stat-card.valid .val { color: #f39c12; }
+    .chart-row { display: flex; gap: 20px; margin-bottom: 40px; flex-wrap: wrap; }
+    .chart-box { background: var(--surface); border-radius: 8px; padding: 20px; flex: 1; min-width: 280px; box-shadow: 0 2px 8px rgba(0,0,0,.2); position: relative; height: 300px; }
+    .chart-box canvas { max-height: 240px; }
+    section { margin-bottom: 40px; background: var(--surface); padding: 24px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+    section h2 { font-size: 1.5em; margin-bottom: 16px; border-bottom: 2px solid var(--border); padding-bottom: 8px; }
+    .filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+    .filter-btn { background: var(--surface2); color: var(--text2); border: 1px solid var(--border); padding: 6px 14px; border-radius: 20px; cursor: pointer; font-size: .8em; transition: all .2s; }
+    .filter-btn:hover { opacity: .8; }
+    .filter-btn.active { background: var(--border); color: var(--text); border-color: var(--text2); }
+    .finding-card { background: var(--surface2); border-radius: 6px; margin-bottom: 12px; border-left: 4px solid var(--border); overflow: hidden; }
+    .finding-card.critical { border-left-color: var(--critical); }
+    .finding-card.high { border-left-color: var(--high); }
+    .finding-card.medium { border-left-color: var(--medium); }
+    .finding-card.low { border-left-color: var(--low); }
+    .finding-card.info { border-left-color: var(--info); }
+    .finding-header { padding: 14px 16px; cursor: pointer; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+    .finding-header:hover { background: rgba(255,255,255,.03); }
+    .finding-title { font-weight: 600; font-size: .95em; flex: 1; min-width: 160px; }
+    .finding-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .sev-badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: .75em; font-weight: 700; text-transform: uppercase; }
+    .sev-critical { background: var(--critical); color: #fff; }
+    .sev-high { background: var(--high); color: #fff; }
+    .sev-medium { background: var(--medium); color: #000; }
+    .sev-low { background: var(--low); color: #fff; }
+    .sev-info { background: var(--info); color: #fff; }
+    .conf-badge { padding: 2px 8px; border-radius: 10px; font-size: .75em; font-weight: 600; }
+    .conf-high { background: #2ecc71; color: #fff; }
+    .conf-mid { background: #f39c12; color: #000; }
+    .conf-low { background: #e74c3c; color: #fff; }
+    .stage-badge { padding: 2px 8px; border-radius: 10px; font-size: .75em; color: var(--text2); border: 1px solid var(--border); }
+    .finding-body { padding: 0 16px 16px; display: none; }
+    .finding-card.open .finding-body { display: block; }
+    .finding-body .row { margin-bottom: 8px; font-size: .88em; }
+    .finding-body .row strong { color: var(--text2); min-width: 90px; display: inline-block; }
+    .finding-body .url { font-family: 'Courier New', monospace; word-break: break-all; font-size: .85em; }
+    .finding-body .evidence { background: var(--bg); padding: 8px 12px; border-radius: 4px; font-family: 'Courier New', monospace; font-size: .82em; word-break: break-all; margin-top: 4px; max-height: 400px; overflow-y: auto; }
+    .finding-body .steps { margin: 4px 0; padding-left: 16px; }
+    .finding-body .steps li { margin-bottom: 4px; font-size: .85em; }
+    .finding-body details { margin: 4px 0; }
+    .finding-body details summary { cursor: pointer; color: var(--text2); font-size: .85em; }
+    .finding-body details summary:hover { color: var(--text); }
+    .finding-body pre { white-space: pre-wrap; word-break: break-all; font-size: .82em; max-height: 300px; overflow-y: auto; }
+    .copy-btn { background: var(--surface); color: var(--text2); border: 1px solid var(--border); padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: .78em; }
+    .copy-btn:hover { background: var(--border); }
+    .recon-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; }
+    .recon-grid .url { display: block; padding: 6px 10px; background: var(--surface2); border-radius: 4px; font-size: .82em; word-break: break-all; }
+    footer { text-align: center; margin-top: 40px; padding-top: 20px; border-top: 2px solid var(--border); color: var(--text2); font-size: .85em; }
+    .empty-message { color: var(--text2); font-style: italic; padding: 20px; text-align: center; }
+    @media (max-width: 600px) { .summary { grid-template-columns: repeat(2, 1fr); } .finding-header { flex-direction: column; align-items: flex-start; } }
+"""
+
+
+class HTMLReporter(ReporterBase):
+    def render(self) -> str:
+        sorted_findings = self._sort_findings()
+        severity_counts = self._get_severity_counts()
+        verification_breakdown = self._get_verification_breakdown()
+        subdomains = self.recon_data.get('subdomains', [])
+        urls = self.recon_data.get('urls', [])
+
+        config_section = self._create_config_section_html()
+        subdomains_section = self._create_subdomains_section_html(subdomains)
+        urls_section = self._create_urls_section_html(urls)
+        js_section = self._create_js_section_html(self.js_data)
+
+        cards_html = self._build_stat_cards_html(severity_counts, verification_breakdown)
+        findings_cards = self._build_finding_cards_html(sorted_findings)
+
+        sev_json = json.dumps(severity_counts)
+        ver_json = json.dumps(verification_breakdown)
+
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bug Bounty Report - {self.target}</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>{REPORT_CSS}</style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Bug Bounty Report</h1>
+            <p class="timestamp">Target: <strong>{self.target}</strong> | Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        </header>
+        <div class="top-bar">
+            <button class="theme-btn" onclick="toggleTheme()">Toggle Theme</button>
+        </div>
+        <section class="summary">{cards_html}</section>
+        <div class="chart-row">
+            <div class="chart-box"><canvas id="sevChart"></canvas></div>
+            <div class="chart-box"><canvas id="verChart"></canvas></div>
+        </div>
+        {config_section}
+        <section>
+            <h2>Findings <span style="font-size:.6em;color:var(--text2)">({sum(severity_counts.values())})</span></h2>
+            <div class="filters" id="filters">
+                <button class="filter-btn active" data-filter="all">All</button>
+                <button class="filter-btn" data-filter="critical">Critical</button>
+                <button class="filter-btn" data-filter="high">High</button>
+                <button class="filter-btn" data-filter="medium">Medium</button>
+                <button class="filter-btn" data-filter="low">Low</button>
+                <button class="filter-btn" data-filter="info">Info</button>
+                <button class="filter-btn" data-filter="exploitable">Exploitable</button>
+                <button class="filter-btn" data-filter="validated">Validated</button>
+                <button class="filter-btn" data-filter="detected">Detected</button>
+            </div>
+            <div id="findingsContainer">{findings_cards if sorted_findings else '<div class="empty-message">No vulnerabilities found.</div>'}</div>
+        </section>
+        {subdomains_section}
+        {urls_section}
+        {js_section}
+        <footer><p>Generated by BugBounty Hunter — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p></footer>
+    </div>
+    <script>
+        var sevData = {sev_json};
+        var verData = {ver_json};
+        var sevCtx = document.getElementById('sevChart').getContext('2d');
+        new Chart(sevCtx, {{type:'doughnut',data:{{labels:Object.keys(sevData).filter(k=>sevData[k]>0).map(k=>k.charAt(0).toUpperCase()+k.slice(1)),datasets:[{{data:Object.values(sevData).filter(v=>v>0),backgroundColor:['#e74c3c','#e67e22','#f1c40f','#3498db','#95a5a6'],borderWidth:0}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:'right',labels:{{color:'#999'}}}}}}}}}});
+        var verCtx = document.getElementById('verChart').getContext('2d');
+        new Chart(verCtx, {{type:'doughnut',data:{{labels:Object.keys(verData).filter(k=>verData[k]>0).map(k=>k.charAt(0).toUpperCase()+k.slice(1)),datasets:[{{data:Object.values(verData).filter(v=>v>0),backgroundColor:['#e74c3c','#f39c12','#2ecc71','#9b59b6'],borderWidth:0}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:'right',labels:{{color:'#999'}}}}}}}}}});
+        document.querySelectorAll('.filter-btn').forEach(btn=>{{btn.addEventListener('click',function(){{document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));this.classList.add('active');var filter=this.dataset.filter;document.querySelectorAll('.finding-card').forEach(card=>{{if(filter==='all'){{card.style.display='';return;}}var show=card.dataset.severity===filter||card.dataset.stage===filter;card.style.display=show?'':'none';}});}});}});
+        document.querySelectorAll('.finding-header').forEach(hdr=>{{hdr.addEventListener('click',function(){{this.parentElement.classList.toggle('open');}});}});
+        function toggleTheme(){{document.body.classList.toggle('light');}}
+        function copyUrl(url){{navigator.clipboard.writeText(url).then(()=>{{var btn=event.target;var orig=btn.textContent;btn.textContent='Copied!';setTimeout(()=>btn.textContent=orig,1200);}});}}
+        function copyCurl(cmd){{navigator.clipboard.writeText(cmd).then(()=>{{var btn=event.target;var orig=btn.textContent;btn.textContent='Copied!';setTimeout(()=>btn.textContent=orig,1200);}});}}
+    </script>
+</body>
+</html>"""
+
+    def _build_stat_cards_html(self, sev: Dict[str, int], ver: Dict[str, int]) -> str:
+        cards = ""
+        for cls, key, label in [("crit","critical","Critical"),("high","high","High"),("med","medium","Medium"),("low","low","Low"),("info","info","Info")]:
+            cards += f'<div class="stat-card {cls}"><div class="val">{sev.get(key,0)}</div><div class="lbl">{label}</div></div>'
+        cards += f'<div class="stat-card conf"><div class="val">{ver.get("exploitable",0)}</div><div class="lbl">Exploitable</div></div>'
+        cards += f'<div class="stat-card valid"><div class="val">{ver.get("validated",0)}</div><div class="lbl">Validated</div></div>'
+        cards += f'<div class="stat-card detect"><div class="val">{ver.get("detected",0)}</div><div class="lbl">Detected</div></div>'
+        return cards
+
+    def _build_finding_cards_html(self, findings: List[Dict[str, Any]]) -> str:
+        if not findings:
+            return '<div class="empty-message">No vulnerabilities found.</div>'
+        html_out = ""
+        for f in findings:
+            sev = f.get("severity", "info").lower()
+            stage = f.get("verification_stage", "detected").lower()
+            score = f.get("confidence_score", 0)
+            evidence = f.get("evidence", "")
+            details = f.get("details", "")
+            vuln_url = f.get("url", "")
+            fpr = f.get("false_positive_risk", "")
+            cvss = f.get("cvss_score", "")
+            steps = f.get("validation_steps", [])
+            request = f.get("request", "")
+            response_excerpt = f.get("response_excerpt", "")
+            screenshot_path = f.get("screenshot_path", "")
+            steps_to_reproduce = f.get("steps_to_reproduce", [])
+
+            sev_class = {"critical":"critical","high":"high","medium":"medium","low":"low","info":"info"}.get(sev,"info")
+            conf_class = "high" if score >= 61 else ("mid" if score >= 31 else "low")
+            stage_label = stage.title()
+
+            e_details = html.escape(details)
+            e_evidence = html.escape(evidence)
+            e_vuln_url = html.escape(vuln_url)
+            e_request = html.escape(request)
+            e_response = html.escape(response_excerpt)
+            e_fpr = html.escape(str(fpr).title() if fpr else "—")
+            e_title = html.escape(f.get("title","Finding"))
+
+            steps_html = ""
+            if steps:
+                items = "".join(f"<li>{html.escape(s)}</li>" for s in steps[:5])
+                steps_html = f'<div class="row"><strong>Steps:</strong><ol class="steps">{items}</ol></div>'
+
+            evidence_html = ""
+            if evidence:
+                evidence_html = f'<div class="row"><strong>Evidence:</strong><details><summary>View evidence ({len(evidence)} chars)</summary><div class="evidence">{e_evidence}</div></details></div>'
+
+            request_html = ""
+            if request:
+                request_html = f'<div class="row"><strong>Request:</strong><details><summary>View request</summary><pre class="evidence">{e_request}</pre></details></div>'
+
+            response_html = ""
+            if response_excerpt:
+                response_html = f'<div class="row"><strong>Response:</strong><details><summary>View response excerpt ({len(response_excerpt)} chars)</summary><pre class="evidence">{e_response}</pre></details></div>'
+
+            screenshot_html = ""
+            if screenshot_path:
+                screenshot_html = f'<div class="row"><strong>Validation Screenshot:</strong><details open><summary>View Playwright screenshot</summary><a href="{html.escape(screenshot_path)}" target="_blank"><img src="{html.escape(screenshot_path)}" alt="XSS execution screenshot" style="max-width:100%;border:1px solid var(--border);border-radius:4px;cursor:zoom-in" /></a></details></div>'
+
+            steps_to_reproduce_html = ""
+            if steps_to_reproduce:
+                items = "".join(f"<li>{html.escape(s)}</li>" for s in steps_to_reproduce[:10])
+                steps_to_reproduce_html = f'<div class="row"><strong>Steps to Reproduce:</strong><ol class="steps">{items}</ol></div>'
+
+            curl_cmd = self._build_curl_command(f)
+            cvss_html = f'<span>CVSS: {cvss:.1f}</span>' if isinstance(cvss, (int, float)) else ""
+
+            html_out += f'''<div class="finding-card {sev_class}" data-severity="{sev}" data-stage="{stage}">
+                <div class="finding-header">
+                    <div class="finding-title">{e_title}</div>
+                    <div class="finding-meta">
+                        <span class="sev-badge sev-{sev_class}">{sev.upper()}</span>
+                        <span class="conf-badge conf-{conf_class}">{score:.0f}%</span>
+                        <span class="stage-badge">{stage_label}</span>
+                    </div>
+                </div>
+                <div class="finding-body">
+                    <div class="row"><strong>URL:</strong> <span class="url">{e_vuln_url}</span> <button class="copy-btn" data-copy="{html.escape(vuln_url, quote=True)}">Copy URL</button> <button class="copy-btn copy-curl" data-copy="{html.escape(curl_cmd, quote=True)}">Copy Curl</button></div>
+                    <div class="row"><strong>Details:</strong> {e_details}</div>
+                    {evidence_html}
+                    {request_html}
+                    {response_html}
+                    {screenshot_html}
+                    {steps_html}
+                    {steps_to_reproduce_html}
+                    <div class="row"><strong>FP Risk:</strong> {e_fpr} {cvss_html}</div>
+                </div>
+            </div>'''
+
+        html_out += '''<script>
+document.addEventListener('click', function(e) {
+    var btn = e.target.closest('.copy-btn');
+    if (btn) { navigator.clipboard.writeText(btn.getAttribute('data-copy')).catch(function(){}); }
+});
+</script>'''
+        return html_out
+
+    def _create_subdomains_section_html(self, subdomains: List[str]) -> str:
+        if not subdomains:
+            return ''
+        content = '<section><h2>Discovered Subdomains</h2><ul>'
+        for sub in subdomains:
+            content += f'<li><span class="url">{html.escape(sub)}</span></li>'
+        return content + '</ul></section>'
+
+    def _create_urls_section_html(self, urls: List[str]) -> str:
+        if not urls:
+            return ''
+        content = '<section><h2>Discovered URLs</h2><ul>'
+        for url in urls:
+            content += f'<li><span class="url">{html.escape(url)}</span></li>'
+        return content + '</ul></section>'
+
+    def _create_config_section_html(self) -> str:
+        items = ''.join(f'<li>{item}</li>' for item in [
+            f"Target: <strong>{self.target}</strong>",
+            f"Format: <strong>{self.report_format.upper()}</strong>",
+            f"Modules: <strong>{', '.join(self.config.get('modules', []))}</strong>",
+            f"Threads: <strong>{self.config.get('threads')}</strong>",
+            f"Timeout: <strong>{self.config.get('timeout')}s</strong>",
+            f"Crawl Depth: <strong>{self.config.get('crawl_depth')}</strong>",
+            f"Max URLs: <strong>{self.config.get('max_urls')}</strong>",
+            f"Retries: <strong>{self.config.get('retries')}</strong>",
+            f"Passive Mode: <strong>{self.config.get('passive')}</strong>",
+        ])
+        return f'<section><h2>Scan Configuration</h2><ul>{items}</ul></section>'
+
+    def _create_js_section_html(self, js_data: dict) -> str:
+        secrets = js_data.get("secrets", [])
+        endpoints = js_data.get("endpoints", [])
+        hidden = js_data.get("hidden_endpoints", [])
+        env_vars = js_data.get("env_vars", [])
+        if not any([secrets, endpoints, hidden, env_vars]):
+            return ""
+        html_out = '<section><h2>JavaScript Intelligence</h2>'
+        if secrets:
+            html_out += '<h3 style="font-size:1.1em;margin:12px 0 8px;color:var(--text)">Discovered Secrets</h3><table><thead><tr><th>Type</th><th>Value</th><th>Source File</th><th>Validated</th></tr></thead><tbody>'
+            for s in secrets:
+                if s.get("confidence") == "none":
+                    continue
+                raw = s.get("value", "")
+                val = (html.escape(raw[:40]) + "...") if len(raw) > 40 else html.escape(raw)
+                source = html.escape(s.get("source_url", "").split("/")[-1] or s.get("source_url",""))
+                s_type = html.escape(s.get("type",""))
+                validated = s.get("validated")
+                if validated is True:
+                    badge = '<span style="color:#2ecc71;font-weight:bold">✓ Confirmed</span>'
+                    row_class = 'style="background:rgba(46,204,113,.08)"'
+                else:
+                    badge = '<span style="color:#f1c40f;font-weight:bold">? Unverified</span>'
+                    row_class = 'style="background:rgba(241,196,15,.06)"'
+                html_out += f'<tr {row_class}><td>{s_type}</td><td style="font-family:monospace;font-size:.85em">{val}</td><td>{source}</td><td>{badge}</td></tr>'
+            html_out += '</tbody></table>'
+        all_eps = list(endpoints) + list(hidden)
+        if all_eps:
+            html_out += '<h3 style="font-size:1.1em;margin:20px 0 8px;color:var(--text)">Discovered Endpoints</h3><table><thead><tr><th>Type</th><th>Endpoint</th><th>Source File</th></tr></thead><tbody>'
+            for ep in all_eps[:100]:
+                ep_url = html.escape(ep.get("url",""))
+                ep_type = html.escape(ep.get("type",""))
+                source = html.escape(ep.get("source_url","").split("/")[-1] or "")
+                style = 'style="color:#e67e22;"' if ep in hidden else ""
+                html_out += f'<tr><td>{ep_type}</td><td {style} style="font-family:monospace;font-size:.85em;word-break:break-all">{ep_url}</td><td>{source}</td></tr>'
+            html_out += '</tbody></table>'
+        if env_vars:
+            html_out += '<h3 style="font-size:1.1em;margin:20px 0 8px;color:var(--text)">Environment Variable References</h3><div class="recon-grid">'
+            for ev in env_vars:
+                html_out += f'<span class="url" style="font-size:.82em">{html.escape(ev.get("variable",""))}</span>'
+            html_out += '</div>'
+        html_out += '</section>'
+        return html_out
