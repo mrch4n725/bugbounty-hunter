@@ -463,13 +463,25 @@ class Reporter:
             fpr = finding.get('false_positive_risk', '')
             details = html.escape(finding.get('details', 'N/A'))
             evidence = html.escape(finding.get('evidence', ''))
-            validation_steps = finding.get('validation_steps', [])
+            request_str = finding.get('request', '')
+            response_excerpt = html.escape(finding.get('response_excerpt', ''))
+            parameter = html.escape(finding.get('parameter', ''))
+            screenshot_path = html.escape(finding.get('screenshot_path', ''))
+            validation_steps = finding.get('validation_steps', []) or finding.get('steps_to_reproduce', [])
             recommendation = html.escape(finding.get('recommendation', ''))
             title_escaped = html.escape(finding.get('title', 'N/A'))
             url_escaped = html.escape(finding.get('url', 'N/A'))
             details_html = f"<div>{details}</div>"
             if evidence:
                 details_html += f"<div><strong>Evidence:</strong> {evidence}</div>"
+            if request_str:
+                details_html += f"<div><strong>Request (curl):</strong> <code>{html.escape(request_str[:500])}</code></div>"
+            if response_excerpt:
+                details_html += f"<div><strong>Response:</strong> {response_excerpt}</div>"
+            if parameter:
+                details_html += f"<div><strong>Parameter:</strong> {parameter}</div>"
+            if screenshot_path:
+                details_html += f'<div><strong>Screenshot:</strong> <a href="{screenshot_path}" target="_blank">{screenshot_path}</a></div>'
             if validation_steps:
                 steps = "<br>".join(f"▸ {html.escape(s)}" for s in validation_steps[:5])
                 details_html += f"<div><strong>Validation:</strong><br>{steps}</div>"
@@ -1051,14 +1063,21 @@ VULNERABILITY FINDINGS
     FP Risk     : {fpr or '—'}
     Evidence    : {evidence_strength or '—'}
     URL         : {finding.get('url', 'N/A')}
+    Parameter   : {finding.get('parameter', 'N/A')}
     Details     : {finding.get('details', 'N/A')}
 """
                 if finding.get('evidence'):
                     txt_content += f"    Raw Evidence: {finding['evidence'][:200]}\n"
-                validation_steps = finding.get('validation_steps', [])
-                if validation_steps:
-                    for vs in validation_steps[:5]:
-                        txt_content += f"    ⬩ {vs}\n"
+                if finding.get('request'):
+                    txt_content += f"    Request     : {finding['request']}\n"
+                if finding.get('response_excerpt'):
+                    txt_content += f"    Response    : {finding['response_excerpt'][:300]}\n"
+                if finding.get('screenshot_path'):
+                    txt_content += f"    Screenshot  : {finding['screenshot_path']}\n"
+                steps = finding.get('validation_steps') or finding.get('steps_to_reproduce', [])
+                if steps:
+                    for s in steps[:5]:
+                        txt_content += f"    ⬩ {s}\n"
                 if finding.get('impact'):
                     txt_content += f"    Impact: {finding['impact']}\n"
                 if finding.get('recommendation'):
@@ -1345,12 +1364,21 @@ End of Report
 
         ia = f.get("impact_assessment", {})
         fp_risk = f.get("false_positive_risk", "")
+        parameter = f.get("parameter", "")
+        curl_cmd = self._build_curl_command(f)
+        response_excerpt = f.get("response_excerpt", "")
+        screenshot_path = f.get("screenshot_path", "")
+        verification_stage = f.get("verification_stage", "detected").title()
+
+        screenshot_line = f"**Screenshot:** {screenshot_path}\n" if screenshot_path else ""
 
         return f"""### {title}
 
 **Severity:** {sev}
 **Component:** {component}
 **CVSS:** {f.get('cvss_score', '—')} ({f.get('cvss_rating', '—')})
+**Parameter:** {parameter or '—'}
+**Verification Stage:** {verification_stage}
 
 #### Summary
 {what}
@@ -1366,6 +1394,16 @@ End of Report
 {self._format_evidence(evidence, 50)}
 ```
 
+#### Request
+```
+{curl_cmd}
+```
+
+#### Response Excerpt
+```
+{self._format_evidence(response_excerpt, 50)}
+```
+{screenshot_line}
 #### Impact
 {impact_narrative}
 
@@ -1460,6 +1498,7 @@ Please verify each finding before submitting.
 | Verification Stage | {f.get('verification_stage', '').title() or 'Detected'} |
 | Confidence | {cs} |
 | CVSS | {f.get('cvss_score', '—')} ({f.get('cvss_rating', '—')}) |
+| Parameter | `{f.get('parameter', '—')}` |
 
 ### Description
 {what}
@@ -1475,6 +1514,12 @@ Please verify each finding before submitting.
 {self._format_evidence(evidence, 50)}
 ```
 
+### Request
+```
+{self._build_curl_command(f)}
+```
+{("### Response\n```\n" + f.get('response_excerpt', '') + "\n```\n") if f.get('response_excerpt') else ""}
+{("Screenshot: " + f.get('screenshot_path', '') + "\n") if f.get('screenshot_path') else ""}
 ### Impact
 {impact}
 

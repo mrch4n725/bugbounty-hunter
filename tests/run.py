@@ -227,6 +227,22 @@ expected_methods = [
 for m in expected_methods:
     check(f"VulnScanner.{m}", hasattr(VulnScanner, m))
 
+from modules.utils import _build_curl
+scanner_instance = VulnScanner({"verbose": True, "target": "https://ex.com", "timeout": 5}, {})
+findings_list: list[dict] = []
+scanner_instance._record_confirmed(findings_list, "TestType", "https://ex.com/test", "high",
+                                   "Test details", "Test evidence", "GET",
+                                   response_excerpt="response text",
+                                   steps_to_reproduce=["Step 1", "Step 2"],
+                                   parameter="test_param")
+check("_record_confirmed creates a finding", len(findings_list) == 1)
+f = findings_list[0]
+check("_record_confirmed has verification_stage", f.get("verification_stage") == "validated")
+check("_record_confirmed has request", bool(f.get("request")))
+check("_record_confirmed has response_excerpt", f.get("response_excerpt") == "response text")
+check("_record_confirmed has steps_to_reproduce", len(f.get("steps_to_reproduce", [])) == 2)
+check("_record_confirmed has parameter", f.get("parameter") == "test_param")
+
 # ═══════════════════════════════════════════════════════════
 # _add() return value
 # ═══════════════════════════════════════════════════════════
@@ -313,6 +329,33 @@ with tempfile.TemporaryDirectory() as tmpdir:
     with open(path3) as fh:
         txt = fh.read()
     check("TXT output non-empty", len(txt) > 0)
+    check("TXT has request field",  "Request" in txt or "curl" in txt)
+    check("TXT has response field", "Response" in txt)
+    check("TXT has parameter field", "Parameter" in txt)
+    check("TXT has screenshot field", "Screenshot" in txt)
+
+    # HackerOne
+    cfg4 = dict(cfg, report_format="hackerone")
+    path4 = Reporter(cfg4, fixtures, [], []).generate(suffix="test")
+    with open(path4) as fh:
+        h1 = fh.read()
+    check("HackerOne output non-empty", len(h1) > 0)
+    check("HackerOne has curl field",  "curl" in h1)
+    check("HackerOne has response field", "Response Excerpt" in h1)
+    check("HackerOne has parameter field", "Parameter" in h1)
+    check("HackerOne has screenshot field", "Screenshot" in h1)
+    check("HackerOne has verification stage", "Verification Stage" in h1)
+
+    # Bugcrowd
+    cfg5 = dict(cfg, report_format="bugcrowd")
+    path5 = Reporter(cfg5, fixtures, [], []).generate(suffix="test")
+    with open(path5) as fh:
+        bc = fh.read()
+    check("Bugcrowd output non-empty", len(bc) > 0)
+    check("Bugcrowd has curl field",  "curl" in bc)
+    check("Bugcrowd has response field", "Response" in bc)
+    check("Bugcrowd has parameter field", "Parameter" in bc)
+    check("Bugcrowd has screenshot field", "Screenshot" in bc)
 
     # assess_finding_impact
     impact = assess_finding_impact(fixtures[0])

@@ -379,7 +379,13 @@ class ApiScanner(VulnScanner):
                     matched = [e for e in SQLI_ERRORS if e in body_text]
                     if matched:
                         details = f"Mutation '{mut_name}' triggered SQL error with payload: {payload}"
-                        self._record_confirmed(findings, "GraphQL SQL Injection", url, "critical", details, matched[0], "POST", op)
+                        self._record_confirmed(findings, "GraphQL SQL Injection", url, "critical",
+                                               details, matched[0], "POST", op,
+                                               response_excerpt=resp.text[:500],
+                                               steps_to_reproduce=[
+                                                   f"Send POST request to {url} with SQL injection payload in mutation '{mut_name}'",
+                                                   "Observe database error messages in the response",
+                                               ])
                         log(f"  [GQL Inj] SQLi in mutation {mut_name}", Colors.RED, verbose_only=True, verbose=self.verbose)
                         break
                 except Exception:
@@ -399,7 +405,12 @@ class ApiScanner(VulnScanner):
                     resp = self.session.post(url, json=op, timeout=self.timeout)
                     if resp and payload in resp.text:
                         details = f"Mutation '{mut_name}' reflects XSS payload in response."
-                        self._record_confirmed(findings, "GraphQL XSS", url, "high", details, payload, "POST", op)
+                        self._record_confirmed(findings, "GraphQL XSS", url, "high", details, payload, "POST", op,
+                                               response_excerpt=resp.text[:500],
+                                               steps_to_reproduce=[
+                                                   f"Send POST request to {url} with XSS payload in mutation '{mut_name}'",
+                                                   "Observe the XSS payload reflected in the response",
+                                               ])
                         log(f"  [GQL Inj] XSS in mutation {mut_name}", Colors.RED, verbose_only=True, verbose=self.verbose)
                         break
                 except Exception:
@@ -427,6 +438,11 @@ class ApiScanner(VulnScanner):
                             self._record_confirmed(
                                 findings, "GraphQL Batching Attack", url, "medium",
                                 details, "__typename", "POST", batch,
+                                response_excerpt=resp.text[:500],
+                                steps_to_reproduce=[
+                                    f"Send POST request to {url} with {len(batch)} batched queries",
+                                    "Observe that the server processes all queries in a single request",
+                                ],
                             )
                             log(f"  [GQL Batch] {url}", Colors.YELLOW,
                                 verbose_only=True, verbose=self.verbose)

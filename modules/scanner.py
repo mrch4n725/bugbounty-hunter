@@ -686,10 +686,28 @@ class VulnScanner:
 
     def _record_confirmed(self, findings_list: list, vuln_type: str, url: str,
                           severity: str, details: str, evidence: str,
-                          method: str, request_data: Any = None) -> None:
+                          method: str, request_data: Any = None,
+                          response_excerpt: str = "",
+                          steps_to_reproduce: Optional[list] = None,
+                          parameter: Optional[str] = None) -> None:
+        request_str = ""
+        if method and url:
+            req_headers = dict(self.session.headers) if hasattr(self, 'session') else {}
+            req_cookies = dict(self.session.cookies) if hasattr(self, 'session') else {}
+            if request_data is not None:
+                import json
+                data_str = json.dumps(request_data) if isinstance(request_data, (dict, list)) else str(request_data)
+                request_str = _build_curl(method, url, req_headers, data=data_str, cookies=req_cookies)
+            else:
+                request_str = _build_curl(method, url, req_headers, cookies=req_cookies)
         f = finding(
             vuln_type=vuln_type, url=url, severity=severity,
-            details=details, evidence=evidence, confidence="confirmed",
+            details=details, evidence=evidence,
+            verification_stage=VerificationStage.VALIDATED.value,
+            request=request_str,
+            response_excerpt=response_excerpt or "",
+            steps_to_reproduce=steps_to_reproduce or [f"Send {method} request to {url}"],
+            parameter=parameter or "",
         )
         self._append_finding(findings_list, f)
 
@@ -1374,6 +1392,7 @@ class VulnScanner:
                         evidence=f"Payload: {payload} | Submitted via param: {entry['param']}",
                         request=_build_curl("GET", base_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=resp.text[:500],
+                        parameter=entry['param'],
                         steps_to_reproduce=[f"Send request to {base_url}", f"Observe payload reflection: {payload[:80]}"],
                         verification_stage=VerificationStage.VALIDATED.value,
                         validation_steps=[f"Payload '{payload}' submitted via {entry['param']} then reflected on {base_url}"],
@@ -2224,6 +2243,7 @@ class VulnScanner:
                                             evidence=f"Payload: {payload}",
                                             request=_build_curl("GET", test_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                                             response_excerpt=resp.text[:500],
+                                            parameter=param,
                                             steps_to_reproduce=[f"Send request to {test_url}", f"Observe: {sig}"],
                                             verification_stage=VerificationStage.VALIDATED.value,
                                             validation_steps=[f"LFI signature '{sig}' found in response"],
@@ -3364,6 +3384,7 @@ class VulnScanner:
                             evidence=r.text[:120],
                             request=_build_curl("GET", test_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                             response_excerpt=r.text[:500],
+                            parameter=c['param'],
                             steps_to_reproduce=[f"Send GET request to {test_url}", "Observe accessible data without authorization"],
                             verification_stage=VerificationStage.DETECTED.value,
                         )

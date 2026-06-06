@@ -641,6 +641,7 @@ class Recon:
     def mine_js_bundles(self) -> list[dict]:
         """Passively mine JavaScript bundles for secrets, endpoints, and hidden functionality."""
         from modules.js_intelligence import JSIntelligence
+        from modules.utils import _build_curl
         findings = []
         for js_url in sorted(self.js_urls):
             r = safe_get(self.session, js_url, timeout=self.timeout, raise_for_status=False)
@@ -659,6 +660,14 @@ class Recon:
                     f"Validated JS Secret: {secret['type']}", js_url, "critical",
                     f"Live-API validated secret in JS bundle — {det}",
                     secret["value"],
+                    verification_stage="verified",
+                    request=_build_curl("GET", js_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                    response_excerpt=r.text[:500],
+                    steps_to_reproduce=[
+                        f"Fetch the JS file at {js_url}",
+                        f"Search the response for '{secret['type']}' patterns",
+                        "Observe the exposed secret value",
+                    ],
                 )
                 if f:
                     findings.append(f)
@@ -675,6 +684,14 @@ class Recon:
                     f"JS Secret: {secret['type']}", js_url, "high",
                     f"Pattern '{secret['type']}' matched in JS bundle",
                     secret["value"],
+                    verification_stage="detected",
+                    request=_build_curl("GET", js_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                    response_excerpt=r.text[:500],
+                    steps_to_reproduce=[
+                        f"Fetch the JS file at {js_url}",
+                        f"Search the response for '{secret['type']}' patterns",
+                        "Observe the potential secret value",
+                    ],
                 )
                 if f:
                     findings.append(f)
@@ -687,6 +704,14 @@ class Recon:
                     f"Hidden JS Endpoint ({ep['type']})", ep["url"], "medium",
                     f"Hidden endpoint discovered via JS analysis in {js_url}",
                     ep.get("match", "")[:120],
+                    verification_stage="detected",
+                    request=_build_curl("GET", ep["url"], dict(self.session.headers), cookies=dict(self.session.cookies)),
+                    response_excerpt=r.text[:500],
+                    steps_to_reproduce=[
+                        f"Analyze the JS file at {js_url}",
+                        f"Discover hidden endpoint: {ep['url']}",
+                        "Observe that the endpoint exists and may expose additional functionality",
+                    ],
                 )
                 if f:
                     findings.append(f)

@@ -377,7 +377,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     # ── TARGET_LEVEL: modules that run once per target, not per URL ──
     TARGET_LEVEL: set[str] = {
         "headers", "dirb", "exposed_files", "clickjacking",
-        "subdomain_takeover", "graphql", "blind_xss", "js_secrets", "api", "openapi", "idor_path",
+        "subdomain_takeover", "graphql", "blind_xss", "api", "openapi", "idor_path",
     }
 
     if config["passive"]:
@@ -409,7 +409,6 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         "subdomain_takeover": scanner.scan_subdomain_takeover,
         "graphql": scanner.scan_graphql,
         "rate_limiting": scanner.scan_rate_limiting,
-        "js_secrets": scanner.scan_js_secrets,
         "openapi": scanner.scan_openapi,
     }
     _api_scanner = ApiScanner(scanner.config, scanner.recon)
@@ -651,7 +650,8 @@ def main():
             if entry.get("confidence") == "none":
                 continue
             sev = entry.get("severity", "high")
-            if entry.get("validated"):
+            validated = entry.get("validated")
+            if validated:
                 sev = "critical"
             source_url = entry.get("source_url", "")
             f = finding(
@@ -660,6 +660,7 @@ def main():
                 severity=sev,
                 details=f"Secret type '{entry['type']}' found in JS file",
                 evidence=f"Match: {entry['value'][:40]}... Source: {source_url}",
+                verification_stage="verified" if validated else "detected",
                 request=_build_curl("GET", source_url, dict(js_session.headers), cookies=dict(js_session.cookies)),
                 response_excerpt=resp.text[:1000] if resp is not None else "",
                 steps_to_reproduce=[
