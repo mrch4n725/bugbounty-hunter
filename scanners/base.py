@@ -112,8 +112,22 @@ class ScannerBase:
         )
 
     def scan(self, target_urls: list[str] | None = None) -> list[dict]:
-        """Main scan entry point. Override to implement scanning logic."""
+        """Main scan entry point. Override to implement scanning logic.
+
+        TARGET_LEVEL = True means scan() ignores the target_urls argument
+        and always operates on self.base_url or self.recon directly.
+        SCANNER_ORDER = 10 for target-level scanners that run before
+        per-URL passes. The _dispatch_to_scanner() caller in
+        modules/scanner.py always passes target_urls; target-level scanners
+        must simply ignore it.
+        """
         raise NotImplementedError
+
+    def finalize(self) -> list[dict]:
+        """Post-scan hook called after scan() returns.
+        Override in OOB-based scanners to poll for callbacks.
+        Returns additional findings confirmed by OOB."""
+        return []
 
     # ── Shared utilities ─────────────────────────────────────────────────
 
@@ -246,6 +260,22 @@ class ScannerBase:
             score = f.get("confidence_score", 0)
             log(f"  [FOUND] [{sev}] {title} @ {url} [{stage}, {score:.0f}/100]",
                 Colors.RED if sev in ("CRITICAL", "HIGH") else Colors.YELLOW)
+
+            # Auto-create and link HttpRequestEvidence for every finding
+            fp = f.get("fingerprint", "")
+            request_str = f.get("request", "")
+            if fp and request_str and self.evidence_engine is not None:
+                try:
+                    from models.evidence import HttpRequestEvidence
+                    req_ev = HttpRequestEvidence(
+                        method=f.get("request", "GET").split()[0] if " " in f.get("request", "") else "GET",
+                        url=url,
+                        curl_command=request_str,
+                    )
+                    self.evidence_engine.store(req_ev)
+                    self.evidence_engine.link_to_finding(req_ev, fp)
+                except Exception:
+                    pass
             return True
 
     def _get_findings(self) -> list[dict]:

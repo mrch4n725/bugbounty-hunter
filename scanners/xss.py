@@ -64,8 +64,8 @@ class XSSScanner(ScannerBase):
     SCANNER_NAME = "xss"
     SCANNER_MATURITY = 4
 
-    def __init__(self, config: dict, recon: dict):
-        super().__init__(config, recon)
+    def __init__(self, config: dict, recon: dict, container=None):
+        super().__init__(config, recon, container=container)
         self._payloads = None
 
     def _get_payloads(self) -> dict:

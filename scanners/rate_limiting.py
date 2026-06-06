@@ -1,0 +1,190 @@
+"""
+RateLimitingScanner — tests auth-related endpoints for missing rate limiting.
+
+Lifecycle:
+  DETECTED:   No 429 returned across 50 rapid POST requests
+  VALIDATED:  (not applicable)
+  EXPLOITABLE: (not applicable)
+  VERIFIED:   (not applicable)
+
+Maturity: Level 1 (Detection only)
+"""
+
+import random
+import time
+from urllib.parse import urlparse, urljoin
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
+from modules.utils import (
+    finding, log, Colors, _build_curl,
+    VerificationStage,
+)
+from scanners.base import ScannerBase
+from models.evidence import TimingEvidence
+
+HARDCODED_PATHS = [
+    "/login", "/auth/login", "/api/login", "/api/auth/login",
+    "/register", "/auth/register", "/api/register",
+    "/reset-password", "/auth/reset-password", "/api/reset-password",
+    "/forgot-password", "/auth/forgot-password",
+    "/api/v1/login", "/api/v1/register",
+    "/oauth/token", "/api/token",
+]
+
+PROBE_COUNT = 50
+
+
+class RateLimitingScanner(ScannerBase):
+    SCANNER_NAME = "rate_limiting"
+    TARGET_LEVEL = False
+
+    def _build_candidates(self, target_urls: list[str] | None = None) -> list[dict]:
+        candidates: list[dict] = []
+        seen_urls: set = set()
+
+        def _add(url: str, sev: str, form_fields: list = None):
+            if url in seen_urls:
+                return
+            seen_urls.add(url)
+            candidates.append({"url": url, "severity": sev, "form_fields": form_fields or []})
+
+        base = self.base_url
+        if target_urls:
+            parsed = urlparse(target_urls[0])
+            base = f"{parsed.scheme}://{parsed.netloc}"
+
+        for path in HARDCODED_PATHS:
+            full = urljoin(base, path)
+            sev = "high" if any(k in path for k in ("login", "auth", "signin", "reset", "password", "token")) else "medium"
+            _add(full, sev)
+
+        forms = self.recon.get("forms", [])
+        if target_urls is not None:
+            target_origins = {urlparse(u).scheme + "://" + urlparse(u).netloc for u in target_urls}
+            forms = [
+                f for f in forms
+                if any(urlparse(f.get("action", "")).scheme + "://" + urlparse(f.get("action", "")).netloc == o for o in target_origins)
+            ]
+        for form in forms:
+            method = form.get("method", "GET").upper()
+            if method != "POST":
+                continue
+            fields = form.get("fields", [])
+            field_names = [f.get("name", "").lower() for f in fields if f.get("name")]
+            pw_fields = [n for n in field_names if n in ("password", "passwd", "pass", "secret", "pin", "otp", "code", "token")]
+            if not pw_fields:
+                continue
+            action = form.get("action", "")
+            if not action:
+                continue
+            _add(action, "high", fields)
+
+        return candidates
+
+    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+        candidates = self._build_candidates(target_urls)
+        for candidate in candidates:
+            test_url = candidate["url"]
+            if not self._in_scope(test_url):
+                continue
+            form_fields = candidate["form_fields"]
+            severity = candidate["severity"]
+
+            try:
+                base_resp = self.session.post(test_url, timeout=self.timeout, data={"baseline": "1"})
+                if base_resp.status_code in (404, 410):
+                    continue
+            except Exception:
+                continue
+
+            if form_fields:
+                probe_data = {}
+                for f in form_fields:
+                    name = f.get("name", "")
+                    ftype = f.get("type", "").lower()
+                    if name.lower() in ("password", "passwd", "pass", "secret", "pin", "otp"):
+                        probe_data[name] = "Wr0ng_P4ss_probe!"
+                    elif name.lower() in ("email", "username", "login"):
+                        probe_data[name] = "probe@ratelimit.test"
+                    elif name.lower() in ("code", "token"):
+                        probe_data[name] = "000000"
+                    else:
+                        probe_data[name] = f.get("value", "test")
+            else:
+                probe_data = {
+                    "username": "ratelimit_probe_user",
+                    "password": "Wr0ng_P4ss_probe!",
+                    "email": "probe@ratelimit.test",
+                }
+
+            _probe_cookies = dict(self.session.cookies)
+            _probe_headers = dict(self.session.headers)
+
+            def _probe(_idx: int, _url=test_url, _data=probe_data, _timeout=self.timeout,
+                       _cookies=_probe_cookies, _headers=_probe_headers) -> tuple[int, str]:
+                try:
+                    import requests as _requests
+                    delay = random.uniform(0.5, 1.5) if self.config.get("stealth") else max(0.05, self.config.get("delay", 0.0))
+                    if delay:
+                        time.sleep(delay)
+                    r = _requests.post(_url, data=_data, timeout=_timeout,
+                                       cookies=_cookies, headers=_headers, verify=False)
+                    return (r.status_code, r.text[:500])
+                except Exception:
+                    return (0, "")
+
+            results: list[tuple[int, str]] = []
+            start = time.time()
+
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                for status_code, body_snippet in pool.map(_probe, range(PROBE_COUNT)):
+                    results.append((status_code, body_snippet))
+
+            elapsed = time.time() - start
+            statuses = [s for s, _ in results]
+            unique_statuses = set(statuses)
+            has_429 = 429 in unique_statuses
+            has_5xx = any(s >= 500 for s in unique_statuses)
+            first_body = results[0][1] if results else ""
+            body_changed = any(b != first_body for b in [b for _, b in results[1:]])
+
+            timing_ev = TimingEvidence(
+                baseline_time_ms=0.0,
+                triggered_time_ms=elapsed * 1000,
+                delay_threshold_ms=0.0,
+                total_attempts=PROBE_COUNT,
+                description=f"Rate limit burst: {PROBE_COUNT} POSTs in {elapsed:.2f}s",
+            )
+            self.evidence_engine.store(timing_ev)
+
+            throttled = has_429 or (body_changed and not has_5xx)
+            if not throttled:
+                f = finding(
+                    vuln_type="Missing Rate Limiting",
+                    url=test_url,
+                    severity=severity,
+                    details=f"Endpoint accepted {PROBE_COUNT} POST requests in {elapsed:.1f}s without rate limiting",
+                    evidence=f"Sent {PROBE_COUNT} POST requests. Statuses: {sorted(unique_statuses)}. No 429 received. Body changed: {body_changed}.",
+                    request=_build_curl("POST", test_url, dict(self.session.headers), data=probe_data),
+                    response_excerpt=f"Sample response (req 1 of {PROBE_COUNT}): {results[0][1][:300]}" if results else "",
+                    steps_to_reproduce=[
+                        f"Send {PROBE_COUNT} rapid POST requests to {test_url}",
+                        "Observe no 429 or throttling response",
+                        "Brute-force or credential stuffing attack possible",
+                    ],
+                    verification_stage=VerificationStage.DETECTED.value,
+                )
+                if f:
+                    self.evidence_engine.link_to_finding(timing_ev, f.get("fingerprint", ""))
+                    self._add_finding(f)
+                log(f"  [RATE LIMITING] {test_url} — no 429 in {elapsed:.1f}s",
+                    Colors.RED, verbose_only=True, verbose=self.verbose)
+            elif has_429:
+                log(f"  [RATE LIMITING] {test_url} — rate limited (429 present)",
+                    Colors.GREEN, verbose_only=True, verbose=self.verbose)
+            elif body_changed:
+                log(f"  [RATE LIMITING] {test_url} — body changed (throttling suspected)",
+                    Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+
+        return self._get_findings()

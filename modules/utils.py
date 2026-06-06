@@ -273,6 +273,7 @@ class VulnerabilityFinding:
     references: List[str] = field(default_factory=list)
     timestamp: str = ""
     validation_steps: List[str] = field(default_factory=list)
+    steps_to_reproduce: List[str] = field(default_factory=list)
     exploitability_rating: str = "unknown"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -301,6 +302,7 @@ class VulnerabilityFinding:
         d = canonical.to_dict()
         d["proof"] = self.proof
         d["validation_steps"] = self.validation_steps
+        d["steps_to_reproduce"] = self.steps_to_reproduce
         d["evidence"] = self.evidence
         return d
 
@@ -332,6 +334,7 @@ class VulnerabilityFinding:
             remediation=f.get("remediation", ""),
             references=f.get("references", []),
             grouped_urls=f.get("grouped_urls", []),
+            steps_to_reproduce=f.get("steps_to_reproduce", []),
         )
         if not vf.fingerprint:
             vf.fingerprint = hashlib.sha256(

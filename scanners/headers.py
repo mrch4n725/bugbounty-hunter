@@ -31,6 +31,7 @@ SECURITY_HEADERS = {
 
 class HeadersScanner(ScannerBase):
     SCANNER_NAME = "headers"
+    TARGET_LEVEL = True
     SCANNER_MATURITY = 2
 
     # ── Detection phase ─────────────────────────────────────────────────
@@ -158,6 +159,8 @@ class HeadersScanner(ScannerBase):
                 )
                 stage = VerificationStage.VALIDATED.value if is_cors else VerificationStage.DETECTED.value
 
+                curl_cmd = _build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies))
+                resp_text = resp.text[:500] if resp else ""
                 f = finding(
                     vuln_type=f"Missing Security Header: {d.parameter}" if d.context == "missing_header"
                     else f"Information Disclosure: {d.parameter}" if d.context == "information_disclosure"
@@ -168,8 +171,16 @@ class HeadersScanner(ScannerBase):
                     severity="low" if d.context in ("insecure_cookie", "information_disclosure") else "medium",
                     details=f"{d.context.replace('_', ' ').title()}: {d.payload[:100]}",
                     evidence=d.payload,
+                    request=curl_cmd,
+                    response_excerpt=resp_text,
+                    steps_to_reproduce=[
+                        f"Send GET request to {url}",
+                        f"Observe missing header: {d.parameter}",
+                    ] if d.context == "missing_header" else [
+                        f"Send GET request to {url}",
+                        f"Observe {d.context.replace('_', ' ')}: {d.payload[:80]}",
+                    ],
                     verification_stage=stage,
-                    response_excerpt="",
                 )
                 if f:
                     self._add_finding(f)

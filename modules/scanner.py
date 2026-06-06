@@ -482,12 +482,12 @@ class VulnScanner:
         # Phase 4: auto-discovered scanner instances
         self._scanner_instances: dict[str, Any] = {}
         if self._use_new_scanners:
-            try:
-                from scanners import discover_scanner_classes
-                for name, cls in discover_scanner_classes().items():
+            from scanners import discover_scanner_classes
+            for name, cls in discover_scanner_classes().items():
+                try:
                     self._scanner_instances[name] = cls(self.config, self.recon, container=self._container)
-            except Exception:
-                pass
+                except Exception as e:
+                    log(f"  [!] Failed to init scanner {name}: {e}", Colors.RED, verbose_only=True, verbose=self.verbose)
 
         self.waf_detected = False
         self.baselines    = BaselineFingerprinter(self.session, self.timeout)
@@ -535,8 +535,11 @@ class VulnScanner:
             inst.waf_detected = self.waf_detected
             inst._prepared = True
         results = inst.scan(target_urls)
-        for f in results:
-            self._add(f)
+        extra   = inst.finalize()
+        for f in results + extra:
+            if f:
+                with self._lock:
+                    self.dedup.add_legacy(f)
         return self._get_findings()
 
     # ── Re-verification Loop (DEPRECATED) ─────────────────────────────
@@ -992,6 +995,8 @@ class VulnScanner:
         Stage 3: Verify evaluation occurred (arithmetic result).
         Stage 4: Attempt safe read-only proof.
         """
+        if result := self._dispatch_to_scanner("ssti", target_urls):
+            return result
         findings: list[dict] = []
         urls = self._urls_with_params() if target_urls is None else target_urls
 
@@ -1631,6 +1636,8 @@ class VulnScanner:
         Args:
             target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
         """
+        if result := self._dispatch_to_scanner("xxe", target_urls):
+            return result
         findings: list[dict] = []
         oob_host = self.config.get("oob_host")
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
@@ -1763,6 +1770,8 @@ class VulnScanner:
         Args:
             target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
         """
+        if result := self._dispatch_to_scanner("cmd_injection", target_urls):
+            return result
         oob_host = self.config.get("oob_host")
         findings: list[dict] = []
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
@@ -2201,13 +2210,15 @@ class VulnScanner:
     # Blind XSS — OOB-Based Stored XSS Detection
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_blind_xss(self) -> list[dict]:
+    def scan_blind_xss(self, target_urls: list[str] | None = None) -> list[dict]:
         """
         Blind / Stored XSS detection via OOB callbacks.
 
         Injects payloads that make outbound requests when executed by a
         victim (stored XSS) and waits for OOB callbacks to confirm execution.
         """
+        if result := self._dispatch_to_scanner("blind_xss"):
+            return result
         oob_host = self.config.get("oob_host")
         if not oob_host:
             log("[!] Blind XSS skipped — provide --oob-host for OOB callback verification", Colors.YELLOW)
@@ -2298,6 +2309,8 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_lfi(self, target_urls: list[str] | None = None) -> list[dict]:
+        if result := self._dispatch_to_scanner("lfi", target_urls):
+            return result
         findings: list[dict] = []
         lfi_payloads = self._load_payloads("lfi")
         raw_urls = self._urls_with_params() if target_urls is None else [u for u in target_urls if "?" in u]
@@ -2347,6 +2360,8 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_open_redirect(self, target_urls: list[str] | None = None) -> list[dict]:
+        if result := self._dispatch_to_scanner("open_redirect", target_urls):
+            return result
         findings: list[dict] = []
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
         for url in urls:
@@ -2394,6 +2409,8 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_csrf(self, target_urls: list[str] | None = None) -> list[dict]:
+        if result := self._dispatch_to_scanner("csrf", target_urls):
+            return result
         findings: list[dict] = []
         forms = self.recon.get("forms", [])
         if target_urls is not None:
@@ -2443,7 +2460,9 @@ class VulnScanner:
     # Directory Fuzzing
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_directory_fuzz(self) -> list[dict]:
+    def scan_directory_fuzz(self, target_urls: list[str] | None = None) -> list[dict]:
+        if result := self._dispatch_to_scanner("dirb"):
+            return result
         findings: list[dict] = []
         urls = self.recon.get("urls", [])
         if not urls:
@@ -2532,7 +2551,9 @@ class VulnScanner:
     # Exposed Files
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_exposed_files(self) -> list[dict]:
+    def scan_exposed_files(self, target_urls: list[str] | None = None) -> list[dict]:
+        if result := self._dispatch_to_scanner("exposed_files"):
+            return result
         findings: list[dict] = []
         target_base = self.config.get("target", "").rstrip("/")
         for exposed_file in EXPOSED_FILES:
@@ -2602,6 +2623,8 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_sensitive_data(self, target_urls: list[str] | None = None) -> list[dict]:
+        if result := self._dispatch_to_scanner("sensitive", target_urls):
+            return result
         from modules.utils import SecretValidator
         findings: list[dict] = []
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
@@ -2675,7 +2698,7 @@ class VulnScanner:
     # Headers
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_headers(self) -> list[dict]:
+    def scan_headers(self, target_urls: list[str] | None = None) -> list[dict]:
         if result := self._dispatch_to_scanner("headers", target_urls):
             return result
 
@@ -2874,7 +2897,9 @@ class VulnScanner:
     # Clickjacking
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_clickjacking(self) -> list[dict]:
+    def scan_clickjacking(self, target_urls: list[str] | None = None) -> list[dict]:
+        if result := self._dispatch_to_scanner("clickjacking"):
+            return result
         findings: list[dict] = []
         target = self.config.get("target", "")
         if not target or not self._in_scope(target):
@@ -2911,6 +2936,8 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_http_methods(self, target_urls: list[str] | None = None) -> list[dict]:
+        if result := self._dispatch_to_scanner("http_methods", target_urls):
+            return result
         findings: list[dict] = []
         targets = target_urls if target_urls else [self.config.get("target", "")]
         for target in targets:
@@ -2949,6 +2976,8 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_insecure_forms(self, target_urls: list[str] | None = None) -> list[dict]:
+        if result := self._dispatch_to_scanner("insecure_forms", target_urls):
+            return result
         findings: list[dict] = []
         forms = self.recon.get("forms", [])
         if target_urls is not None:
@@ -3018,7 +3047,9 @@ class VulnScanner:
     # Subdomain Takeover
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_subdomain_takeover(self) -> list[dict]:
+    def scan_subdomain_takeover(self, target_urls: list[str] | None = None) -> list[dict]:
+        if result := self._dispatch_to_scanner("subdomain_takeover"):
+            return result
         findings: list[dict] = []
         for subdomain in self.recon.get("subdomains", []):
             try:
@@ -3068,6 +3099,8 @@ class VulnScanner:
             target_urls: Optional list of specific URLs. If provided, filters
                         candidates to those matching the given target origin.
         """
+        if result := self._dispatch_to_scanner("rate_limiting", target_urls):
+            return result
         findings: list[dict] = []
 
         # ── STEP 1: Build candidate list ─────────────────────────────────
@@ -3303,7 +3336,9 @@ class VulnScanner:
     # GraphQL
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_graphql(self) -> list[dict]:
+    def scan_graphql(self, target_urls: list[str] | None = None) -> list[dict]:
+        if result := self._dispatch_to_scanner("graphql"):
+            return result
         findings: list[dict] = []
         endpoints = ["/graphql", "/api/graphql", "/nerdgraph/graphql", "/v1/graphql", "/query"]
         introspection_query = {"query": r"{ __schema { types { name } } }"}

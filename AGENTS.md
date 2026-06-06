@@ -19,7 +19,7 @@ Each finding carries a confidence score (0–100), evidence strength (Weak/Moder
 ### Entry point
 
 ```
-main.py                     — CLI arg parsing, orchestration, autosave, --dry-run, --new-scanners
+main.py                     — CLI arg parsing, orchestration, autosave, --dry-run, --legacy-scanners
 modules/
   scanner.py                — Core VulnScanner with scan_* methods, feature-flag dispatchers
   utils.py                  — Finding engine, dedup, OOB, BrowserValidator, helpers
@@ -28,12 +28,29 @@ modules/
   idor.py                   — IdorScanner (subclass of VulnScanner), param-based IDOR
   recon.py                  — Reconnaissance, crawling, subdomain discovery, JS analysis
 scanners/
-  __init__.py               — Exports: ScannerBase, XSSScanner, HeadersScanner, SQLiScanner, SSRFScanner
-  base.py                   — ScannerBase with 5-phase lifecycle (init → prepare → scan → finalize → findings)
-  xss.py                    — XSSScanner(ScannerBase): reflected, stored, DOM, form XSS
-  headers.py                — HeadersScanner(ScannerBase): security header audit
-  sqli.py                   — SQLiScanner(ScannerBase): error-based, boolean, time-based, OOB
-  ssrf.py                   — SSRFScanner(ScannerBase): cloud metadata + OOB callback confirmation
+  __init__.py               — Exports: all 23 ScannerBase subclasses, discover_scanner_classes()
+  base.py                   — ScannerBase with 5-phase lifecycle + finalize() returning list[dict]
+  xss.py                    — XSSScanner: reflected, stored, DOM, form XSS
+  headers.py                — HeadersScanner: security header audit
+  sqli.py                   — SQLiScanner: error-based, boolean, time-based, OOB
+  ssrf.py                   — SSRFScanner: cloud metadata + OOB callback confirmation
+  clickjacking.py           — ClickjackingScanner: framing protection (X-Frame-Options/CSP)
+  csrf.py                   — CSRFScanner: anti-CSRF token validation
+  insecure_forms.py         — InsecureFormsScanner: form action/transport security
+  http_methods.py           — HttpMethodsScanner: HTTP method override/fuzzing
+  lfi.py                    — LFIScanner: path traversal detection with inject_param
+  open_redirect.py          — OpenRedirectScanner: open redirect with inject_param
+  exposed_files.py          — ExposedFilesScanner: common sensitive path probing
+  directory_fuzz.py         — DirectoryFuzzScanner: directory enumeration
+  subdomain_takeover.py     — SubdomainTakeoverScanner: CNAME-based takeover checks
+  sensitive_data.py         — SensitiveDataScanner: secret/key pattern scanning
+  ssti.py                   — SSTIScanner: template injection via inject_param
+  rate_limiting.py          — RateLimitingScanner: burst detection with TimingEvidence
+  blind_xss.py              — BlindXSSScanner: OOB-based blind XSS
+  xxe.py                    — XXEScanner: error/OOB-based XXE
+  command_injection.py      — CommandInjectionScanner: time/OOB-based CMDI
+  graphql.py                — GraphQLScanner: introspection, batching, query depth, auth
+  idor.py                   — IdorScannerAdapter: wraps modules.idor.IdorScanner.run_all()
 models/
   config.py                 — ScanConfig dataclass with use_new_scanners: bool
   finding.py                — Finding class with dict-compat shim, strict __getitem__, content-fingerprinted to_dict()
@@ -72,12 +89,12 @@ f = finding("XSS Reflected", "https://example.com/xss?q=1", "critical",
 
 The `module_map` and `TARGET_LEVEL` sets live in `main.py`'s `run()` function, **not** on `VulnScanner`. There are two tiers:
 
-- **TARGET_LEVEL modules** (run once per target, not per URL): `headers`, `dirb`, `exposed_files`, `clickjacking`, `subdomain_takeover`, `graphql`, `blind_xss`, `js_secrets`, `api`, `openapi`
-- **Per-URL modules** (run for each discovered URL): `xss`, `sqli`, `lfi`, `ssrf`, `xxe`, `ssti`, `cmd_injection`, `open_redirect`, `csrf`, `http_methods`, `insecure_forms`, `idor`, `rate_limiting`
+- **TARGET_LEVEL modules** (run once per target, not per URL): `headers`, `dirb`, `exposed_files`, `clickjacking`, `subdomain_takeover`, `graphql`, `blind_xss`, `http_methods`, `js_secrets`, `api`, `openapi`
+- **Per-URL modules** (run for each discovered URL): `xss`, `sqli`, `lfi`, `ssrf`, `xxe`, `ssti`, `cmd_injection`, `open_redirect`, `csrf`, `insecure_forms`, `idor`, `rate_limiting`
 
-### 2j. New scanner lifecycle (opt-in via --new-scanners)
+### 2j. New scanner lifecycle (default on, opt-out via --legacy-scanners)
 
-Use `--new-scanners` to route certain modules through `scanners/` `ScannerBase` subclasses instead of `modules/scanner.py` inline methods. Currently XSS and Headers have ScannerBase implementations. Each implements a 5-phase lifecycle:
+ScannerBase subclasses are the **default** for 20 modules. Use `--legacy-scanners` to fall back to inline scan methods in `modules/scanner.py`. Currently 20 modules have ScannerBase implementations: xss, sqli, ssrf, ssti, lfi, open_redirect, csrf, headers, clickjacking, http_methods, insecure_forms, exposed_files, dirb, sensitive_data, subdomain_takeover, graphql, blind_xss, xxe, cmd_injection, rate_limiting. Each implements a 5-phase lifecycle:
 
 1. **init** — receives config, recon data, container
 2. **prepare** — load payloads, init state
@@ -140,7 +157,7 @@ HTML reports use `html.escape()` on every user-provided field at render time. Co
 
 | File | Responsibility | Key classes/functions |
 |---|---|---|
-| `main.py` | CLI parsing, orchestration, module_map, TARGET_LEVEL, autosave, `--dry-run`, `--resume`, `--new-scanners` | `parse_args()`, `run()`, `main()` |
+| `main.py` | CLI parsing, orchestration, module_map, TARGET_LEVEL, autosave, `--dry-run`, `--resume`, `--legacy-scanners` | `parse_args()`, `run()`, `main()` |
 | `modules/scanner.py` | All scan methods, `VulnScanner` class, chain analysis, `_add()`, feature-flag dispatchers | `VulnScanner` (scan methods), `chain_analysis()` |
 | `modules/utils.py` | Shared utilities, finding engine, dedup, OOB, BrowserValidator, curl builder, classify, safe HTTP | `finding()`, `_build_curl()`, `BrowserValidator`, `OOBDetectionFramework`, `RateLimiter`, `DeduplicationEngine`, `SecretValidator`, `safe_get()`, `safe_post()` |
 | `modules/reporter.py` | Legacy wrapper — delegates to `reporting/` package, passes container via `**kwargs` | `Reporter` class |
@@ -160,7 +177,7 @@ HTML reports use `html.escape()` on every user-provided field at render time. Co
 | `scanners/headers.py` | Security header audit via ScannerBase | `HeadersScanner(ScannerBase)` |
 | `scanners/sqli.py` | SQLi detection via ScannerBase | `SQLiScanner(ScannerBase)`: error, boolean, time, OOB |
 | `scanners/ssrf.py` | SSRF detection via ScannerBase | `SSRFScanner(ScannerBase)`: cloud metadata + OOB |
-| `models/config.py` | ScanConfig dataclass | `ScanConfig` with `use_new_scanners: bool = False` |
+| `models/config.py` | ScanConfig dataclass | `ScanConfig` with `use_new_scanners: bool = True` |
 | `models/finding.py` | Finding class with dict-compat shim | `Finding` with strict `__getitem__`, content-fingerprinted `to_dict()` |
 | `models/evidence.py` | Evidence type hierarchy (10 subclasses) | `EvidenceBase`, `HttpRequestEvidence`, `BrowserExecutionEvidence`, `ScreenshotEvidence`, `TimingEvidence`, `OOBCallbackEvidence`, `AuthorizationComparisonEvidence`, `GraphQLSchemaEvidence`, `CommandExecutionEvidence`, `ResponseDiffEvidence`, `CompositeEvidence` |
 | `engines/evidence_engine.py` | Evidence storage with SHA-256 content-based dedup | `EvidenceEngine`, `store()`, `get_evidence()` |

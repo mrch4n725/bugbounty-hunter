@@ -75,8 +75,8 @@ def parse_args():
         help="Resume a previous scan from .scan_state.json (skips completed URLs)")
     parser.add_argument("--rps", type=float, default=5.0,
         help="Requests per second (default: 5). Halved on 429, restored after 20 OK.")
-    parser.add_argument("--new-scanners", action="store_true",
-        help="Use new ScannerBase-based scanners (opt-in, experimental). Enables EvidenceEngine, structured evidence types, and 5-phase lifecycle.")
+    parser.add_argument("--legacy-scanners", action="store_false", dest="new_scanners",
+        help="Use legacy inline scan methods instead of ScannerBase subclasses.")
     parser.add_argument("--stealth", action="store_true",
         help="Stealth mode: rotate 20 User-Agent strings, random 0.5-2s delay, shuffle POST params.")
     parser.add_argument("--scope",
@@ -284,7 +284,7 @@ def build_config(args):
         "headless": getattr(args, "headless", False),
         "verify_only": getattr(args, "verify_only", None),
         "resume": getattr(args, "resume", False),
-        "use_new_scanners": getattr(args, "new_scanners", False),
+        "use_new_scanners": getattr(args, "new_scanners", True),
         "dry_run": getattr(args, "dry_run", False),
         "no_mask_curl": getattr(args, "no_mask_curl", False),
         "rps": args.rps,
@@ -401,6 +401,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     TARGET_LEVEL: set[str] = {
         "headers", "dirb", "exposed_files", "clickjacking",
         "subdomain_takeover", "graphql", "blind_xss", "api", "openapi",
+        "http_methods",
     }
 
     if config["passive"]:
