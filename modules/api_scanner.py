@@ -274,7 +274,7 @@ class ApiScanner(VulnScanner):
                     "medium",
                     "GraphQL introspection is enabled and exposes the full schema.",
                     f"Schema exposes {query_count} types with fields",
-                    confidence="confirmed",
+                    verification_stage="validated",
                     request=_build_curl("POST", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                     response_excerpt=resp.text[:500],
                     steps_to_reproduce=[
@@ -479,7 +479,7 @@ class ApiScanner(VulnScanner):
                             "Broken Object Level Authorization (BOLA)",
                             url, "high", details,
                             f"HTTP {resp.status_code} on {method}",
-                            confidence="probable",
+                            verification_stage="validated",
                             request=_build_curl(method, url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                             response_excerpt=resp.text[:500],
                             steps_to_reproduce=[
@@ -550,7 +550,8 @@ class ApiScanner(VulnScanner):
                             "Mass Assignment", url, "high",
                             details,
                             f"Field '{field}' reflected in response: {body_text[:120]}",
-                            confidence="probable",
+                            verification_stage="validated",
+                            parameter=field,
                             request=_build_curl(method, url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                             response_excerpt=resp.text[:500],
                             steps_to_reproduce=[

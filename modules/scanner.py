@@ -574,6 +574,8 @@ class VulnScanner:
                     severity="critical",
                     details="CSRF vulnerabilities allow an attacker to forge requests; combined with stored XSS, this enables silent account takeover without user interaction beyond visiting a page.",
                     evidence=f"Same-origin CSRF ({c['url']}) + XSS ({match['url']})",
+                    request=f"Chain of:\n  CSRF: {_build_curl('GET', c['url'], {})}\n  XSS: {_build_curl('GET', match['url'], {})}",
+                    response_excerpt=f"See individual findings at {c['url']} and {match['url']} for full response context.",
                     verification_stage=VerificationStage.VALIDATED.value,
                     steps_to_reproduce=[
                         f"1. Trigger XSS at {match['url']} to inject CSRF payload",
@@ -596,6 +598,8 @@ class VulnScanner:
                 severity="critical",
                 details="SSRF can be leveraged to probe internal services, access cloud metadata endpoints, or exploit internal-facing RCE (e.g., Jenkins, Hadoop, Consul).",
                 evidence=f"Exploitable SSRF: {len(ssrf)} finding(s)",
+                request=_build_curl("GET", ssrf[0].get("url", ""), {}),
+                response_excerpt=f"SSRF at {ssrf[0].get('url', '')} can reach internal services; full response in individual finding.",
                 verification_stage=VerificationStage.EXPLOITABLE.value,
                 steps_to_reproduce=[
                     f"1. Send crafted request to {ssrf[0].get('url', '')} with SSRF payload",
@@ -621,6 +625,8 @@ class VulnScanner:
                     severity="critical",
                     details="IDOR vulnerabilities allow enumerating user/object identifiers; combined with sensitive data exposure, this enables mass PII harvesting.",
                     evidence=f"Same-origin IDOR ({i['url']}) + Sensitive Data ({match['url']})",
+                    request=f"Chain of:\n  IDOR: {_build_curl('GET', i['url'], {})}\n  Sensitive: {_build_curl('GET', match['url'], {})}",
+                    response_excerpt=f"See individual findings at {i['url']} and {match['url']} for full response context.",
                     verification_stage=VerificationStage.EXPLOITABLE.value,
                     steps_to_reproduce=[
                         f"1. Enumerate IDs at {i['url']} using sequential/predictable patterns",
@@ -1029,6 +1035,7 @@ class VulnScanner:
             request=request_str or _build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
             response_excerpt=response_excerpt_str,
             verification_stage=stage,
+            parameter=param,
             validation_steps=vsteps,
         )
 
@@ -1236,6 +1243,7 @@ class VulnScanner:
             request=request_str or _build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
             response_excerpt=response_excerpt_str,
             verification_stage=stage,
+            parameter=param,
             validation_steps=[f"Signal: {s}" for s in evidence_parts],
         )
         if f:
@@ -1483,17 +1491,19 @@ class VulnScanner:
         # Poll OOB for callbacks
         confirmed_oob = self.oob.poll()
         for entry in confirmed_oob:
+            oob_url = entry.get("url", "")
             f = finding(
                 vuln_type="Confirmed SSRF (OOB)",
-                url=entry.get("url", ""),
+                url=oob_url,
                 severity="critical",
                 details=f"OOB callback received for SSRF probe — DNS/HTTP interaction confirmed from target server",
                 evidence=f"Callback: {entry.get('payload', '')} | Confirmed: DNS/HTTP callback received",
+                request=_build_curl("GET", oob_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                 verification_stage=VerificationStage.VERIFIED.value,
                 validation_steps=["OOB callback verified: DNS/HTTP interaction confirmed from target infrastructure"],
                 response_excerpt="(SSRF confirmed via out-of-band callback — DNS/HTTP request received from target server)",
                 steps_to_reproduce=[
-                    f"Send SSRF probe to {entry.get('url', '')}",
+                    f"Send SSRF probe to {oob_url}",
                     "Observe OOB callback on listener — confirms server makes external requests",
                     "Use SSRF to access internal services or cloud metadata",
                 ],
@@ -1618,17 +1628,19 @@ class VulnScanner:
         # Poll OOB for callbacks
         confirmed_oob = self.oob.poll()
         for entry in confirmed_oob:
+            oob_url = entry.get("url", "")
             f = finding(
                 vuln_type="XML External Entity (XXE) Injection",
-                url=entry.get("url", ""),
+                url=oob_url,
                 severity="critical",
                 details="Blind XXE confirmed via OOB callback — server parsed XML entity and made external request",
                 evidence=f"Callback: {entry.get('payload', '')[:200]}",
+                request=_build_curl("POST", oob_url, dict(self.session.headers), data="(XXE payload with OOB DTD)", cookies=dict(self.session.cookies)),
                 verification_stage=VerificationStage.VERIFIED.value,
                 validation_steps=["OOB callback verified: DNS/HTTP interaction from XML parser"],
                 response_excerpt="(XXE confirmed via out-of-band callback — XML parser made external request)",
                 steps_to_reproduce=[
-                    f"Send XXE payload to {entry.get('url', '')}",
+                    f"Send XXE payload to {oob_url}",
                     "Observe OOB callback — confirms XML external entity processing",
                     "Use XXE to read local files or access internal services",
                 ],
@@ -1678,17 +1690,19 @@ class VulnScanner:
         # Poll OOB for callbacks
         confirmed_oob = self.oob.poll()
         for entry in confirmed_oob:
+            oob_url = entry.get("url", "")
             f = finding(
                 vuln_type="Command Injection",
-                url=entry.get("url", ""),
+                url=oob_url,
                 severity="critical",
                 details="Command injection confirmed via OOB callback — injected command executed on server",
                 evidence=f"Callback: {entry.get('payload', '')[:200]}",
+                request=_build_curl("GET", oob_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                 verification_stage=VerificationStage.VERIFIED.value,
                 validation_steps=["OOB callback verified: DNS/HTTP interaction from injected command"],
                 response_excerpt="(Command injection confirmed via out-of-band callback — server executed injected command)",
                 steps_to_reproduce=[
-                    f"Send command injection payload to {entry.get('url', '')}",
+                    f"Send command injection payload to {oob_url}",
                     "Observe OOB callback — confirms command execution on server",
                     "Use access for remote code execution or data exfiltration",
                 ],
@@ -1815,6 +1829,7 @@ class VulnScanner:
             request=request_str or _build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
             response_excerpt=response_excerpt_str,
             verification_stage=stage,
+            parameter=param,
             validation_steps=[f"Signal: {s}" for s in evidence_parts],
         )
 
@@ -1881,8 +1896,15 @@ class VulnScanner:
                         severity="high",
                         details=f"DOM sink '{df['sink']}' triggered by probe in {url}",
                         evidence=f"Probe: {df['probe']} | Sink: {df['sink']}",
+                        request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                        response_excerpt=df.get("body_snippet", "")[:500],
                         verification_stage=VerificationStage.VERIFIED.value,
                         validation_steps=[f"DOM sink '{df['sink']}' executed probe via Playwright"],
+                        steps_to_reproduce=[
+                            f"Visit {url}",
+                            f"DOM sink '{df['sink']}' executes without sanitization",
+                            "Observe JavaScript execution in browser context",
+                        ],
                     )
                     if f:
                         self._add(f)
@@ -1957,12 +1979,12 @@ class VulnScanner:
                         evidence=f"Payload: {ctx_payload} | Alert: {exec_result.get('alert_fired')} | DOM: {exec_result.get('dom_mutation')}",
                         request=_build_curl("GET", ctx_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=ctx_resp.text[:500],
+                        parameter=param,
                         steps_to_reproduce=[f"Send request to {ctx_url}", f"Observe XSS execution: {ctx_payload[:80]}"],
                         verification_stage=VerificationStage.VERIFIED.value,
                         validation_steps=[
-                            f"Reflection in {context} context detected",
-                            "Playwright browser validation: JS executed",
-                            f"Screenshot: {exec_result.get('screenshot_path', 'N/A')}",
+                            f"Payload reflected in {context} context",
+                            f"Playwright confirmed execution: alert={exec_result.get('alert_fired')}, dom={exec_result.get('dom_mutation')}",
                         ],
                     )
                     if f:
@@ -1979,6 +2001,7 @@ class VulnScanner:
                         evidence=f"Payload: {ctx_payload}",
                         request=_build_curl("GET", ctx_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=ctx_resp.text[:500],
+                        parameter=param,
                         steps_to_reproduce=[f"Send request to {ctx_url}", f"Observe payload reflection: {ctx_payload[:80]}"],
                         verification_stage=VerificationStage.DETECTED.value,
                         validation_steps=[f"Reflection in {context} context detected (no headless browser available for execution verification)"],
@@ -2041,6 +2064,7 @@ class VulnScanner:
                         evidence=f"Payload: {ctx_payload}",
                         request=_build_curl(method, confirm_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=r.text[:500],
+                        parameter=field_name,
                         steps_to_reproduce=[f"Send {method} request to {confirm_url}", f"Observe XSS execution: {ctx_payload[:80]}"],
                         verification_stage=VerificationStage.VERIFIED.value,
                         validation_steps=["Form reflection + Playwright execution verified",
@@ -2060,6 +2084,7 @@ class VulnScanner:
                         evidence=f"Payload: {ctx_payload}",
                         request=_build_curl(method, confirm_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=r.text[:500],
+                        parameter=field_name,
                         steps_to_reproduce=[f"Send {method} request to {confirm_url}", f"Observe payload reflection: {ctx_payload[:80]}"],
                         verification_stage=VerificationStage.DETECTED.value,
                         validation_steps=[f"Reflection in {context} context (unverified execution)"],
@@ -2245,6 +2270,7 @@ class VulnScanner:
                                     evidence=f"Location: {loc[:100]}",
                                     request=_build_curl("GET", test_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                                     response_excerpt=resp.text[:500],
+                                    parameter=param,
                                     steps_to_reproduce=[f"Send request to {test_url}", f"Observe redirect to {loc[:80]}"],
                                     verification_stage=VerificationStage.VALIDATED.value,
                                     validation_steps=[f"Redirect header contains external domain: {loc[:60]}"],
@@ -2607,7 +2633,7 @@ class VulnScanner:
                 url=target,
                 severity="low",
                 details=f"Server header reveals version: {server!r}",
-                evidence="",
+                evidence=f"Server: {server!r}",
                 request=_build_curl("GET", target, dict(self.session.headers), cookies=dict(self.session.cookies)),
                 response_excerpt=resp.text[:500],
                 steps_to_reproduce=[f"Send GET request to {target}", f"Observe server header: {server!r}"],
@@ -2626,7 +2652,7 @@ class VulnScanner:
                     url=target,
                     severity="low",
                     details=f"{header} reveals tech stack: {value!r}",
-                    evidence="",
+                    evidence=f"{header}: {value!r}",
                     request=_build_curl("GET", target, dict(self.session.headers), cookies=dict(self.session.cookies)),
                     response_excerpt=resp.text[:500],
                     steps_to_reproduce=[f"Send GET request to {target}", f"Observe {header} header: {value!r}"],

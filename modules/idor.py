@@ -246,7 +246,8 @@ class IdorScanner(VulnScanner):
                     f"Parameter '{c['param']}' ({c['type']}) returned HTTP 200 "
                     f"for second user with differing content.",
                     f"Second user accessed: {resp_alt.text[:120]}",
-                    confidence="confirmed",
+                    verification_stage="validated",
+                    parameter=c['param'],
                     request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                     response_excerpt=resp_alt.text[:500],
                     steps_to_reproduce=[
@@ -322,6 +323,7 @@ class IdorScanner(VulnScanner):
         resp = safe_get(
             self.session, test_url, self.timeout, raise_for_status=False,
         )
+        from modules.utils import _build_curl
         if not resp:
             return
 
@@ -335,8 +337,9 @@ class IdorScanner(VulnScanner):
                 f"Parameter '{param}' changed from {original_val} to {new_val} "
                 f"and returned accessible content.",
                 f"HTTP {resp.status_code} - Response length: {len(resp.text)}",
-                confidence="confirmed",
-                request=f"GET {test_url}",
+                verification_stage="validated",
+                parameter=param,
+                request=_build_curl("GET", test_url, dict(self.session.headers), cookies=dict(self.session.cookies)) if hasattr(self, 'session') else f"GET {test_url}",
                 response_excerpt=resp.text[:500],
                 steps_to_reproduce=[
                     f"Send GET request to {test_url} with parameter '{param}'={new_val}",
@@ -373,8 +376,9 @@ class IdorScanner(VulnScanner):
                 f"Form field '{field_name}' changed from {original_val} to {new_val} "
                 f"and returned accessible content.",
                 f"HTTP {resp.status_code}",
-                confidence="confirmed",
-                request=f"{method} {action}",
+                verification_stage="validated",
+                parameter=field_name,
+                request=_build_curl(method, action, dict(self.session.headers), cookies=dict(self.session.cookies)) if hasattr(self, 'session') else f"{method} {action}",
                 response_excerpt=resp.text[:500],
                 steps_to_reproduce=[
                     f"Submit {method} request to {action} with form field '{field_name}'={new_val}",

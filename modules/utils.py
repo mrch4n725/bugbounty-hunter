@@ -1455,7 +1455,7 @@ def finding(
         "parameter": parameter or "",
         "request": request or "",
         "response_excerpt": response_excerpt or "",
-        "steps_to_reproduce": steps_to_reproduce or [],
+        "steps_to_reproduce": steps_to_reproduce or validation_steps or [],
     }
 
     for key in (
