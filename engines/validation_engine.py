@@ -31,30 +31,55 @@ class ValidationEngine:
     - Phase 3: scanners call directly (inline OOB/browser calls removed from scanner.py)
     """
 
-    def __init__(self, config: ScanConfig | dict[str, Any]):
+    def __init__(
+        self,
+        config: ScanConfig | dict[str, Any],
+        capabilities: Any | None = None,
+    ):
         self.config = config
-        self._oob = OOBDetectionFramework(config if isinstance(config, dict) else config.to_dict())
-        self._browser = BrowserValidator(config if isinstance(config, dict) else config.to_dict())
+        self._capabilities = capabilities
+        cfg_dict = config if isinstance(config, dict) else config.to_dict()
+
+        if capabilities and not capabilities.has("oob_validation"):
+            self._oob = None
+        else:
+            self._oob = OOBDetectionFramework(cfg_dict)
+
+        if capabilities and not capabilities.browser_validation:
+            self._browser = None
+        else:
+            self._browser = BrowserValidator(cfg_dict)
+
         self._lock = threading.Lock()
 
     # ── OOB Confirmation ─────────────────────────────────────────────────
 
     @property
     def callback_host(self) -> str:
+        if self._oob is None:
+            return ""
         return self._oob.callback_host
 
     @property
     def callback_url(self) -> str:
+        if self._oob is None:
+            return ""
         return self._oob.callback_url
 
     def generate_oob_payload(self, placeholder: str = "{oob}") -> str:
+        if self._oob is None:
+            return ""
         return self._oob.generate_payload(placeholder)
 
     def register_oob(self, vuln_type: str, payload: str, url: str) -> None:
+        if self._oob is None:
+            return
         self._oob.register_interaction(vuln_type, payload, url)
 
     def poll_oob(self, timeout: float = 5.0) -> list[OOBCallbackEvidence]:
         """Poll for OOB callbacks and return structured evidence."""
+        if self._oob is None:
+            return []
         confirmed = self._oob.poll(timeout=timeout)
         results: list[OOBCallbackEvidence] = []
         for entry in confirmed:
@@ -90,6 +115,8 @@ class ValidationEngine:
         screenshot_dir: str | None = None,
     ) -> BrowserExecutionEvidence | None:
         """Validate XSS execution in headless browser. Returns evidence or None."""
+        if self._browser is None:
+            return None
         result = self._browser.check_xss_execution(
             url=url,
             payload=payload,
@@ -111,6 +138,8 @@ class ValidationEngine:
 
     def scan_dom_xss(self, url: str, probes: list[str]) -> list[BrowserExecutionEvidence]:
         """Scan for DOM-based XSS sinks. Returns list of evidence per sink."""
+        if self._browser is None:
+            return []
         raw = self._browser.scan_dom_xss(url, probes)
         results: list[BrowserExecutionEvidence] = []
         for r in raw:
@@ -125,7 +154,8 @@ class ValidationEngine:
         return results
 
     def close_browser(self) -> None:
-        self._browser.close()
+        if self._browser is not None:
+            self._browser.close()
 
     # ── Timing Verification ──────────────────────────────────────────────
 
@@ -281,7 +311,8 @@ class ValidationEngine:
 
     def cleanup(self) -> None:
         self.close_browser()
-        self._oob.clear()
+        if self._oob is not None:
+            self._oob.clear()
 
 
 # ── Utility ──────────────────────────────────────────────────────────────────

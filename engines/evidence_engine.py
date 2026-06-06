@@ -12,7 +12,9 @@ class EvidenceEngine:
     and exports structured evidence for reports and resume.
     """
 
-    def __init__(self):
+    def __init__(self, config: Any | None = None, capabilities: Any | None = None):
+        self.config = config or {}
+        self.capabilities = capabilities
         self._lock = threading.Lock()
         self._store: dict[str, list[EvidenceBase]] = {}
         self._fingerprints: dict[str, EvidenceBase] = {}

@@ -22,11 +22,13 @@ from modules.reporter import Reporter
 from modules.js_intelligence import JSIntelligence
 from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score, prioritize_findings, reset_seen_findings, _build_curl, set_mask_sensitive_default
 from models.finding import Finding
+from app.bootstrap import bootstrap, auto_upgrade_config, print_startup_summary
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="BugBounty Hunter - Automated vulnerability detector",
+        description="BugBounty Hunter - Automated vulnerability detector\n"
+                    "  bugbounty-hunter scan https://target.com   (preferred CLI)",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("--config", "-C", help="Path to YAML configuration file")
@@ -319,11 +321,11 @@ def _should_run_recon(config: dict, run_all: bool, disabled_modules: set) -> boo
     )
 
 
-def _run_recon_if_needed(config: dict, run_recon: bool):
+def _run_recon_if_needed(config: dict, run_recon: bool, container=None):
     if not run_recon:
         return None, {"urls": [config["target"]], "subdomains": [], "forms": [], "js_urls": [], "authenticated": False}
     log("[*] Starting Recon...", Colors.YELLOW)
-    recon = Recon(config)
+    recon = Recon(config, container=container)
     recon_data = recon.run()
     if not recon.authenticated:
         print("[!] Scanning unauthenticated. Pass --cookies or --headers for full coverage of authenticated attack surface.")
@@ -332,7 +334,7 @@ def _run_recon_if_needed(config: dict, run_recon: bool):
     return recon, recon_data
 
 
-def _start_autosave(config, recon_data, all_findings, all_findings_lock, js_data=None):
+def _start_autosave(config, recon_data, all_findings, all_findings_lock, js_data=None, container=None):
     interval = config.get("autosave_interval", 0)
     stop_event = threading.Event()
     _js_data = js_data or {}
@@ -355,7 +357,7 @@ def _start_autosave(config, recon_data, all_findings, all_findings_lock, js_data
             with all_findings_lock:
                 snapshot = list(all_findings)
             try:
-                reporter = Reporter(config, snapshot, recon_data, js_data=_js_data)
+                reporter = Reporter(config, snapshot, recon_data, js_data=_js_data, container=container)
                 reporter.generate(suffix="partial")
                 log(f"[✓] Interim report autosaved", Colors.GREEN)
             except Exception as e:
@@ -384,7 +386,7 @@ def _collect_module_findings(modules, config, run_all, disabled_modules, all_fin
             log(f"[+] {mod_name.upper()} — nothing found", Colors.GREEN)
 
 
-def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, lock):
+def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, lock, container=None):
     # ── TARGET_LEVEL: modules that run once per target, not per URL ──
     TARGET_LEVEL: set[str] = {
         "headers", "dirb", "exposed_files", "clickjacking",
@@ -393,12 +395,12 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
 
     if config["passive"]:
         log("[*] Passive mode — skipping active fuzzing.", Colors.YELLOW)
-        scanner = VulnScanner(config, recon_data)
+        scanner = VulnScanner(config, recon_data, container=container)
         modules = {"headers": scanner.scan_headers}
         _collect_module_findings(modules, config, run_all, disabled_modules, all_findings, lock)
         return
 
-    scanner = VulnScanner(config, recon_data)
+    scanner = VulnScanner(config, recon_data, container=container)
     all_findings_local: list[dict] = []
 
     # ── Step 1: Build module map (same keys as original _active_module_map) ──
@@ -422,9 +424,9 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         "rate_limiting": scanner.scan_rate_limiting,
         "openapi": scanner.scan_openapi,
     }
-    _api_scanner = ApiScanner(scanner.config, scanner.recon)
+    _api_scanner = ApiScanner(scanner.config, scanner.recon, container=container)
     module_map["api"] = _api_scanner.run_all
-    _idor_scanner = IdorScanner(scanner.config, scanner.recon)
+    _idor_scanner = IdorScanner(scanner.config, scanner.recon, container=container)
     module_map["idor"] = _idor_scanner.run_all
     module_map["idor_path"] = scanner.scan_idor
 
@@ -554,11 +556,10 @@ def _findings_to_finding(config, all_findings, recon_data, js_data):
     return converted
 
 
-def _write_report_and_summary(config, all_findings, recon_data, js_data=None) -> int:
-    # Adapt legacy dict findings to canonical Finding instances
+def _write_report_and_summary(config, all_findings, recon_data, js_data=None, container=None) -> int:
     adapted = _findings_to_finding(config, all_findings, recon_data, js_data)
     try:
-        report_path = Reporter(config, adapted, recon_data, js_data=js_data).generate()
+        report_path = Reporter(config, adapted, recon_data, js_data=js_data, container=container).generate()
         log(f"\n[✓] Report saved → {report_path}", Colors.GREEN)
     except Exception as e:
         log(f"\n[✗] Failed to save report: {e}", Colors.RED)
@@ -603,6 +604,12 @@ def main():
 
     config = build_config(args)
     set_mask_sensitive_default(not config.get("no_mask_curl", False))
+
+    # ── Capability-driven startup ────────────────────────────────────────
+    capabilities, container = bootstrap(config)
+    config = auto_upgrade_config(config, capabilities)
+    print_startup_summary(capabilities)
+
     verify_path = config.get("verify_only")
     if verify_path:
         log(f"[*] Verify-only mode: re-checking findings from {verify_path}", Colors.CYAN)
@@ -627,7 +634,7 @@ def main():
     run_all = "all" in config["modules"]
     disabled_modules = set(config.get("disable_modules", []))
     recon, recon_data = _run_recon_if_needed(
-        config, _should_run_recon(config, run_all, disabled_modules)
+        config, _should_run_recon(config, run_all, disabled_modules), container=container
     )
 
     # ── JS Intelligence scan ─────────────────────────────────────────────
@@ -643,7 +650,7 @@ def main():
     js_findings: list[dict] = []
     if run_js:
         log("[*] Running JS Intelligence scan...", Colors.YELLOW)
-        js_intel = JSIntelligence(base_url=config["target"], config=config)
+        js_intel = JSIntelligence(base_url=config["target"], config=config, container=container)
         js_session = make_session(config)
         max_js = config.get("max_js_files", 50)
         urls_to_scan = js_urls[:max_js]
@@ -722,10 +729,10 @@ def main():
 
     all_findings_lock = threading.Lock()
     stop_autosave, autosave_thread = _start_autosave(
-        config, recon_data, all_findings, all_findings_lock, js_data=js_data
+        config, recon_data, all_findings, all_findings_lock, js_data=js_data, container=container
     )
     try:
-        _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, all_findings_lock)
+        _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, all_findings_lock, container=container)
     except KeyboardInterrupt:
         log("\n[!] Scan interrupted — saving partial report...", Colors.YELLOW)
 
@@ -735,7 +742,7 @@ def main():
     if autosave_thread:
         stop_autosave.set()
         autosave_thread.join(timeout=2)
-    return _write_report_and_summary(config, all_findings, recon_data, js_data=js_data)
+    return _write_report_and_summary(config, all_findings, recon_data, js_data=js_data, container=container)
 
 
 if __name__ == "__main__":

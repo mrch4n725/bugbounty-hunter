@@ -19,9 +19,9 @@ from modules.utils import SecretValidator
 # Regex fallback is used automatically when esprima is absent.
 try:
     import esprima
-    ESPRIMA_AVAILABLE = True
+    _ESPRIMA_AVAILABLE = True
 except ImportError:
-    ESPRIMA_AVAILABLE = False
+    _ESPRIMA_AVAILABLE = False
 
 
 SECRET_SEVERITY = {
@@ -154,12 +154,15 @@ class JSIntelligence:
     Supports deduplication, same-domain filtering, file size limits, and thread-safe operation.
     """
 
-    def __init__(self, base_url: str = "", config: Optional[Dict[str, Any]] = None):
+    def __init__(self, base_url: str = "", config: Optional[Dict[str, Any]] = None, container=None):
         self.base_url = base_url.rstrip("/")
-        self._ast_available = ESPRIMA_AVAILABLE
         self._config = config or {}
         self._lock = threading.Lock()
         self._seen_fingerprints: Set[str] = set()
+        if container and container.capabilities:
+            self._ast_available = container.capabilities.has("esprima")
+        else:
+            self._ast_available = _ESPRIMA_AVAILABLE
 
     def _fingerprint(self, secret_type: str, value: str) -> str:
         return hashlib.sha256(f"{secret_type}:{value}".encode()).hexdigest()

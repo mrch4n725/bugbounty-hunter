@@ -13,9 +13,9 @@ from modules.utils import make_session, safe_get, same_domain, log, Colors, url_
 
 try:
     from playwright.sync_api import sync_playwright
-    PLAYWRIGHT_AVAILABLE = True
+    _PLAYWRIGHT_AVAILABLE = True
 except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
+    _PLAYWRIGHT_AVAILABLE = False
 
 # Regex patterns to discover API endpoints inside JavaScript source code
 JS_API_PATTERNS = [
@@ -61,11 +61,12 @@ class Recon:
         'email', 'smtp', 'pop', 'ns', 'mx', 'dns', 'db', 'database'
     ]
     
-    def __init__(self, config):
+    def __init__(self, config, container=None):
         """
         Initialize the Recon module.
         """
         self.config = config
+        self.container = container
         self.target = config.get('target')
         self.threads = config.get('threads', 5)
         self.timeout = config.get('timeout', 10)
@@ -74,7 +75,14 @@ class Recon:
         self.request_delay = config.get('delay', 0.0)
         self.max_urls = config.get('max_urls', 250)
         self.headless = config.get('headless', False)
-        if self.headless and not PLAYWRIGHT_AVAILABLE:
+
+        # Query capabilities from container or fall back to module-level flag
+        if container and container.capabilities:
+            self._playwright_available = container.capabilities.has("playwright")
+        else:
+            self._playwright_available = _PLAYWRIGHT_AVAILABLE
+
+        if self.headless and not self._playwright_available:
             log("--headless requires playwright. Install: pip install playwright && python -m playwright install chromium", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
             self.headless = False
         
@@ -517,7 +525,7 @@ class Recon:
     def _crawl_headless(self) -> None:
         """Crawl with Playwright: intercept XHR/fetch, click interactive
         elements, and extract JS endpoints from bundled source."""
-        if not PLAYWRIGHT_AVAILABLE:
+        if not self._playwright_available:
             return
         log("[*] Headless crawl started (Playwright) …", Colors.CYAN, verbose_only=True, verbose=self.verbose)
         visited = set()

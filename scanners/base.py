@@ -62,9 +62,10 @@ class ScannerBase:
     SCANNER_NAME = "base"
     SCANNER_MATURITY = 1  # 1-5: Detection only → Verified
 
-    def __init__(self, config: dict, recon: dict):
+    def __init__(self, config: dict, recon: dict, container=None):
         self.config = config
         self.recon = recon
+        self.container = container
         self.timeout = config.get("timeout", 10)
         self.threads = config.get("threads", 10)
         self.verbose = config.get("verbose", False)
@@ -73,8 +74,12 @@ class ScannerBase:
 
         self._lock = threading.Lock()
         self.dedup = DeduplicationEngine()
-        self.validation = ValidationEngine(config)
-        self.evidence_engine = EvidenceEngine()
+        if container:
+            self.validation = container.validation_engine
+            self.evidence_engine = container.evidence_engine
+        else:
+            self.validation = ValidationEngine(config)
+            self.evidence_engine = EvidenceEngine()
 
         self.waf_detected = False
         self._prepared = False

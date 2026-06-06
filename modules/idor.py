@@ -65,8 +65,8 @@ SEQUENTIAL_DELTAS = [-1, 1, -100, 100]
 class IdorScanner(VulnScanner):
     """Scanner for Insecure Direct Object Reference vulnerabilities."""
 
-    def __init__(self, config: dict, recon_data: dict):
-        super().__init__(config, recon_data)
+    def __init__(self, config: dict, recon_data: dict, container=None):
+        super().__init__(config, recon_data, container=container)
         self.cookies_alt: Optional[dict] = self._parse_cookies_alt()
         self.session_alt: Any = None
         if self.cookies_alt:

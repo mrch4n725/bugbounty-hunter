@@ -29,13 +29,6 @@ from modules.utils import (
 )
 from engines import ValidationEngine, EvidenceEngine
 
-try:
-    from playwright.sync_api import sync_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-
-
 # ── Payloads ──────────────────────────────────────────────────────────────────
 
 XSS_PAYLOADS = [
@@ -453,9 +446,10 @@ CLICKJACKING_SAFE_DIRECTIVES = [
 # ── Scanner class ─────────────────────────────────────────────────────────────
 
 class VulnScanner:
-    def __init__(self, config: dict, recon_data: dict):
+    def __init__(self, config: dict, recon_data: dict, container=None):
         self.config    = config
         self.recon     = recon_data
+        self.container = container
         self.timeout   = config.get("timeout", 10)
         self.threads   = config.get("threads", 10)
         self.verbose   = config.get("verbose", False)
@@ -464,12 +458,21 @@ class VulnScanner:
         self.findings  : list[dict] = []
         self._lock     = threading.Lock()
         self.dedup     = DeduplicationEngine()
-        self.oob       = OOBDetectionFramework(config)
-        self.browser   = BrowserValidator(config)
 
-        # Phase 2: centralized validation and evidence engines
-        self.validation = ValidationEngine(config)
-        self.evidence   = EvidenceEngine()
+        if container:
+            self.validation = container.validation_engine
+            self.evidence   = container.evidence_engine
+            self.oob        = (container.oob_framework
+                               if container.oob_framework
+                               else OOBDetectionFramework(config))
+            self.browser    = (container.browser_validator
+                               if container.browser_validator
+                               else BrowserValidator(config))
+        else:
+            self.oob       = OOBDetectionFramework(config)
+            self.browser   = BrowserValidator(config)
+            self.validation = ValidationEngine(config)
+            self.evidence   = EvidenceEngine()
 
         # Phase 3: new scanner delegates (scanners/ package)
         self._use_new_scanners = config.get("use_new_scanners", False)

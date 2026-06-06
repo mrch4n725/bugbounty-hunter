@@ -35,11 +35,13 @@ class Reporter:
     SEVERITY_ORDER = ReporterBase.SEVERITY_ORDER
 
     def __init__(self, config: Dict[str, Any], findings: List[Dict[str, Any]],
-                 recon_data: Dict[str, Any], js_data: Optional[Dict[str, Any]] = None):
+                 recon_data: Dict[str, Any], js_data: Optional[Dict[str, Any]] = None,
+                 container=None):
         self.config = config
         self.findings = findings
         self.recon_data = recon_data or {}
         self.js_data = js_data or {}
+        self.container = container
         self.target = config.get('target', 'target')
         self.timestamp = config.get('timestamp', ReporterBase(
             config, findings, recon_data, js_data

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "bugbounty-hunter"
+version = "0.2.0"
+description = "A high-discovery vulnerability scanner with first-class validation and evidence generation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "mrch4n725"},
+]
+
+[project.scripts]
+bugbounty-hunter = "cli:main"
+
+[tool.setuptools.packages.find]
+include = [
+    "app*",
+    "engines*",
+    "models*",
+    "modules*",
+    "reporting*",
+    "scanners*",
+]

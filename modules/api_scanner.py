@@ -82,8 +82,8 @@ BATCH_SIZE = 100
 class ApiScanner(VulnScanner):
     """Vulnerability scanner targeting REST and GraphQL APIs."""
 
-    def __init__(self, config: dict, recon_data: dict):
-        super().__init__(config, recon_data)
+    def __init__(self, config: dict, recon_data: dict, container=None):
+        super().__init__(config, recon_data, container=container)
         self.role_sessions = build_role_sessions(config, base_session=self.session)
         self.current_role = config.get("role", None) or "default"
 
