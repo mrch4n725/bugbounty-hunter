@@ -6,7 +6,9 @@ This document is written for AI coding agents and human contributors. It capture
 
 ## 1. Project Overview
 
-BugBounty Hunter is a modular, multithreaded web vulnerability scanner with **evidence-based verification**. Findings progress through stages:
+BugBounty Hunter is a **high-discovery vulnerability scanner with first-class validation and evidence generation**. It does not choose between being a scanner or a reporting platform — it is both. The project aims to discover the maximum number of real vulnerabilities while automatically validating, documenting, and packaging findings into high-quality reports suitable for rapid triage and responsible disclosure.
+
+Findings progress through stages:
 
 ```
 Detected → Validated → Exploitable → Verified

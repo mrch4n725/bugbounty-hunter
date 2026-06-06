@@ -2,7 +2,7 @@
 
 # BugBounty Hunter
 
-**Automated web reconnaissance and vulnerability scanning for bug bounty programs — with evidence-based verification and submission-ready reporting**
+**A high-discovery vulnerability scanner with first-class validation and evidence generation — built to find real vulnerabilities, automatically validate them, and package the results into submission-ready reports.**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
@@ -44,7 +44,9 @@
 
 ## Overview
 
-BugBounty Hunter is a modular, multithreaded web vulnerability scanner designed for **bug bounty programs**. It combines reconnaissance, intelligence-led module selection, and multi-signal verification to produce findings that are ready for submission to HackerOne, Bugcrowd, or any bug bounty platform.
+BugBounty Hunter is a **high-discovery vulnerability scanner with first-class validation and evidence generation**. It does not force you to choose between a scanner and a reporting platform — it is both. The goal is to discover the maximum number of real vulnerabilities while automatically validating, documenting, and packaging findings into high-quality reports suitable for rapid triage and responsible disclosure.
+
+It combines multithreaded reconnaissance, intelligence-led module selection, and multi-signal verification to produce findings that are ready for submission to HackerOne, Bugcrowd, or any bug bounty program — complete with curl reproduction commands, response excerpts, CVSS vectors, impact assessments, and step-by-step reproduction instructions.
 
 Key capabilities:
 
