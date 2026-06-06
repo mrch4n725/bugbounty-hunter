@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -29,22 +30,43 @@ CVSS_VECTORS: Dict[str, str] = {
 # ── Impact assessment matrix ────────────────────────────────────────────────────
 # Maps vulnerability type → (data_exposure, ato_potential, rce_potential, biz_impact_desc)
 IMPACT_MATRIX: Dict[str, tuple] = {
-    "xss":             (2, 5, 0, "Account takeover via session theft, phishing, or UI redressing"),
-    "sqli":            (5, 4, 2, "Full database exfiltration, authentication bypass, data integrity loss"),
-    "lfi":             (4, 0, 0, "Source code disclosure, credential leak, path traversal data access"),
-    "ssrf":            (4, 0, 4, "Internal network scanning, cloud metadata access, pivot to internal services"),
-    "xxe":             (5, 0, 3, "File disclosure, SSRF pivot, denial of service, data exfiltration"),
-    "cmd_injection":   (5, 5, 5, "Full server compromise, lateral movement, data destruction or exfiltration"),
-    "blind_xss":       (2, 4, 0, "Session hijacking of privileged users, admin panel compromise"),
-    "open_redirect":   (0, 2, 0, "Phishing, Bypassing URL allowlists, OAuth token theft"),
-    "csrf":            (0, 3, 0, "State-changing actions on behalf of authenticated users"),
-    "idor":            (5, 3, 0, "Unauthorized access to other users' private data, privilege escalation"),
-    "graphql":         (4, 2, 1, "Data disclosure via introspection, batch attacks, query depth abuse"),
-    "sensitive_data":  (5, 0, 0, "Secrets in source/response enable lateral attacks, cloud compromise"),
-    "headers":         (0, 0, 0, "Increased attack surface, missing clickjacking/HSTS protection"),
-    "clickjacking":    (0, 0, 0, "UI redressing, mouse-jacking — chained with XSS for account takeover"),
+    "xss":               (2, 5, 0, "Account takeover via session theft, phishing, or UI redressing"),
+    "reflected xss":     (2, 5, 0, "Session theft, phishing via reflected payload in URL"),
+    "confirmed xss":     (2, 5, 0, "Verified script execution in victim browser context"),
+    "dom xss":           (2, 5, 0, "Client-side sink injection able to bypass WAF filters"),
+    "sqli":              (5, 4, 2, "Full database exfiltration, authentication bypass, data integrity loss"),
+    "sql injection":     (5, 4, 2, "Full database exfiltration, authentication bypass, data integrity loss"),
+    "confirmed sqli":    (5, 4, 2, "OOB-confirmed SQL injection with data exfiltration capability"),
+    "lfi":               (4, 0, 0, "Source code disclosure, credential leak, path traversal data access"),
+    "ssrf":              (4, 0, 4, "Internal network scanning, cloud metadata access, pivot to internal services"),
+    "confirmed ssrf":    (4, 0, 4, "OOB-confirmed SSRF — cloud metadata access or callback received"),
+    "xxe":               (5, 0, 3, "File disclosure, SSRF pivot, denial of service, data exfiltration"),
+    "ssti":              (4, 0, 2, "Server-side template injection leading to RCE or data access"),
+    "cmd_injection":     (5, 5, 5, "Full server compromise, lateral movement, data destruction or exfiltration"),
+    "command injection": (5, 5, 5, "Full server compromise, lateral movement, data destruction or exfiltration"),
+    "blind_xss":         (2, 4, 0, "Session hijacking of privileged users, admin panel compromise"),
+    "open_redirect":     (0, 2, 0, "Phishing, Bypassing URL allowlists, OAuth token theft"),
+    "csrf":              (0, 3, 0, "State-changing actions on behalf of authenticated users"),
+    "idor":              (5, 3, 0, "Unauthorized access to other users' private data, privilege escalation"),
+    "graphql":           (4, 2, 1, "Data disclosure via introspection, batch attacks, query depth abuse"),
+    "sensitive_data":    (5, 0, 0, "Secrets in source/response enable lateral attacks, cloud compromise"),
+    "sensitive data":    (5, 0, 0, "Secrets in source/response enable lateral attacks, cloud compromise"),
+    "exposed js secret": (4, 0, 0, "Hardcoded API keys, tokens, or credentials in client-side source"),
+    "headers":           (0, 0, 0, "Increased attack surface, missing clickjacking/HSTS protection"),
+    "clickjacking":      (0, 0, 0, "UI redressing, mouse-jacking — chained with XSS for account takeover"),
     "subdomain_takeover": (0, 2, 0, "Brand impersonation, phishing, credential harvesting"),
-    "command_injection": (5, 5, 5, "Full server compromise, lateral movement, data destruction or exfiltration"),
+    "http_methods":      (0, 0, 1, "Unrestricted HTTP methods allow file upload or endpoint tampering"),
+    "insecure_forms":    (0, 1, 0, "Forms submitted over HTTP allowing MITM data interception"),
+    "exposed_files":     (4, 0, 0, "Sensitive config files, .env, .git, or backups exposed publicly"),
+    "rate_limiting":     (0, 0, 0, "No rate limiting enables brute force, credential stuffing, or DoS"),
+    "api":               (3, 1, 1, "API misconfiguration enables data leak, mass assignment, or BOLA"),
+    "bola":              (5, 3, 0, "Broken Object Level Authorization — unauthorized object access"),
+    "mass assignment":   (2, 1, 0, "Mass assignment enables privilege escalation via extra fields"),
+    "potential idor":    (3, 2, 0, "IDOR via parameter tampering returns accessible resource"),
+    "missing security header": (0, 0, 0, "Missing headers increase attack surface for common web attacks"),
+    "weak csp":          (0, 0, 0, "Permissive Content-Security-Policy weakens XSS protections"),
+    "insecure cookie":   (0, 0, 0, "Cookies missing Secure/HttpOnly/SameSite flags"),
+    "server disclosure": (0, 0, 0, "Server header reveals software versions aiding targeted attacks"),
 }
 
 IMPACT_VULN_EXAMPLES: Dict[str, str] = {
@@ -75,11 +97,18 @@ def assess_finding_impact(finding: Dict[str, Any]) -> Dict[str, Any]:
     sev = finding.get("severity", "info").lower()
 
     matrix_entry = None
-    # best-match vuln type
+    # best-match vuln type — try full title first, then first few words
     for key in IMPACT_MATRIX:
-        if key in title or title.startswith(key):
+        if title.startswith(key) or key in title:
             matrix_entry = IMPACT_MATRIX[key]
             break
+    # Also check by finding type field
+    if not matrix_entry:
+        finding_type = (finding.get("type") or "").lower()
+        for key in IMPACT_MATRIX:
+            if finding_type.startswith(key) or key in finding_type:
+                matrix_entry = IMPACT_MATRIX[key]
+                break
     if not matrix_entry:
         # fallback by severity
         data_exp, ato, rce = {
@@ -146,6 +175,148 @@ class Reporter:
         'low': 3,
         'info': 4
     }
+
+    # Inline CSS for HTML report
+    REPORT_CSS = """
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg: #0f0f0f;
+            --surface: #1e1e1e;
+            --surface2: #2a2a2a;
+            --text: #e0e0e0;
+            --text2: #999;
+            --border: #333;
+            --critical: #e74c3c;
+            --high: #e67e22;
+            --medium: #f1c40f;
+            --low: #3498db;
+            --info: #95a5a6;
+            --confirmed: #2ecc71;
+        }
+        .light {
+            --bg: #f5f5f5;
+            --surface: #ffffff;
+            --surface2: #f0f0f0;
+            --text: #222;
+            --text2: #666;
+            --border: #ddd;
+        }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            line-height: 1.6;
+            padding: 20px;
+            transition: background .3s, color .3s;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header { text-align: center; margin-bottom: 40px; border-bottom: 2px solid var(--border); padding-bottom: 20px; }
+        header h1 { font-size: 2.2em; color: var(--text); }
+        .timestamp { color: var(--text2); font-size: .9em; }
+
+        .top-bar { display: flex; justify-content: flex-end; gap: 10px; margin-bottom: 20px; }
+        .theme-btn {
+            background: var(--surface2); color: var(--text); border: 1px solid var(--border);
+            padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: .85em;
+        }
+        .theme-btn:hover { opacity: .8; }
+
+        .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; margin-bottom: 40px; }
+        .stat-card {
+            background: var(--surface); border-radius: 8px; padding: 16px; text-align: center;
+            box-shadow: 0 2px 8px rgba(0,0,0,.2); border-top: 4px solid var(--border);
+        }
+        .stat-card .val { font-size: 2em; font-weight: 700; }
+        .stat-card .lbl { font-size: .8em; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; }
+        .stat-card.crit { border-top-color: var(--critical); } .stat-card.crit .val { color: var(--critical); }
+        .stat-card.high { border-top-color: var(--high); } .stat-card.high .val { color: var(--high); }
+        .stat-card.med { border-top-color: var(--medium); } .stat-card.med .val { color: var(--medium); }
+        .stat-card.low { border-top-color: var(--low); } .stat-card.low .val { color: var(--low); }
+        .stat-card.info { border-top-color: var(--info); } .stat-card.info .val { color: var(--info); }
+        .stat-card.conf { border-top-color: var(--confirmed); } .stat-card.conf .val { color: var(--confirmed); }
+        .stat-card.exploit { border-top-color: #9b59b6; } .stat-card.exploit .val { color: #9b59b6; }
+        .stat-card.detect { border-top-color: #e74c3c; } .stat-card.detect .val { color: #e74c3c; }
+        .stat-card.valid { border-top-color: #f39c12; } .stat-card.valid .val { color: #f39c12; }
+
+        .chart-row { display: flex; gap: 20px; margin-bottom: 40px; flex-wrap: wrap; }
+        .chart-box {
+            background: var(--surface); border-radius: 8px; padding: 20px; flex: 1; min-width: 280px;
+            box-shadow: 0 2px 8px rgba(0,0,0,.2); position: relative; height: 300px;
+        }
+        .chart-box canvas { max-height: 240px; }
+
+        section { margin-bottom: 40px; background: var(--surface); padding: 24px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+        section h2 { font-size: 1.5em; margin-bottom: 16px; border-bottom: 2px solid var(--border); padding-bottom: 8px; }
+
+        .filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+        .filter-btn {
+            background: var(--surface2); color: var(--text2); border: 1px solid var(--border);
+            padding: 6px 14px; border-radius: 20px; cursor: pointer; font-size: .8em; transition: all .2s;
+        }
+        .filter-btn:hover { opacity: .8; }
+        .filter-btn.active { background: var(--border); color: var(--text); border-color: var(--text2); }
+
+        .finding-card {
+            background: var(--surface2); border-radius: 6px; margin-bottom: 12px;
+            border-left: 4px solid var(--border); overflow: hidden;
+        }
+        .finding-card.critical { border-left-color: var(--critical); }
+        .finding-card.high { border-left-color: var(--high); }
+        .finding-card.medium { border-left-color: var(--medium); }
+        .finding-card.low { border-left-color: var(--low); }
+        .finding-card.info { border-left-color: var(--info); }
+
+        .finding-header {
+            padding: 14px 16px; cursor: pointer; display: flex; align-items: center;
+            justify-content: space-between; flex-wrap: wrap; gap: 8px;
+        }
+        .finding-header:hover { background: rgba(255,255,255,.03); }
+        .finding-title { font-weight: 600; font-size: .95em; flex: 1; min-width: 160px; }
+        .finding-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .sev-badge {
+            display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: .75em;
+            font-weight: 700; text-transform: uppercase;
+        }
+        .sev-critical { background: var(--critical); color: #fff; }
+        .sev-high { background: var(--high); color: #fff; }
+        .sev-medium { background: var(--medium); color: #000; }
+        .sev-low { background: var(--low); color: #fff; }
+        .sev-info { background: var(--info); color: #fff; }
+        .conf-badge { padding: 2px 8px; border-radius: 10px; font-size: .75em; font-weight: 600; }
+        .conf-high { background: #2ecc71; color: #fff; }
+        .conf-mid { background: #f39c12; color: #000; }
+        .conf-low { background: #e74c3c; color: #fff; }
+        .stage-badge { padding: 2px 8px; border-radius: 10px; font-size: .75em; color: var(--text2); border: 1px solid var(--border); }
+
+        .finding-body { padding: 0 16px 16px; display: none; }
+        .finding-card.open .finding-body { display: block; }
+        .finding-body .row { margin-bottom: 8px; font-size: .88em; }
+        .finding-body .row strong { color: var(--text2); min-width: 90px; display: inline-block; }
+        .finding-body .url { font-family: 'Courier New', monospace; word-break: break-all; font-size: .85em; }
+        .finding-body .evidence { background: var(--bg); padding: 8px 12px; border-radius: 4px; font-family: 'Courier New', monospace; font-size: .82em; word-break: break-all; margin-top: 4px; max-height: 400px; overflow-y: auto; }
+        .finding-body .steps { margin: 4px 0; padding-left: 16px; }
+        .finding-body .steps li { margin-bottom: 4px; font-size: .85em; }
+        .finding-body details { margin: 4px 0; }
+        .finding-body details summary { cursor: pointer; color: var(--text2); font-size: .85em; }
+        .finding-body details summary:hover { color: var(--text); }
+        .finding-body pre { white-space: pre-wrap; word-break: break-all; font-size: .82em; max-height: 300px; overflow-y: auto; }
+        .copy-btn {
+            background: var(--surface); color: var(--text2); border: 1px solid var(--border);
+            padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: .78em;
+        }
+        .copy-btn:hover { background: var(--border); }
+
+        .recon-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; }
+        .recon-grid .url { display: block; padding: 6px 10px; background: var(--surface2); border-radius: 4px; font-size: .82em; word-break: break-all; }
+
+        footer { text-align: center; margin-top: 40px; padding-top: 20px; border-top: 2px solid var(--border); color: var(--text2); font-size: .85em; }
+        .empty-message { color: var(--text2); font-style: italic; padding: 20px; text-align: center; }
+
+        @media (max-width: 600px) {
+            .summary { grid-template-columns: repeat(2, 1fr); }
+            .finding-header { flex-direction: column; align-items: flex-start; }
+        }
+    """
     
     def __init__(self, config: Dict[str, Any], findings: List[Dict[str, Any]],
                  recon_data: Dict[str, Any], js_data: Optional[Dict[str, Any]] = None):
@@ -406,140 +577,7 @@ class Reporter:
     <title>Bug Bounty Report - {self.target}</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        :root {{
-            --bg: #0f0f0f;
-            --surface: #1e1e1e;
-            --surface2: #2a2a2a;
-            --text: #e0e0e0;
-            --text2: #999;
-            --border: #333;
-            --critical: #e74c3c;
-            --high: #e67e22;
-            --medium: #f1c40f;
-            --low: #3498db;
-            --info: #95a5a6;
-            --confirmed: #2ecc71;
-        }}
-        .light {{
-            --bg: #f5f5f5;
-            --surface: #ffffff;
-            --surface2: #f0f0f0;
-            --text: #222;
-            --text2: #666;
-            --border: #ddd;
-        }}
-        body {{
-            background: var(--bg);
-            color: var(--text);
-            font-family: 'Segoe UI', system-ui, sans-serif;
-            line-height: 1.6;
-            padding: 20px;
-            transition: background .3s, color .3s;
-        }}
-        .container {{ max-width: 1200px; margin: 0 auto; }}
-        header {{ text-align: center; margin-bottom: 40px; border-bottom: 2px solid var(--border); padding-bottom: 20px; }}
-        header h1 {{ font-size: 2.2em; color: var(--text); }}
-        .timestamp {{ color: var(--text2); font-size: .9em; }}
-
-        .top-bar {{ display: flex; justify-content: flex-end; gap: 10px; margin-bottom: 20px; }}
-        .theme-btn {{
-            background: var(--surface2); color: var(--text); border: 1px solid var(--border);
-            padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: .85em;
-        }}
-        .theme-btn:hover {{ opacity: .8; }}
-
-        .summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; margin-bottom: 40px; }}
-        .stat-card {{
-            background: var(--surface); border-radius: 8px; padding: 16px; text-align: center;
-            box-shadow: 0 2px 8px rgba(0,0,0,.2); border-top: 4px solid var(--border);
-        }}
-        .stat-card .val {{ font-size: 2em; font-weight: 700; }}
-        .stat-card .lbl {{ font-size: .8em; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; }}
-        .stat-card.crit {{ border-top-color: var(--critical); }} .stat-card.crit .val {{ color: var(--critical); }}
-        .stat-card.high {{ border-top-color: var(--high); }} .stat-card.high .val {{ color: var(--high); }}
-        .stat-card.med {{ border-top-color: var(--medium); }} .stat-card.med .val {{ color: var(--medium); }}
-        .stat-card.low {{ border-top-color: var(--low); }} .stat-card.low .val {{ color: var(--low); }}
-        .stat-card.info {{ border-top-color: var(--info); }} .stat-card.info .val {{ color: var(--info); }}
-        .stat-card.conf {{ border-top-color: var(--confirmed); }} .stat-card.conf .val {{ color: var(--confirmed); }}
-        .stat-card.exploit {{ border-top-color: #9b59b6; }} .stat-card.exploit .val {{ color: #9b59b6; }}
-        .stat-card.detect {{ border-top-color: #e74c3c; }} .stat-card.detect .val {{ color: #e74c3c; }}
-        .stat-card.valid {{ border-top-color: #f39c12; }} .stat-card.valid .val {{ color: #f39c12; }}
-
-        .chart-row {{ display: flex; gap: 20px; margin-bottom: 40px; flex-wrap: wrap; }}
-        .chart-box {{
-            background: var(--surface); border-radius: 8px; padding: 20px; flex: 1; min-width: 280px;
-            box-shadow: 0 2px 8px rgba(0,0,0,.2); position: relative; height: 300px;
-        }}
-        .chart-box canvas {{ max-height: 240px; }}
-
-        section {{ margin-bottom: 40px; background: var(--surface); padding: 24px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.2); }}
-        section h2 {{ font-size: 1.5em; margin-bottom: 16px; border-bottom: 2px solid var(--border); padding-bottom: 8px; }}
-
-        .filters {{ display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }}
-        .filter-btn {{
-            background: var(--surface2); color: var(--text2); border: 1px solid var(--border);
-            padding: 6px 14px; border-radius: 20px; cursor: pointer; font-size: .8em; transition: all .2s;
-        }}
-        .filter-btn:hover {{ opacity: .8; }}
-        .filter-btn.active {{ background: var(--border); color: var(--text); border-color: var(--text2); }}
-
-        .finding-card {{
-            background: var(--surface2); border-radius: 6px; margin-bottom: 12px;
-            border-left: 4px solid var(--border); overflow: hidden;
-        }}
-        .finding-card.critical {{ border-left-color: var(--critical); }}
-        .finding-card.high {{ border-left-color: var(--high); }}
-        .finding-card.medium {{ border-left-color: var(--medium); }}
-        .finding-card.low {{ border-left-color: var(--low); }}
-        .finding-card.info {{ border-left-color: var(--info); }}
-
-        .finding-header {{
-            padding: 14px 16px; cursor: pointer; display: flex; align-items: center;
-            justify-content: space-between; flex-wrap: wrap; gap: 8px;
-        }}
-        .finding-header:hover {{ background: rgba(255,255,255,.03); }}
-        .finding-title {{ font-weight: 600; font-size: .95em; flex: 1; min-width: 160px; }}
-        .finding-meta {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
-        .sev-badge {{
-            display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: .75em;
-            font-weight: 700; text-transform: uppercase;
-        }}
-        .sev-critical {{ background: var(--critical); color: #fff; }}
-        .sev-high {{ background: var(--high); color: #fff; }}
-        .sev-medium {{ background: var(--medium); color: #000; }}
-        .sev-low {{ background: var(--low); color: #fff; }}
-        .sev-info {{ background: var(--info); color: #fff; }}
-        .conf-badge {{ padding: 2px 8px; border-radius: 10px; font-size: .75em; font-weight: 600; }}
-        .conf-high {{ background: #2ecc71; color: #fff; }}
-        .conf-mid {{ background: #f39c12; color: #000; }}
-        .conf-low {{ background: #e74c3c; color: #fff; }}
-        .stage-badge {{ padding: 2px 8px; border-radius: 10px; font-size: .75em; color: var(--text2); border: 1px solid var(--border); }}
-
-        .finding-body {{ padding: 0 16px 16px; display: none; }}
-        .finding-card.open .finding-body {{ display: block; }}
-        .finding-body .row {{ margin-bottom: 8px; font-size: .88em; }}
-        .finding-body .row strong {{ color: var(--text2); min-width: 90px; display: inline-block; }}
-        .finding-body .url {{ font-family: 'Courier New', monospace; word-break: break-all; font-size: .85em; }}
-        .finding-body .evidence {{ background: var(--bg); padding: 8px 12px; border-radius: 4px; font-family: 'Courier New', monospace; font-size: .82em; word-break: break-all; margin-top: 4px; }}
-        .finding-body .steps {{ margin: 4px 0; padding-left: 16px; }}
-        .finding-body .steps li {{ margin-bottom: 4px; font-size: .85em; }}
-        .copy-btn {{
-            background: var(--surface); color: var(--text2); border: 1px solid var(--border);
-            padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: .78em;
-        }}
-        .copy-btn:hover {{ background: var(--border); }}
-
-        .recon-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; }}
-        .recon-grid .url {{ display: block; padding: 6px 10px; background: var(--surface2); border-radius: 4px; font-size: .82em; word-break: break-all; }}
-
-        footer {{ text-align: center; margin-top: 40px; padding-top: 20px; border-top: 2px solid var(--border); color: var(--text2); font-size: .85em; }}
-        .empty-message {{ color: var(--text2); font-style: italic; padding: 20px; text-align: center; }}
-
-        @media (max-width: 600px) {{
-            .summary {{ grid-template-columns: repeat(2, 1fr); }}
-            .finding-header {{ flex-direction: column; align-items: flex-start; }}
-        }}
+        {self.REPORT_CSS}
     </style>
 </head>
 <body>
@@ -668,6 +706,16 @@ class Reporter:
                 setTimeout(() => btn.textContent = orig, 1200);
             }});
         }}
+
+        // Copy Curl
+        function copyCurl(cmd) {{
+            navigator.clipboard.writeText(cmd).then(() => {{
+                var btn = event.target;
+                var orig = btn.textContent;
+                btn.textContent = 'Copied!';
+                setTimeout(() => btn.textContent = orig, 1200);
+            }});
+        }}
     </script>
 </body>
 </html>"""
@@ -684,6 +732,11 @@ class Reporter:
         cards += f'<div class="stat-card detect"><div class="val">{ver.get("detected", 0)}</div><div class="lbl">Detected</div></div>'
         return cards
 
+    def _build_curl_command(self, finding: Dict[str, Any]) -> str:
+        """Build a curl command from finding request metadata."""
+        url = finding.get("url", "")
+        return f"curl -X GET '{url}'"
+
     def _build_finding_cards_html(self, findings: List[Dict[str, Any]]) -> str:
         if not findings:
             return '<div class="empty-message">No vulnerabilities found.</div>'
@@ -698,6 +751,9 @@ class Reporter:
             fpr = f.get("false_positive_risk", "")
             cvss = f.get("cvss_score", "")
             steps = f.get("validation_steps", [])
+            request = f.get("request", "")
+            response_excerpt = f.get("response_excerpt", "")
+            steps_to_reproduce = f.get("steps_to_reproduce", [])
 
             sev_class = {"critical": "critical", "high": "high", "medium": "medium", "low": "low", "info": "info"}.get(sev, "info")
             conf_class = "high" if score >= 61 else ("mid" if score >= 31 else "low")
@@ -710,8 +766,37 @@ class Reporter:
 
             evidence_html = ""
             if evidence:
-                evidence_html = f'<div class="row"><strong>Evidence:</strong><div class="evidence">{evidence[:300]}</div></div>'
+                evidence_html = (
+                    '<div class="row"><strong>Evidence:</strong>'
+                    f'<details><summary>View evidence ({len(evidence)} chars)</summary>'
+                    f'<div class="evidence">{evidence}</div>'
+                    "</details></div>"
+                )
 
+            request_html = ""
+            if request:
+                request_html = (
+                    '<div class="row"><strong>Request:</strong>'
+                    f'<details><summary>View request</summary>'
+                    f'<pre class="evidence">{request}</pre>'
+                    "</details></div>"
+                )
+
+            response_html = ""
+            if response_excerpt:
+                response_html = (
+                    '<div class="row"><strong>Response:</strong>'
+                    f'<details><summary>View response excerpt ({len(response_excerpt)} chars)</summary>'
+                    f'<pre class="evidence">{response_excerpt}</pre>'
+                    "</details></div>"
+                )
+
+            steps_to_reproduce_html = ""
+            if steps_to_reproduce:
+                items = "".join(f"<li>{s}</li>" for s in steps_to_reproduce[:10])
+                steps_to_reproduce_html = f'<div class="row"><strong>Steps to Reproduce:</strong><ol class="steps">{items}</ol></div>'
+
+            curl_cmd = self._build_curl_command(f)
             cvss_html = f'<span>CVSS: {cvss:.1f}</span>' if isinstance(cvss, (int, float)) else ""
 
             html += f'''<div class="finding-card {sev_class}" data-severity="{sev}" data-stage="{stage}">
@@ -724,10 +809,13 @@ class Reporter:
                     </div>
                 </div>
                 <div class="finding-body">
-                    <div class="row"><strong>URL:</strong> <span class="url">{vuln_url}</span> <button class="copy-btn" onclick="copyUrl('{vuln_url.replace("'", "\\'")}')">Copy URL</button></div>
+                    <div class="row"><strong>URL:</strong> <span class="url">{vuln_url}</span> <button class="copy-btn" onclick="copyUrl('{vuln_url.replace("'", "\\'")}')">Copy URL</button> <button class="copy-btn" onclick="copyCurl('{curl_cmd.replace("'", "\\'")}')">Copy Curl</button></div>
                     <div class="row"><strong>Details:</strong> {details}</div>
                     {evidence_html}
+                    {request_html}
+                    {response_html}
                     {steps_html}
+                    {steps_to_reproduce_html}
                     <div class="row"><strong>FP Risk:</strong> {fpr.title() if fpr else "—"} {cvss_html}</div>
                 </div>
             </div>'''
@@ -1015,95 +1103,76 @@ End of Report
         return "\n".join(lines)
 
     def _build_impact_narrative(self, finding: Dict[str, Any]) -> str:
-        """Construct an impact paragraph from available metadata."""
+        """Construct an impact paragraph from available metadata, interpolating URL/parameter/evidence."""
         what = finding.get("what_is_it") or finding.get("details", "")
         impact = finding.get("impact", "")
         sev = finding.get("severity", "info").lower()
+        url = finding.get("url", "the affected endpoint")
+        param = finding.get("parameter", "")
+        evidence = finding.get("evidence", "")
 
         if impact:
-            return impact
-        # Fallback template-based impact
+            return impact.format(url=url, parameter=param, evidence=evidence)
+
+        vuln_type = (finding.get("title") or "").lower()
+        matrix_entry = None
+        for key in IMPACT_MATRIX:
+            if key in vuln_type:
+                matrix_entry = IMPACT_MATRIX.get(key)
+                biz_impact = matrix_entry[3] if matrix_entry and len(matrix_entry) > 3 else ""
+                break
+
+        param_str = f" via parameter `{param}`" if param else ""
+        biz_line = f" Business impact: {biz_impact}." if biz_impact else ""
+        ev_line = f" Evidence: {evidence[:120]}." if evidence else ""
+
         templates = {
-            "critical": "This vulnerability poses a severe risk to the confidentiality, "
-                       "integrity, and availability of the affected system. "
-                       "Successful exploitation could lead to complete compromise of the "
-                       "application, including arbitrary code execution, data exfiltration, "
-                       "or full account takeover.",
-            "high": "This vulnerability can lead to significant data disclosure, "
-                    "privilege escalation, or partial system compromise. "
-                    "Immediate remediation is strongly recommended.",
-            "medium": "Exploitation may lead to limited information disclosure, "
-                      "minor privilege escalation, or degraded security posture. "
-                      "Should be addressed in the next maintenance cycle.",
-            "low": "Limited practical impact under normal conditions. "
-                   "Risk is minimal but may be chained with other vulnerabilities.",
+            "critical": (
+                f"This vulnerability at `{url}`{param_str} poses a severe risk to "
+                f"confidentiality, integrity, and availability. Successful exploitation "
+                f"could lead to complete compromise of the application, including arbitrary "
+                f"code execution, data exfiltration, or full account takeover.{biz_line}{ev_line}"
+            ),
+            "high": (
+                f"This vulnerability at `{url}`{param_str} can lead to significant "
+                f"data disclosure, privilege escalation, or partial system compromise. "
+                f"Immediate remediation is strongly recommended.{biz_line}{ev_line}"
+            ),
+            "medium": (
+                f"Exploitation of `{url}`{param_str} may lead to limited information "
+                f"disclosure, minor privilege escalation, or degraded security posture. "
+                f"Should be addressed in the next maintenance cycle.{biz_line}{ev_line}"
+            ),
+            "low": (
+                f"Limited practical impact at `{url}`{param_str} under normal conditions. "
+                f"Risk is minimal but may be chained with other vulnerabilities.{ev_line}"
+            ),
         }
-        return templates.get(sev, "See details for impact information.")
+        return templates.get(sev, f"See details for impact information at `{url}`.{ev_line}")
 
     def _build_remediation(self, finding: Dict[str, Any]) -> str:
         rem = finding.get("remediation") or finding.get("recommendation", "")
         if rem:
-            return rem
+            return rem.format(
+                url=finding.get("url", "the affected endpoint"),
+                parameter=finding.get("parameter", ""),
+                evidence=finding.get("evidence", ""),
+            )
+        url = finding.get("url", "the affected endpoint")
         # Generic fallback per severity
         fallbacks = {
-            "critical": "Immediately review and fix the root cause. "
+            "critical": f"Immediately review and fix the root cause at `{url}`. "
                         "Apply input validation, output encoding, proper authentication "
                         "checks, and access controls. Conduct a focused security review "
                         "of the affected component.",
-            "high": "Review and fix the vulnerability. Apply appropriate security "
+            "high": f"Review and fix the vulnerability at `{url}`. Apply appropriate security "
                     "controls such as input sanitization, parameterized queries, "
                     "or access control hardening.",
-            "medium": "Review the affected functionality and apply standard security "
+            "medium": f"Review the affected functionality at `{url}` and apply standard security "
                       "best practices including input validation and proper authorization checks.",
         }
         return fallbacks.get(finding.get("severity", "").lower(),
-                             "Follow security best practices for the affected component.")
-
-    def _call_triage_assist(self, finding: Dict[str, Any]) -> Dict[str, str]:
-        """Use OpenAI to enhance the impact narrative if the API key is set."""
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        if not api_key:
-            return {}
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=api_key)
-            prompt = (
-                f"You are a senior application security engineer triaging findings.\n\n"
-                f"Vulnerability: {finding.get('title', 'Unknown')}\n"
-                f"Severity: {finding.get('severity', 'info').upper()}\n"
-                f"URL: {finding.get('url', 'N/A')}\n"
-                f"Details: {finding.get('details', 'N/A')}\n"
-                f"Evidence: {finding.get('evidence', 'N/A')}\n\n"
-                f"Return a JSON object with exactly two keys:\n"
-                f"  - impact: a 2–4 sentence business-impact description\n"
-                f"  - remediation: a 2–4 sentence actionable fix recommendation\n"
-                f"Return ONLY the JSON object, no markdown fences."
-            )
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=500,
-            )
-            text = resp.choices[0].message.content.strip()
-            # Attempt to strip any accidental markdown fences
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1]
-                text = text.rsplit("```", 1)[0].strip()
-            result = json.loads(text)
-            if not isinstance(result, dict):
-                return {}
-            return {k: v for k, v in result.items() if isinstance(v, str)}
-        except ImportError:
-            log(
-                "[!] --triage-assist requires the openai package. "
-                "Install it with: pip install openai",
-                Colors.YELLOW
-            )
-            return {}
-        except Exception:
-            pass
-        return {}
+                             f"Follow security best practices for `{url}`.")
 
     def _create_markdown_report(self) -> str:
         """Generate one Markdown file per finding and return the output directory path."""
@@ -1111,7 +1180,6 @@ End of Report
         Path(md_dir).mkdir(parents=True, exist_ok=True)
 
         sorted_findings = self._sort_findings()
-        triage_assist_enabled = self.config.get("triage_assist", False)
 
         for finding in sorted_findings:
             cvss_score = self._get_cvss_score(finding)
@@ -1120,29 +1188,34 @@ End of Report
             component = self._get_affected_component(finding.get("url", ""))
             confirmed = finding.get("confirmed", False)
 
-            # Optionally enhance with LLM
-            if triage_assist_enabled:
-                llm = self._call_triage_assist(finding)
-            else:
-                llm = {}
-
-            impact = llm.get("impact") or self._build_impact_narrative(finding)
-            remediation = llm.get("remediation") or self._build_remediation(finding)
+            impact = self._build_impact_narrative(finding)
+            remediation = self._build_remediation(finding)
 
             # Steps to reproduce – build from available metadata
             details = finding.get("details", "")
             evidence = self._format_evidence(finding.get("evidence", ""))
+            request = finding.get("request", "")
+            response_excerpt = finding.get("response_excerpt", "")
+            steps_to_reproduce = finding.get("steps_to_reproduce", [])
             steps = f"""
 1.  Navigate to the affected endpoint: `{finding.get('url', 'N/A')}`
 2.  {details}
 3.  Observe the evidence below to confirm the vulnerability.
 """
+            if steps_to_reproduce:
+                steps_lines = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps_to_reproduce))
+                steps += f"\n## Detailed Steps to Reproduce\n\n{steps_lines}\n"
             if evidence:
                 steps += f"\n## Evidence\n\n```\n{evidence}\n```\n"
+            if request:
+                steps += f"\n## Request\n\n```\n{request}\n```\n"
+            if response_excerpt:
+                steps += f"\n## Response Excerpt\n\n```\n{response_excerpt}\n```\n"
 
             vuln_type = finding.get("title", "finding").replace(" ", "_").replace("/", "_")
             safe_target = self._sanitize_target()
-            filename = f"{vuln_type}_{safe_target}.md"
+            url_hash = hashlib.md5(finding.get("url", "").encode()).hexdigest()[:8]
+            filename = f"{vuln_type}_{safe_target}_{url_hash}.md"
             filepath = os.path.join(md_dir, filename)
 
             score = finding.get('confidence_score')

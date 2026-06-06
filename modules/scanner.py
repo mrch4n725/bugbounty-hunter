@@ -1313,6 +1313,9 @@ class VulnScanner:
                         severity="high",
                         details=f"Stored payload reflected in {base_url}",
                         evidence=f"Payload: {payload} | Submitted via param: {entry['param']}",
+                        request=f"GET {base_url}",
+                        response_excerpt=resp.text[:500],
+                        steps_to_reproduce=[f"Send request to {base_url}", f"Observe payload reflection: {payload[:80]}"],
                         verification_stage=VerificationStage.VALIDATED.value,
                         validation_steps=[f"Payload '{payload}' submitted via {entry['param']} then reflected on {base_url}"],
                     )
@@ -1413,6 +1416,9 @@ class VulnScanner:
                         severity="critical",
                         details=f"Vulnerable parameters ({len(vulnerable_params)}): {', '.join(vulnerable_params[:10])}",
                         evidence=f"Signatures: {', '.join(list(all_matched_sigs)[:5])}",
+                        request=f"GET {url}",
+                        response_excerpt=resp.text[:500],
+                        steps_to_reproduce=[f"Send request to {url}", f"Observe cloud metadata signature in response"],
                         verification_stage=VerificationStage.VALIDATED.value,
                         validation_steps=[f"Cloud metadata signature matched: {s}" for s in all_matched_sigs],
                         confidence_score=confidence_score,
@@ -1491,6 +1497,9 @@ class VulnScanner:
                                 url=url, severity="critical",
                                 details="In-band XXE: file content returned in response via XML entity",
                                 evidence=f"Signature: {sig!r}",
+                                request=f"POST {url}",
+                                response_excerpt=resp.text[:500],
+                                steps_to_reproduce=[f"Send POST request to {url} with XXE payload", f"Observe: {sig}"],
                                 verification_stage=VerificationStage.VALIDATED.value,
                                 validation_steps=[f"In-band XXE payload returned file content: {sig}"],
                             )
@@ -1521,6 +1530,9 @@ class VulnScanner:
                                     url=url, severity="critical",
                                     details="Error-based XXE: file content leaked via parser error message",
                                     evidence=f"Signature: {sig!r}",
+                                    request=f"POST {url}",
+                                    response_excerpt=resp.text[:500],
+                                    steps_to_reproduce=[f"Send POST request to {url} with XXE payload", f"Observe: {sig}"],
                                     verification_stage=VerificationStage.VALIDATED.value,
                                     validation_steps=["Error-based XXE payload leaked file content"],
                                 )
@@ -1860,6 +1872,9 @@ class VulnScanner:
                         severity="critical",
                         details=f"Parameter '{param}' — XSS execution verified via Playwright ({context} context)",
                         evidence=f"Payload: {ctx_payload} | Alert: {exec_result.get('alert_fired')} | DOM: {exec_result.get('dom_mutation')}",
+                        request=f"GET {ctx_url}",
+                        response_excerpt=ctx_resp.text[:500],
+                        steps_to_reproduce=[f"Send request to {ctx_url}", f"Observe XSS execution: {ctx_payload[:80]}"],
                         verification_stage=VerificationStage.EXPLOITABLE.value,
                         validation_steps=[
                             f"Reflection in {context} context detected",
@@ -1876,6 +1891,9 @@ class VulnScanner:
                         severity="high",
                         details=f"Parameter '{param}' reflects payload in {context} context (unverified execution)",
                         evidence=f"Payload: {ctx_payload}",
+                        request=f"GET {ctx_url}",
+                        response_excerpt=ctx_resp.text[:500],
+                        steps_to_reproduce=[f"Send request to {ctx_url}", f"Observe payload reflection: {ctx_payload[:80]}"],
                         verification_stage=VerificationStage.DETECTED.value,
                         validation_steps=[f"Reflection in {context} context detected (no headless browser available for execution verification)"],
                     )
@@ -1934,6 +1952,9 @@ class VulnScanner:
                         severity="critical",
                         details=f"Form field '{field_name}' — XSS execution verified ({context} context)",
                         evidence=f"Payload: {ctx_payload}",
+                        request=f"{method} {confirm_url}",
+                        response_excerpt=r.text[:500],
+                        steps_to_reproduce=[f"Send {method} request to {confirm_url}", f"Observe XSS execution: {ctx_payload[:80]}"],
                         verification_stage=VerificationStage.EXPLOITABLE.value,
                         validation_steps=["Form reflection + Playwright execution verified"],
                     )
@@ -1947,6 +1968,9 @@ class VulnScanner:
                         severity="high",
                         details=f"Form field '{field_name}' reflects in {context} context",
                         evidence=f"Payload: {ctx_payload}",
+                        request=f"{method} {confirm_url}",
+                        response_excerpt=r.text[:500],
+                        steps_to_reproduce=[f"Send {method} request to {confirm_url}", f"Observe payload reflection: {ctx_payload[:80]}"],
                         verification_stage=VerificationStage.DETECTED.value,
                         validation_steps=[f"Reflection in {context} context (unverified execution)"],
                     )
@@ -2076,6 +2100,9 @@ class VulnScanner:
                                             severity="critical",
                                             details=f"Parameter '{param}' includes local file (signature: {sig!r})",
                                             evidence=f"Payload: {payload}",
+                                            request=f"GET {test_url}",
+                                            response_excerpt=resp.text[:500],
+                                            steps_to_reproduce=[f"Send request to {test_url}", f"Observe: {sig}"],
                                             verification_stage=VerificationStage.VALIDATED.value,
                                             validation_steps=[f"LFI signature '{sig}' found in response"],
                                         )
@@ -2119,6 +2146,9 @@ class VulnScanner:
                                     severity="medium",
                                     details=f"Parameter '{param}' redirects to external domain",
                                     evidence=f"Location: {loc[:100]}",
+                                    request=f"GET {test_url}",
+                                    response_excerpt=resp.text[:500],
+                                    steps_to_reproduce=[f"Send request to {test_url}", f"Observe redirect to {loc[:80]}"],
                                     verification_stage=VerificationStage.VALIDATED.value,
                                     validation_steps=[f"Redirect header contains external domain: {loc[:60]}"],
                                 )
@@ -2219,6 +2249,9 @@ class VulnScanner:
                         severity="medium",
                         details=details,
                         evidence=f"HTTP {resp.status_code}",
+                        request=f"GET {target_url}",
+                        response_excerpt=resp.text[:500],
+                        steps_to_reproduce=[f"Send request to {target_url}", "Observe HTTP 200 response"],
                         verification_stage=VerificationStage.DETECTED.value,
                     )
                     if f and self._add(f):
@@ -2231,6 +2264,9 @@ class VulnScanner:
                         severity="info",
                         details=f"Path exists but is access-controlled (HTTP 403): {target_url}",
                         evidence=f"HTTP 403",
+                        request=f"GET {target_url}",
+                        response_excerpt=resp.text[:500],
+                        steps_to_reproduce=[f"Send request to {target_url}", "Observe HTTP 403 response"],
                         verification_stage=VerificationStage.DETECTED.value,
                     )
                     if f and self._add(f):
@@ -2243,6 +2279,9 @@ class VulnScanner:
                         severity="info",
                         details=f"Path requires authentication (HTTP 401): {target_url}",
                         evidence=f"HTTP 401",
+                        request=f"GET {target_url}",
+                        response_excerpt=resp.text[:500],
+                        steps_to_reproduce=[f"Send request to {target_url}", "Observe HTTP 401 response"],
                         verification_stage=VerificationStage.DETECTED.value,
                     )
                     if f and self._add(f):
@@ -2294,6 +2333,9 @@ class VulnScanner:
                     severity=severity,
                     details=details,
                     evidence=f"HTTP {resp.status_code} — {len(resp.text)} bytes",
+                    request=f"GET {file_url}",
+                    response_excerpt=resp.text[:500],
+                    steps_to_reproduce=[f"Send request to {file_url}", f"Observe: {details[:100]}"],
                     verification_stage=VerificationStage.VALIDATED.value,
                     validation_steps=[f"File accessible at {file_url} (HTTP 200)"],
                 )
@@ -2379,6 +2421,9 @@ class VulnScanner:
                             severity=severity,
                             details=f"Potential sensitive value detected in page content: {label}",
                             evidence=" | ".join(evidence_parts),
+                            request=f"GET {url}",
+                            response_excerpt=resp.text[:500],
+                            steps_to_reproduce=[f"Send request to {url}", f"Observe {label} in response"],
                             verification_stage=VerificationStage.VALIDATED.value if (validation_result and validation_result.get("valid") is True) else VerificationStage.DETECTED.value,
                             validation_steps=validation_steps,
                         )
@@ -2439,6 +2484,9 @@ class VulnScanner:
                 severity=severity,
                 details=f"Response is missing the '{header}' header",
                 evidence=f"Headers present: {', '.join(list(resp.headers.keys())[:5])}",
+                request=f"GET {target}",
+                response_excerpt=resp.text[:500],
+                steps_to_reproduce=[f"Send GET request to {target}", f"Observe missing header: {header}"],
                 verification_stage=VerificationStage.DETECTED.value,
             )
             if f:
@@ -2453,6 +2501,9 @@ class VulnScanner:
                 severity="low",
                 details=f"Server header reveals version: {server!r}",
                 evidence="",
+                request=f"GET {target}",
+                response_excerpt=resp.text[:500],
+                steps_to_reproduce=[f"Send GET request to {target}", f"Observe server header: {server!r}"],
                 verification_stage=VerificationStage.DETECTED.value,
             )
             if f:
@@ -2469,6 +2520,9 @@ class VulnScanner:
                     severity="low",
                     details=f"{header} reveals tech stack: {value!r}",
                     evidence="",
+                    request=f"GET {target}",
+                    response_excerpt=resp.text[:500],
+                    steps_to_reproduce=[f"Send GET request to {target}", f"Observe {header} header: {value!r}"],
                     verification_stage=VerificationStage.DETECTED.value,
                 )
                 if f:
@@ -2483,6 +2537,9 @@ class VulnScanner:
                 severity="medium",
                 details="CSP contains potentially unsafe directives (unsafe-inline, unsafe-eval, or data:).",
                 evidence=f"CSP: {csp[:200]}",
+                request=f"GET {target}",
+                response_excerpt=resp.text[:500],
+                steps_to_reproduce=[f"Send GET request to {target}", "Observe CSP with unsafe directives"],
                 verification_stage=VerificationStage.DETECTED.value,
             )
             if f:
@@ -2496,6 +2553,9 @@ class VulnScanner:
                 severity="high",
                 details="Access-Control-Allow-Origin is '*' while credentials are allowed.",
                 evidence=f"Access-Control-Allow-Origin: {acao}, Access-Control-Allow-Credentials: {acc}",
+                request=f"GET {target}",
+                response_excerpt=resp.text[:500],
+                steps_to_reproduce=[f"Send GET request to {target}", f"Observe CORS: {acao} with {acc}"],
                 verification_stage=VerificationStage.DETECTED.value,
             )
             if f:
@@ -2507,6 +2567,9 @@ class VulnScanner:
                 severity="low",
                 details="Access-Control-Allow-Origin is set to '*'.",
                 evidence=f"Access-Control-Allow-Origin: {acao}",
+                request=f"GET {target}",
+                response_excerpt=resp.text[:500],
+                steps_to_reproduce=[f"Send GET request to {target}", f"Observe CORS: {acao}"],
                 verification_stage=VerificationStage.DETECTED.value,
             )
             if f:
@@ -2527,6 +2590,9 @@ class VulnScanner:
                         severity="critical",
                         details="Access-Control-Allow-Origin reflects Origin header verbatim with credentials allowed — full account access risk",
                         evidence=f"Origin: {evil_origin} -> ACAO: {reflected_acao}, ACC: {reflected_acc}",
+                        request=f"GET {target}",
+                        response_excerpt=probe_resp.text[:500],
+                        steps_to_reproduce=[f"Send GET request to {target} with Origin: {evil_origin}", "Observe reflected ACAO header"],
                         verification_stage=VerificationStage.VALIDATED.value,
                         validation_steps=[
                             f"Sent request with Origin: {evil_origin}",
@@ -2556,6 +2622,9 @@ class VulnScanner:
                     severity="medium",
                     details=f"Set-Cookie missing {', '.join(missing)} flags.",
                     evidence=f"Set-Cookie: {cookie[:120]}",
+                    request=f"GET {target}",
+                    response_excerpt=resp.text[:500],
+                    steps_to_reproduce=[f"Send GET request to {target}", f"Observe insecure cookie flags: {', '.join(missing)}"],
                     verification_stage=VerificationStage.DETECTED.value,
                 )
                 if f:
@@ -2585,6 +2654,9 @@ class VulnScanner:
                     severity="medium",
                     details="The application does not enforce frame protection headers.",
                     evidence=f"X-Frame-Options: {x_frame or 'missing'}, CSP: {csp or 'missing'}",
+                    request=f"GET {target}",
+                    response_excerpt=resp.text[:500],
+                    steps_to_reproduce=[f"Send GET request to {target}", "Observe missing X-Frame-Options header"],
                     verification_stage=VerificationStage.DETECTED.value,
                 )
                 if f and self._add(f):
@@ -2620,6 +2692,9 @@ class VulnScanner:
                         severity="medium",
                         details="The server supports non-safe HTTP methods.",
                         evidence=f"Allowed methods: {', '.join(sorted(methods))}",
+                        request=f"OPTIONS {target}",
+                        response_excerpt=resp.text[:500],
+                        steps_to_reproduce=[f"Send OPTIONS request to {target}", f"Observe dangerous methods: {', '.join(exposed)}"],
                         verification_stage=VerificationStage.DETECTED.value,
                     )
                     if f and self._add(f):
@@ -2703,6 +2778,9 @@ class VulnScanner:
                                 severity="high",
                                 details="A known takeover fingerprint was detected on the subdomain.",
                                 evidence=f"Signature: {signature}",
+                                request=f"GET {target_url}",
+                                response_excerpt=resp.text[:500],
+                                steps_to_reproduce=[f"Send GET request to {target_url}", f"Observe takeover signature: {signature}"],
                                 verification_stage=VerificationStage.DETECTED.value,
                             )
                             if f and self._add(f):
@@ -2978,6 +3056,9 @@ class VulnScanner:
                         severity="medium",
                         details="Full schema is exposed via introspection.",
                         evidence="__schema",
+                        request=f"POST {url}",
+                        response_excerpt=r.text[:500],
+                        steps_to_reproduce=[f"Send POST request to {url} with introspection query", "Observe __schema in response"],
                         verification_stage=VerificationStage.VALIDATED.value,
                         validation_steps=["GraphQL introspection response received"],
                     )
@@ -2996,6 +3077,9 @@ class VulnScanner:
                         severity="medium",
                         details="Server accepts batched GraphQL arrays with no apparent limit. (50 queries in one request)",
                         evidence="__typename",
+                        request=f"POST {url}",
+                        response_excerpt=r.text[:500],
+                        steps_to_reproduce=[f"Send POST request to {url} with batch query", "Observe multiple results"],
                         verification_stage=VerificationStage.VALIDATED.value,
                         validation_steps=["Batch of 50 queries returned 50 responses"],
                     )
@@ -3015,6 +3099,9 @@ class VulnScanner:
                         severity="low",
                         details="Error messages contain suggested field names, aiding attacker recon.",
                         evidence="suggestions",
+                        request=f"POST {url}",
+                        response_excerpt=r.text[:500],
+                        steps_to_reproduce=[f"Send POST request to {url} with malformed query", "Observe suggestions in error"],
                         verification_stage=VerificationStage.VALIDATED.value,
                         validation_steps=["Malformed query returned field suggestions"],
                     )
@@ -3035,6 +3122,9 @@ class VulnScanner:
                         severity="low",
                         details="Server accepts 200+ aliases in a single query, allowing resource exhaustion.",
                         evidence="200 aliases accepted",
+                        request=f"POST {url}",
+                        response_excerpt=r.text[:500],
+                        steps_to_reproduce=[f"Send POST request to {url} with 200 aliases", "Observe 200 OK response"],
                         verification_stage=VerificationStage.DETECTED.value,
                         validation_steps=["200 aliased __typename queries returned 200 results"],
                     )
@@ -3055,6 +3145,9 @@ class VulnScanner:
                         severity="low",
                         details="Server allows 7+ levels of nested queries, enabling recursive DoS.",
                         evidence="7+ levels accepted without error",
+                        request=f"POST {url}",
+                        response_excerpt=r.text[:500],
+                        steps_to_reproduce=[f"Send POST request to {url} with deeply nested query", "Observe 200 OK without errors"],
                         verification_stage=VerificationStage.DETECTED.value,
                         validation_steps=["Deeply nested query returned 200 without errors"],
                     )
@@ -3107,6 +3200,9 @@ class VulnScanner:
                             severity="critical",
                             details=f"Parameter '{c['param']}' changed from {original_val} to {test_val} and returned non-identical content.",
                             evidence=r.text[:120],
+                            request=f"GET {test_url}",
+                            response_excerpt=r.text[:500],
+                            steps_to_reproduce=[f"Send GET request to {test_url}", "Observe accessible data without authorization"],
                             verification_stage=VerificationStage.DETECTED.value,
                         )
                         if f and self._add(f):

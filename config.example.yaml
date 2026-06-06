@@ -6,7 +6,7 @@
 # Usage: python main.py --config config.yaml
 #
 # ── NOTE ON BOOLEAN FLAGS ──────────────────────────────────────────────
-# Boolean flags like verbose, passive, headless, stealth, triage_assist,
+# Boolean flags like verbose, passive, headless, stealth, resume,
 # verify_only default to False.  Setting them to true in this file works
 # ONLY when the corresponding CLI flag is NOT passed on the command line.
 # If you run:  python main.py --config config.yaml

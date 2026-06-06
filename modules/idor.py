@@ -247,6 +247,12 @@ class IdorScanner(VulnScanner):
                     f"for second user with differing content.",
                     f"Second user accessed: {resp_alt.text[:120]}",
                     confidence="confirmed",
+                    request=f"GET {url}",
+                    response_excerpt=resp_alt.text[:500],
+                    steps_to_reproduce=[
+                        f"Authenticate as second user and send GET request to {url}",
+                        "Observe that the response content differs from the first user's response, indicating horizontal privilege escalation",
+                    ],
                 ))
                 log(f"  [IDOR Horiz] {url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
 
@@ -330,6 +336,12 @@ class IdorScanner(VulnScanner):
                 f"and returned accessible content.",
                 f"HTTP {resp.status_code} - Response length: {len(resp.text)}",
                 confidence="confirmed",
+                request=f"GET {test_url}",
+                response_excerpt=resp.text[:500],
+                steps_to_reproduce=[
+                    f"Send GET request to {test_url} with parameter '{param}'={new_val}",
+                    "Observe that the endpoint returns accessible content, indicating an insecure direct object reference",
+                ],
             ))
             log(f"  [IDOR Seq] {test_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
 
@@ -362,6 +374,12 @@ class IdorScanner(VulnScanner):
                 f"and returned accessible content.",
                 f"HTTP {resp.status_code}",
                 confidence="confirmed",
+                request=f"{method} {action}",
+                response_excerpt=resp.text[:500],
+                steps_to_reproduce=[
+                    f"Submit {method} request to {action} with form field '{field_name}'={new_val}",
+                    "Observe that the endpoint returns accessible content, indicating an insecure direct object reference",
+                ],
             ))
             log(f"  [IDOR Form] {action[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
 

@@ -67,8 +67,8 @@ def parse_args():
         help="Use Playwright headless browser for JS-rendered crawling (network intercept, SPA route discovery)")
     parser.add_argument("--verify-only", "-V",
         help="Re-verify unconfirmed findings from a previous JSON report. Path to report file.")
-    parser.add_argument("--triage-assist", action="store_true",
-        help="Use OpenAI to enhance impact narrative in markdown reports (requires OPENAI_API_KEY env var)")
+    parser.add_argument("--resume", action="store_true",
+        help="Resume a previous scan from .scan_state.json (skips completed URLs)")
     parser.add_argument("--rps", type=float, default=5.0,
         help="Requests per second (default: 5). Halved on 429, restored after 20 OK.")
     parser.add_argument("--stealth", action="store_true",
@@ -122,7 +122,7 @@ def _apply_scalar_config(cli_args, config_file: dict) -> None:
         'retries': 'retries', 'verbose': 'verbose', 'passive': 'passive',
         'headless': 'headless',
         'verify_only': 'verify_only',
-        'triage_assist': 'triage_assist',
+        'resume': 'resume',
         'rps': 'rps',
         'stealth': 'stealth',
         'scope': 'scope',
@@ -135,7 +135,7 @@ def _apply_scalar_config(cli_args, config_file: dict) -> None:
         'threads': 10, 'timeout': 10, 'retries': 3,
         'crawl_depth': 2, 'autosave_interval': 0, 'rps': 5.0,
     }
-    BOOL_FLAGS = {'verbose', 'passive', 'headless', 'stealth', 'triage_assist', 'verify_only'}
+    BOOL_FLAGS = {'verbose', 'passive', 'headless', 'stealth', 'resume', 'verify_only'}
     for yaml_key, arg_key in yaml_to_arg.items():
         if yaml_key not in config_file:
             continue
@@ -260,7 +260,7 @@ def build_config(args):
         "passive": args.passive,
         "headless": getattr(args, "headless", False),
         "verify_only": getattr(args, "verify_only", None),
-        "triage_assist": getattr(args, "triage_assist", False),
+        "resume": getattr(args, "resume", False),
         "rps": args.rps,
         "stealth": args.stealth,
         "max_js_files": args.max_js_files,
@@ -422,7 +422,24 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     # collected via all_findings_local and merged in Step 5.
     per_url_modules = {k: v for k, v in module_map.items() if k not in TARGET_LEVEL}
 
-    for url in sorted_urls:
+    # Resume support: load completed URLs from scan state
+    resume_file = os.path.join(config.get("output_dir", "reports"), ".scan_state.json")
+    completed_urls: set[str] = set()
+    if config.get("resume"):
+        try:
+            with open(resume_file, "r") as f:
+                state = json.load(f)
+            completed_urls = set(state.get("completed_urls", []))
+            log(f"[*] Resume mode: {len(completed_urls)} URLs already scanned, skipping", Colors.CYAN)
+        except (FileNotFoundError, json.JSONDecodeError):
+            log("[*] No scan state found, starting fresh", Colors.CYAN)
+
+    for idx, url in enumerate(sorted_urls):
+        if url in completed_urls:
+            continue
+        if idx % 10 == 0:
+            log(f"[*] Progress: {idx}/{len(sorted_urls)} URLs processed", Colors.CYAN)
+
         applicable = classify_endpoint(url, forms, recon_data)
         # Respect --modules filter
         if not run_all:
@@ -433,6 +450,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         applicable &= per_url_modules.keys()
 
         if not applicable:
+            completed_urls.add(url)
             continue
 
         if config.get("verbose", False):
@@ -444,6 +462,15 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
                 mod_fn(target_urls=[url])  # findings written via self._add() to scanner.dedup
             except Exception as e:
                 log(f"  [!] {mod_name} error on {url}: {e}", Colors.RED, verbose_only=True, verbose=config.get("verbose", False))
+
+        completed_urls.add(url)
+        # Persist scan state after each URL
+        try:
+            os.makedirs(os.path.dirname(resume_file), exist_ok=True)
+            with open(resume_file, "w") as f:
+                json.dump({"completed_urls": list(completed_urls), "target": config.get("target")}, f)
+        except Exception:
+            pass
 
     # ── Step 5: Post-scan triage pipeline ───────────────────────────────
     log("[*] Running re-verification loop...", Colors.CYAN)
@@ -496,6 +523,7 @@ def _write_report_and_summary(config, all_findings, recon_data, js_data=None) ->
     confirmed = [f for f in all_findings if f.get("confidence_score", 0) >= 86]
     validated = [f for f in all_findings if f.get("verification_stage") == "validated"]
     exploitable = [f for f in all_findings if f.get("verification_stage") == "exploitable"]
+    verified = [f for f in all_findings if f.get("verification_stage") == "verified"]
     log(f"\n{'─'*50}", Colors.CYAN)
     log("  SCAN SUMMARY", Colors.BOLD)
     log(f"{'─'*50}", Colors.CYAN)
@@ -506,6 +534,7 @@ def _write_report_and_summary(config, all_findings, recon_data, js_data=None) ->
     log(f"  Confirmed   : {len(confirmed)}", Colors.GREEN if confirmed else Colors.WHITE)
     log(f"  Validated   : {len(validated)}", Colors.GREEN if validated else Colors.WHITE)
     log(f"  Exploitable : {len(exploitable)}", Colors.RED if exploitable else Colors.WHITE)
+    log(f"  Verified    : {len(verified)}", Colors.GREEN if verified else Colors.WHITE)
     log(f"  Total       : {len(all_findings)}", Colors.BOLD)
     log(f"{'─'*50}\n", Colors.CYAN)
     return 0 if not critical and not high else 1
@@ -563,6 +592,7 @@ def main():
         "all" in config["modules"] or "js_secrets" in config["modules"]
     ) and bool(js_urls) and not config.get("passive", False)
 
+    js_findings: list[dict] = []
     if run_js:
         log("[*] Running JS Intelligence scan...", Colors.YELLOW)
         js_intel = JSIntelligence(base_url=config["target"], config=config)
@@ -593,7 +623,7 @@ def main():
                 if ep_url not in recon_data["urls"]:
                     recon_data["urls"].append(ep_url)
 
-        # Generate findings from secrets
+        # Generate findings from secrets (collected in js_findings, merged after _run_scans)
         for entry in js_data.get("secrets", []):
             if entry.get("confidence") == "none":
                 continue
@@ -608,7 +638,7 @@ def main():
                 evidence=f"Match: {entry['value'][:40]}... Source: {entry.get('source_url', '')}",
             )
             if f:
-                all_findings.append(f)
+                js_findings.append(f)
 
         secret_count = len(js_data.get("secrets", []))
         endpoint_count = len(js_data.get("endpoints", [])) + len(js_data.get("hidden_endpoints", []))
@@ -620,6 +650,10 @@ def main():
         config, recon_data, all_findings, all_findings_lock, js_data=js_data
     )
     _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, all_findings_lock)
+
+    # Merge JS secret findings AFTER _run_scans (so they appear after scanner findings)
+    all_findings.extend(js_findings)
+
     if autosave_thread:
         stop_autosave.set()
         autosave_thread.join(timeout=2)

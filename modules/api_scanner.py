@@ -275,6 +275,12 @@ class ApiScanner(VulnScanner):
                     "GraphQL introspection is enabled and exposes the full schema.",
                     f"Schema exposes {query_count} types with fields",
                     confidence="confirmed",
+                    request=f"POST {url}",
+                    response_excerpt=resp.text[:500],
+                    steps_to_reproduce=[
+                        f"Send POST request to {url} with GraphQL introspection query",
+                        "Observe the schema response containing all types and fields",
+                    ],
                 )
                 self._append_finding(findings, f)
                 log(f"  [GQL] Introspection enabled → {url}", Colors.YELLOW,
@@ -474,6 +480,12 @@ class ApiScanner(VulnScanner):
                             url, "high", details,
                             f"HTTP {resp.status_code} on {method}",
                             confidence="probable",
+                            request=f"{method.upper()} {url}",
+                            response_excerpt=resp.text[:500],
+                            steps_to_reproduce=[
+                                f"Send {method.upper()} request to {url}",
+                                "Observe that the endpoint returns accessible content without proper authorization",
+                            ],
                         )
                         self._append_finding(findings, f)
                         log(f"  [BOLA] {method} {url} → {resp.status_code}", Colors.RED,
@@ -539,6 +551,12 @@ class ApiScanner(VulnScanner):
                             details,
                             f"Field '{field}' reflected in response: {body_text[:120]}",
                             confidence="probable",
+                            request=f"{method.upper()} {url}",
+                            response_excerpt=resp.text[:500],
+                            steps_to_reproduce=[
+                                f"Send {method.upper()} request to {url} with extra field '{field}'",
+                                "Observe that the field is accepted and reflected in the response",
+                            ],
                         )
                         self._append_finding(findings, f)
                         log(f"  [MASS] {method.upper()} {url} field='{field}'", Colors.RED,

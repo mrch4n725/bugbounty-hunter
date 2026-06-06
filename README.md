@@ -340,9 +340,28 @@ Respect `url_in_scope()` in every URL loop and use `self._record_confirmed(...)`
 | `urllib3` | Retries and connection pooling |
 | `tqdm` | Progress bars |
 | `playwright` | (optional) Headless browser for JS-rendered crawling + XSS execution verification (`requirements-headless.txt`) |
-| `openai` | (optional) LLM-assisted triage (markdown reports) |
 | `esprima` | (optional) JavaScript AST parsing for enhanced JS intelligence |
 | `boto3` | (optional) Live AWS key validation via STS |
+
+---
+
+## AI-Prompt Engineering for Impact Narratives
+
+Every finding's impact and remediation text is built from static templates that interpolate the actual finding data — URL, parameter name, evidence excerpt, and business impact from the `IMPACT_MATRIX`. This means the output is deterministic, reproducible, and does not require any external API calls.
+
+**How it works:**
+
+1. `_build_impact_narrative(finding)` in `reporter.py` selects a severity-based template (critical/high/medium/low) and fills in `{url}`, `{parameter}`, and `{evidence}` from the finding.
+2. If a finding has a custom `impact` string, it's used directly (and any `{url}`, `{parameter}`, `{evidence}` placeholders in it are interpolated).
+3. `_build_remediation(finding)` works identically — interpolating `{url}` and `{parameter}` into remediation templates.
+
+**Example output for a critical XSS finding:**
+
+> This vulnerability at `https://example.com/search?q=` via parameter `q` poses a severe risk to confidentiality, integrity, and availability. Successful exploitation could lead to complete compromise of the application, including arbitrary code execution, data exfiltration, or full account takeover. Business impact: Account takeover via session theft, phishing, or UI redressing.
+
+**To customize:** Edit the template strings in `_build_impact_narrative()` and `_build_remediation()` in `modules/reporter.py`. You can add `{url}`, `{parameter}`, `{evidence}`, or any key from the finding dict as a placeholder.
+
+The old `--triage-assist` flag (OpenAI prompt-based narrative generation) has been removed in favor of these static but interpolated templates. The result is faster, cheaper, deterministic, and works entirely offline.
 
 ---
 

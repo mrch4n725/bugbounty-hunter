@@ -58,6 +58,31 @@ def reset_seen_findings() -> None:
         _seen_findings = set()
 
 
+def _build_curl(
+    method: str,
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    data: Any = None,
+    cookies: Optional[Dict[str, str]] = None,
+) -> str:
+    """Build a curl command string for reproduction of a request."""
+    parts = ["curl", "-X", method.upper()]
+    if headers:
+        for k, v in headers.items():
+            parts.append(f"-H '{k}: {v}'")
+    if cookies:
+        for k, v in cookies.items():
+            parts.append(f"-b '{k}={v}'")
+    if data is not None and data:
+        if isinstance(data, str):
+            parts.append(f"-d '{data}'")
+        elif isinstance(data, dict):
+            import urllib.parse
+            parts.append(f"-d '{urllib.parse.urlencode(data)}'")
+    parts.append(f"'{url}'")
+    return " \\\n  ".join(parts)
+
+
 def set_rich_enabled(enabled: bool) -> None:
     """Enable or disable Rich terminal output (e.g. --no-rich)."""
     global _use_rich
@@ -1342,7 +1367,7 @@ def finding(
     Build a standardized finding dict with CVSS metadata, fingerprint, and timestamp.
     Supports both legacy confidence strings and new proof-based confidence fields.
     """
-    dedupe_key = (vuln_type, url)
+    dedupe_key = (vuln_type, url, parameter or "")
     with _seen_findings_lock:
         if dedupe_key in _seen_findings:
             return None
@@ -1545,13 +1570,16 @@ class RateLimiter:
             self.current_rps = max(0.1, self.current_rps / 2)
             self._backoff_until = time.time() + 5.0
             self._success_count = 0
+        log(f"  [RateLimit] 429 received — throttled to {self.current_rps:.1f} RPS", Colors.YELLOW)
 
     def report_success(self) -> None:
         with self._lock:
             self._success_count += 1
             if self._success_count >= 20 and self.current_rps < self.max_rps:
+                prev = self.current_rps
                 self.current_rps = min(self.max_rps, self.current_rps * 2)
                 self._success_count = 0
+                log(f"  [RateLimit] Restored to {self.current_rps:.1f} RPS (was {prev:.1f})", Colors.GREEN)
 
 
 class ScopeEnforcer:
