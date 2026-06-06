@@ -19,7 +19,7 @@ from modules.api_scanner import ApiScanner
 from modules.idor import IdorScanner
 from modules.reporter import Reporter
 from modules.js_intelligence import JSIntelligence
-from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score, prioritize_findings
+from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score, prioritize_findings, reset_seen_findings
 
 
 def parse_args():
@@ -512,6 +512,7 @@ def _write_report_and_summary(config, all_findings, recon_data, js_data=None) ->
 
 
 def main():
+    reset_seen_findings()
     banner()
     args = parse_args()
     if getattr(args, "no_rich", False):

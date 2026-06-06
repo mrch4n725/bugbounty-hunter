@@ -51,6 +51,13 @@ _seen_findings = set()
 _seen_findings_lock = threading.Lock()
 
 
+def reset_seen_findings() -> None:
+    """Clear the module-level deduplication set. Call once per scan session."""
+    global _seen_findings
+    with _seen_findings_lock:
+        _seen_findings = set()
+
+
 def set_rich_enabled(enabled: bool) -> None:
     """Enable or disable Rich terminal output (e.g. --no-rich)."""
     global _use_rich
@@ -2115,9 +2122,9 @@ def classify_endpoint(
     if is_form_post:
         modules.update({"csrf", "xss", "sqli", "insecure_forms"})
     if is_json_api:
-        modules.update({"sqli", "idor", "rate_limiting", "api"})
+        modules.update({"sqli", "idor", "rate_limiting", "api", "http_methods"})
     if is_xml:
-        modules.add("xxe")
+        modules.update({"xxe", "http_methods"})
     if is_graphql:
         modules.add("graphql")
     if is_file_upload:

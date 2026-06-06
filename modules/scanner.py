@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
 from urllib.parse import urlparse, urlencode, parse_qs, urljoin, urlunparse
 from queue import Queue
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 import yaml
 
@@ -24,7 +25,7 @@ from modules.utils import (
     EvidenceStrength, ConfidenceLevel, calculate_confidence,
     evidence_strength_from_score, false_positive_risk_from_score,
     prioritize_findings, compute_priority_score,
-    TechnologyFingerprinter,
+    TechnologyFingerprinter, reset_seen_findings,
 )
 
 try:
@@ -818,6 +819,11 @@ class VulnScanner:
         target = self.config.get("target", "")
         if not target:
             return
+        if self.config.get("stealth"):
+            log("[*] WAF detection skipped in stealth mode", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+            self.waf_detected = True
+            return
+        log("[*] WAF probe: testing root URL with 2 detection payloads", Colors.CYAN, verbose_only=True, verbose=self.verbose)
         safe_url = target.rstrip("/") + "/"
         blocked = 0
         for probe in ("' OR 1=1--", "<script>alert(1)</script>"):
@@ -864,7 +870,7 @@ class VulnScanner:
     # SSTI — 4-Stage Detection
     # ═════════════════════════════════════════════════════════════════════
 
-    def scan_ssti(self) -> list[dict]:
+    def scan_ssti(self, target_urls: list[str] | None = None) -> list[dict]:
         """
         4-stage SSTI detection:
         Stage 1: Detect reflection of template syntax.
@@ -873,8 +879,9 @@ class VulnScanner:
         Stage 4: Attempt safe read-only proof.
         """
         findings: list[dict] = []
+        urls = self._urls_with_params() if target_urls is None else target_urls
 
-        for url in self._urls_with_params():
+        for url in urls:
             if not self._in_scope(url):
                 continue
             try:
@@ -1215,15 +1222,32 @@ class VulnScanner:
                     self._add(f)
                 break
 
+        # Try form fields from recon first, then fall back to hardcoded
+        form_fields: list[str] = []
+        for form in (self.recon.get("forms", []) or []):
+            form_action = form.get("action", "")
+            if form_action and (form_action in url or url in form_action):
+                for field in form.get("fields", []):
+                    ftype = field.get("type", "").lower()
+                    fname = field.get("name", "")
+                    if fname and ftype in ("text", "search", "email", "number", ""):
+                        form_fields.append(fname)
+        if not form_fields:
+            form_fields = ["id", "query", "search", "email", "filter", "name"]
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         for payload in post_payloads["form"]:
-            resp = safe_post(self.session, url, data=payload, headers=headers, timeout=self.timeout)
-            if resp and any(err in resp.text.lower() for err in SQLI_ERRORS):
-                signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
-                f = self._sqli_build_finding(url, "POST form body", signals)
-                if f:
-                    self._add(f)
-                break
+            for field_name in form_fields:
+                post_data = {field_name: payload}
+                resp = safe_post(self.session, url, data=post_data, headers=headers, timeout=self.timeout)
+                if resp and any(err in resp.text.lower() for err in SQLI_ERRORS):
+                    signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
+                    f = self._sqli_build_finding(url, f"POST form body ({field_name})", signals)
+                    if f:
+                        self._add(f)
+                    break
+            else:
+                continue
+            break
 
         # OOB variants for POST bodies
         if oob_host:
@@ -1377,8 +1401,8 @@ class VulnScanner:
                         validation_steps=[f"Cloud metadata signature matched: {s}" for s in all_matched_sigs],
                         confidence_score=confidence_score,
                     )
-                    if f:
-                        self._add(f)
+                    if f and self._add(f):
+                        findings.append(f)
 
             except Exception as e:
                 log(f"  [SSRF] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
@@ -1395,10 +1419,10 @@ class VulnScanner:
                 verification_stage=VerificationStage.EXPLOITABLE.value,
                 validation_steps=["OOB callback verified: DNS/HTTP interaction confirmed"],
             )
-            if f:
-                self._add(f)
+            if f and self._add(f):
+                findings.append(f)
 
-        return self._get_findings()
+        return findings
 
     def _build_ssrf_url(self, url: str, parsed, original_params: dict, param: str, payload: str) -> str:
         if param in original_params:
@@ -1454,8 +1478,8 @@ class VulnScanner:
                                 verification_stage=VerificationStage.VALIDATED.value,
                                 validation_steps=[f"In-band XXE payload returned file content: {sig}"],
                             )
-                            if f:
-                                self._add(f)
+                            if f and self._add(f):
+                                findings.append(f)
                             log(f"  [XXE] In-band {url}", Colors.RED, verbose_only=True, verbose=self.verbose)
                             break
                     if signals["in_band"]:
@@ -1484,8 +1508,8 @@ class VulnScanner:
                                     verification_stage=VerificationStage.VALIDATED.value,
                                     validation_steps=["Error-based XXE payload leaked file content"],
                                 )
-                                if f:
-                                    self._add(f)
+                                if f and self._add(f):
+                                    findings.append(f)
                                 log(f"  [XXE Error] {url}", Colors.RED, verbose_only=True, verbose=self.verbose)
                                 break
                         if signals["error"]:
@@ -1518,11 +1542,11 @@ class VulnScanner:
                 verification_stage=VerificationStage.EXPLOITABLE.value,
                 validation_steps=["OOB callback verified: DNS/HTTP interaction from XML parser"],
             )
-            if f:
-                self._add(f)
+            if f and self._add(f):
+                findings.append(f)
             log(f"  [XXE OOB] {entry.get('url', '')}", Colors.RED, verbose_only=True, verbose=self.verbose)
 
-        return self._get_findings()
+        return findings
 
     # ═════════════════════════════════════════════════════════════════════
     # Command Injection — Output + Time-Based + OOB Detection
@@ -1553,8 +1577,8 @@ class VulnScanner:
                     signals = self._cmd_injection_test_parameter(url, param, oob_host)
                     if signals and any(signals.values()):
                         f = self._cmd_injection_build_finding(url, param, signals)
-                        if f:
-                            self._add(f)
+                        if f and self._add(f):
+                            findings.append(f)
             except Exception as e:
                 log(f"  [CMD] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
 
@@ -1570,11 +1594,11 @@ class VulnScanner:
                 verification_stage=VerificationStage.EXPLOITABLE.value,
                 validation_steps=["OOB callback verified: DNS/HTTP interaction from injected command"],
             )
-            if f:
-                self._add(f)
+            if f and self._add(f):
+                findings.append(f)
             log(f"  [CMD OOB] {entry.get('url', '')}", Colors.RED, verbose_only=True, verbose=self.verbose)
 
-        return self._get_findings()
+        return findings
 
     def _cmd_injection_test_parameter(self, url: str, param: str,
                                       oob_host: Optional[str]) -> Dict[str, bool]:
@@ -1928,8 +1952,7 @@ class VulnScanner:
         """
         oob_host = self.config.get("oob_host")
         if not oob_host:
-            log("  [Blind XSS] No OOB host configured — skipping", Colors.YELLOW,
-                verbose_only=True, verbose=self.verbose)
+            log("[!] Blind XSS skipped — provide --oob-host for OOB callback verification", Colors.YELLOW)
             return self._get_findings()
 
         blind_payloads = [
@@ -2020,6 +2043,9 @@ class VulnScanner:
                 parsed = urlparse(url)
                 params = list(parse_qs(parsed.query).keys())
                 for param in params:
+                    # Baseline: fetch with original param value
+                    baseline_resp = safe_get(self.session, url, self.timeout)
+                    baseline_body = baseline_resp.text if baseline_resp else ""
                     for payload in lfi_payloads:
                         try:
                             test_url = self._inject_param(url, param, payload)
@@ -2027,7 +2053,7 @@ class VulnScanner:
                             if resp:
                                 body = resp.text
                                 for sig in LFI_SIGNATURES:
-                                    if sig in body:
+                                    if sig in body and sig not in baseline_body:
                                         f = finding(
                                             vuln_type="Local File Inclusion",
                                             url=test_url,
@@ -2037,15 +2063,15 @@ class VulnScanner:
                                             verification_stage=VerificationStage.VALIDATED.value,
                                             validation_steps=[f"LFI signature '{sig}' found in response"],
                                         )
-                                        if f:
-                                            self._add(f)
+                                        if f and self._add(f):
+                                            findings.append(f)
                                         log(f"  [LFI] {test_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
                                         break
                         except Exception:
                             continue
             except Exception:
                 continue
-        return self._get_findings()
+        return findings
 
     # ═════════════════════════════════════════════════════════════════════
     # Open Redirect
@@ -2080,15 +2106,15 @@ class VulnScanner:
                                     verification_stage=VerificationStage.VALIDATED.value,
                                     validation_steps=[f"Redirect header contains external domain: {loc[:60]}"],
                                 )
-                                if f:
-                                    self._add(f)
+                                if f and self._add(f):
+                                    findings.append(f)
                                 log(f"  [REDIRECT] {test_url[:80]}", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
                                 break
                         except Exception:
                             continue
             except Exception:
                 continue
-        return self._get_findings()
+        return findings
 
     # ═════════════════════════════════════════════════════════════════════
     # CSRF
@@ -2123,12 +2149,12 @@ class VulnScanner:
                         evidence=f"Form action: {form_action}",
                         verification_stage=VerificationStage.DETECTED.value,
                     )
-                    if f:
-                        self._add(f)
+                    if f and self._add(f):
+                        findings.append(f)
                     log(f"  [CSRF] {form_action}", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
             except Exception:
                 continue
-        return self._get_findings()
+        return findings
 
     # ═════════════════════════════════════════════════════════════════════
     # Directory Fuzzing
@@ -2176,12 +2202,36 @@ class VulnScanner:
                         evidence=f"HTTP {resp.status_code}",
                         verification_stage=VerificationStage.DETECTED.value,
                     )
-                    if f:
-                        self._add(f)
+                    if f and self._add(f):
+                        findings.append(f)
                     log(f"  [DIRB] {target_url}", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+                elif resp and resp.status_code == 403:
+                    f = finding(
+                        vuln_type="Forbidden Path (Access Control Exists)",
+                        url=target_url,
+                        severity="info",
+                        details=f"Path exists but is access-controlled (HTTP 403): {target_url}",
+                        evidence=f"HTTP 403",
+                        verification_stage=VerificationStage.DETECTED.value,
+                    )
+                    if f and self._add(f):
+                        findings.append(f)
+                    log(f"  [DIRB 403] {target_url}", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+                elif resp and resp.status_code == 401:
+                    f = finding(
+                        vuln_type="Authentication Required Path",
+                        url=target_url,
+                        severity="info",
+                        details=f"Path requires authentication (HTTP 401): {target_url}",
+                        evidence=f"HTTP 401",
+                        verification_stage=VerificationStage.DETECTED.value,
+                    )
+                    if f and self._add(f):
+                        findings.append(f)
+                    log(f"  [DIRB 401] {target_url}", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
             except Exception:
                 continue
-        return self._get_findings()
+        return findings
 
     # ═════════════════════════════════════════════════════════════════════
     # Exposed Files
@@ -2290,13 +2340,12 @@ class VulnScanner:
                             verification_stage=VerificationStage.VALIDATED.value if (validation_result and validation_result.get("valid") is True) else VerificationStage.DETECTED.value,
                             validation_steps=validation_steps,
                         )
-                        if f:
-                            self._add(f)
+                        if f and self._add(f):
+                            findings.append(f)
                         log(f"  [SENSITIVE] {url} - {label}", Colors.RED, verbose_only=True, verbose=self.verbose)
-                        break
             except Exception:
                 continue
-        return self._get_findings()
+        return findings
 
     # ═════════════════════════════════════════════════════════════════════
     # Headers
@@ -2317,6 +2366,19 @@ class VulnScanner:
             self._scan_disclosure_headers(findings, target, resp)
             self._scan_policy_headers(findings, target, resp)
             self._scan_cookie_headers(findings, target, resp)
+
+            # Also check subdomains discovered during recon
+            for sub in (self.recon.get("subdomains", []) or [])[:20]:
+                sub_url = f"https://{sub}"
+                if not self._in_scope(sub_url):
+                    continue
+                sub_resp = safe_get(self.session, sub_url, self.timeout)
+                if not sub_resp:
+                    continue
+                self._scan_missing_headers(findings, sub_url, sub_resp)
+                self._scan_disclosure_headers(findings, sub_url, sub_resp)
+                self._scan_policy_headers(findings, sub_url, sub_resp)
+                self._scan_cookie_headers(findings, sub_url, sub_resp)
         except Exception:
             pass
         for f in findings:
@@ -2328,7 +2390,7 @@ class VulnScanner:
             if header in resp.headers:
                 continue
             f = finding(
-                vuln_type="Missing Security Header",
+                vuln_type=f"Missing Security Header: {header}",
                 url=target,
                 severity=severity,
                 details=f"Response is missing the '{header}' header",
@@ -2406,19 +2468,54 @@ class VulnScanner:
             if f:
                 findings.append(f)
 
+        # CORS Origin reflection probe
+        try:
+            evil_origin = "https://evil-bugbounty-probe.com"
+            probe_headers = {"Origin": evil_origin}
+            probe_resp = safe_get(self.session, target, self.timeout, headers=probe_headers)
+            if probe_resp:
+                reflected_acao = probe_resp.headers.get("Access-Control-Allow-Origin", "")
+                reflected_acc = probe_resp.headers.get("Access-Control-Allow-Credentials", "").lower()
+                if evil_origin in reflected_acao and reflected_acc == "true":
+                    f = finding(
+                        vuln_type="CORS Origin Reflection",
+                        url=target,
+                        severity="critical",
+                        details="Access-Control-Allow-Origin reflects Origin header verbatim with credentials allowed — full account access risk",
+                        evidence=f"Origin: {evil_origin} -> ACAO: {reflected_acao}, ACC: {reflected_acc}",
+                        verification_stage=VerificationStage.VALIDATED.value,
+                        validation_steps=[
+                            f"Sent request with Origin: {evil_origin}",
+                            f"ACAO reflected: {reflected_acao}",
+                            "Credentials allowed: true — full CORS trust to arbitrary origin",
+                        ],
+                    )
+                    if f:
+                        findings.append(f)
+        except Exception:
+            pass
+
     def _scan_cookie_headers(self, findings: list[dict], target: str, resp) -> None:
-        cookie_headers = resp.headers.get("Set-Cookie", "")
-        if cookie_headers and ("secure" not in cookie_headers.lower() or "httponly" not in cookie_headers.lower()):
-            f = finding(
-                vuln_type="Insecure Session Cookie",
-                url=target,
-                severity="medium",
-                details="Set-Cookie header may be missing Secure and/or HttpOnly flags.",
-                evidence=f"Set-Cookie: {cookie_headers}",
-                verification_stage=VerificationStage.DETECTED.value,
-            )
-            if f:
-                findings.append(f)
+        cookie_vals = resp.raw.headers.getlist("Set-Cookie") if hasattr(resp.raw.headers, "getlist") else [resp.headers.get("Set-Cookie", "")]
+        for cookie in cookie_vals:
+            if not cookie:
+                continue
+            missing = []
+            if "secure" not in cookie.lower():
+                missing.append("Secure")
+            if "httponly" not in cookie.lower():
+                missing.append("HttpOnly")
+            if missing:
+                f = finding(
+                    vuln_type="Insecure Session Cookie",
+                    url=target,
+                    severity="medium",
+                    details=f"Set-Cookie missing {', '.join(missing)} flags.",
+                    evidence=f"Set-Cookie: {cookie[:120]}",
+                    verification_stage=VerificationStage.DETECTED.value,
+                )
+                if f:
+                    findings.append(f)
 
     # ═════════════════════════════════════════════════════════════════════
     # Clickjacking
@@ -2680,50 +2777,61 @@ class VulnScanner:
                     "email": "probe@ratelimit.test",
                 }
 
-            statuses: list[int] = []
+            PROBE_COUNT = 50
+            results: list[tuple[int, str]] = []
             start = time.time()
 
-            for _ in range(20):
+            def _probe(_idx: int) -> tuple[int, str]:
                 try:
-                    resp = self.session.post(test_url, data=probe_data, timeout=self.timeout)
-                    statuses.append(resp.status_code)
+                    r = self.session.post(test_url, data=probe_data, timeout=self.timeout)
+                    return (r.status_code, r.text[:500])
                 except Exception:
-                    statuses.append(0)
-                time.sleep(0.05)
+                    return (0, "")
+
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                for status_code, body_snippet in pool.map(_probe, range(PROBE_COUNT)):
+                    results.append((status_code, body_snippet))
 
             elapsed = time.time() - start
+            statuses = [s for s, _ in results]
+            bodies = [b for _, b in results]
             unique_statuses = set(statuses)
             has_429 = 429 in unique_statuses
             has_5xx = any(s >= 500 for s in unique_statuses)
+            first_body = bodies[0] if bodies else ""
+            body_changed = any(b != first_body for b in bodies[1:])
 
-            if not has_429 and not has_5xx:
-                avg_time = elapsed / 20
+            throttled = has_429 or (body_changed and not has_5xx)
+            if not throttled:
                 evidence = (
-                    f"Sent 20 POST requests. Statuses: {sorted(unique_statuses)}. "
-                    f"No 429 received. Avg response time: {avg_time:.2f}s. "
+                    f"Sent {PROBE_COUNT} POST requests. Statuses: {sorted(unique_statuses)}. "
+                    f"No 429 received. Body changed: {body_changed}. "
                     f"Endpoint: {test_url}"
                 )
                 f = finding(
                     vuln_type="Missing Rate Limiting",
                     url=test_url,
                     severity=severity,
-                    details=f"Endpoint accepted 20 POST requests in {elapsed:.1f}s without rate limiting",
+                    details=f"Endpoint accepted {PROBE_COUNT} POST requests in {elapsed:.1f}s without rate limiting",
                     evidence=evidence,
                     verification_stage=VerificationStage.VALIDATED.value,
                     validation_steps=[
-                        f"Sent 20 rapid POST requests to {test_url}",
+                        f"Sent {PROBE_COUNT} burst POST requests to {test_url} (5 workers)",
                         f"Received statuses: {sorted(unique_statuses)}",
+                        f"Body changed across requests: {body_changed}",
                         f"No 429 returned — rate limiting absent or ineffective",
                     ],
                 )
-                if f:
-                    self._add(f)
+                if f and self._add(f):
                     findings.append(f)
                     log(f"  [RATE LIMITING] {test_url} — no 429 in {elapsed:.1f}s",
                         Colors.RED, verbose_only=True, verbose=self.verbose)
             elif has_429:
                 log(f"  [RATE LIMITING] {test_url} — rate limited (429 present)",
                     Colors.GREEN, verbose_only=True, verbose=self.verbose)
+            elif body_changed:
+                log(f"  [RATE LIMITING] {test_url} — body changed (throttling suspected)",
+                    Colors.YELLOW, verbose_only=True, verbose=self.verbose)
 
         return self._get_findings()
 
@@ -2955,11 +3063,9 @@ class VulnScanner:
                             evidence=r.text[:120],
                             verification_stage=VerificationStage.DETECTED.value,
                         )
-                        if f:
-                            self._add(f)
+                        if f and self._add(f):
+                            findings.append(f)
 
-        for f in findings:
-            self._add(f)
         return findings
 
     # ═════════════════════════════════════════════════════════════════════
@@ -2968,6 +3074,7 @@ class VulnScanner:
 
     @staticmethod
     def verify_report(report_path: str, config: dict) -> list[dict]:
+        reset_seen_findings()
         import json
         try:
             with open(report_path, "r") as f:

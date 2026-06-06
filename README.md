@@ -139,9 +139,9 @@ Recon and all active modules respect these rules.
 | Command Injection | `cmd_injection` | Output-based (`uid=`), time-based (≥5s), OOB callback (nslookup/curl) |
 | Blind XSS | `blind_xss` | Inject OOB-payload forms/params, poll for callback from admin browser |
 | Open redirect | `open_redirect` | Redirect parameter abuse |
-| Headers | `headers` | Missing security headers, disclosure, CORS, cookies |
+| Headers | `headers` | Missing security headers, disclosure, CORS (including origin reflection), cookies, subdomain scan |
 | CSRF | `csrf` | POST forms without anti-CSRF tokens |
-| Directory fuzz | `dirb` | Common paths and optional wordlist |
+| Directory fuzz | `dirb` | Common paths (200 → exposed, 403/401 → access control info) and optional wordlist |
 | Sensitive data | `sensitive` | Secret patterns in page bodies + **live validation** (AWS keys, GitHub tokens, Slack tokens) |
 | Exposed files | `exposed_files` | `.env`, `.git`, backups, etc. |
 | Clickjacking | `clickjacking` | Missing frame protection |
