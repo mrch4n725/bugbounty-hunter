@@ -7,6 +7,23 @@ from reporting.base import ReporterBase
 
 
 class MarkdownReporter(ReporterBase):
+    def _get_evidence_markdown(self, finding: Any) -> str:
+        """Render evidence as markdown blocks, handling both list and string formats."""
+        evidence = finding.get("evidence", "")
+        if not evidence:
+            return "*No evidence collected.*"
+        if isinstance(evidence, list):
+            parts = []
+            for i, ev in enumerate(evidence):
+                if hasattr(ev, 'to_dict'):
+                    ev_text = json.dumps(ev.to_dict(), indent=2)
+                else:
+                    ev_text = str(ev)
+                desc = getattr(ev, 'description', f'Evidence #{i+1}') if hasattr(ev, 'description') else f'Evidence #{i+1}'
+                parts.append(f"> **{desc}**\n```\n{ev_text}\n```")
+            return "\n\n".join(parts)
+        return f"```\n{evidence}\n```"
+
     def render(self) -> str:
         md_dir = os.path.join(self.output_dir, "markdown")
         Path(md_dir).mkdir(parents=True, exist_ok=True)
@@ -21,25 +38,17 @@ class MarkdownReporter(ReporterBase):
             remediation = self._build_remediation(finding)
 
             details = finding.get("details", "")
-            evidence = self._format_evidence(finding.get("evidence", ""))
+            evidence_md = self._get_evidence_markdown(finding)
             request = finding.get("request", "")
             response_excerpt = finding.get("response_excerpt", "")
             steps_to_reproduce = finding.get("steps_to_reproduce", [])
 
-            steps = f"""
-1.  Navigate to the affected endpoint: `{finding.get('url', 'N/A')}`
-2.  {details}
-3.  Observe the evidence below to confirm the vulnerability.
-"""
+            steps = ""
             if steps_to_reproduce:
                 steps_lines = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps_to_reproduce))
-                steps += f"\n## Detailed Steps to Reproduce\n\n{steps_lines}\n"
-            if evidence:
-                steps += f"\n## Evidence\n\n```\n{evidence}\n```\n"
-            if request:
-                steps += f"\n## Request\n\n```\n{request}\n```\n"
-            if response_excerpt:
-                steps += f"\n## Response Excerpt\n\n```\n{response_excerpt}\n```\n"
+                steps = f"{steps_lines}\n"
+            if not steps:
+                steps = f"1. Navigate to the affected endpoint: `{finding.get('url', 'N/A')}`\n2. {details}\n3. Observe the evidence below to confirm the vulnerability.\n"
 
             vuln_type = finding.get("title", "finding").replace(" ", "_").replace("/", "_")
             safe_target = self._sanitize_target()
@@ -61,11 +70,11 @@ class MarkdownReporter(ReporterBase):
 **Component:** `{component}`
 **Severity:** {finding.get('severity', 'info').upper()}
 **Confidence:** {score_str}
+**CVSS:** {cvss_score:.1f} ({rating})
+**CVSS Vector:** `{cvss_vector}`
 **Verification Stage:** {stage}
 **Evidence Strength:** {evidence_strength or '—'}
 **False Positive Risk:** {fpr or '—'}
-**CVSS Score:** {cvss_score} ({rating})
-**CVSS Vector:** `{cvss_vector}`
 
 ---
 
@@ -74,6 +83,7 @@ class MarkdownReporter(ReporterBase):
 {finding.get('what_is_it') or details}
 
 ## Steps to Reproduce
+
 {steps}
 """
             if validation_steps:
@@ -86,6 +96,17 @@ class MarkdownReporter(ReporterBase):
                 for gu in grouped_urls:
                     content += f"- {gu}\n"
                 content += "\n"
+
+            content += f"""## Evidence
+
+{evidence_md}
+
+## Request
+
+```\n{request}\n```\n""" if request else ""
+
+            if response_excerpt:
+                content += f"## Response Excerpt\n\n```\n{response_excerpt}\n```\n\n"
 
             content += f"""## Impact
 

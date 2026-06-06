@@ -179,6 +179,28 @@ class HTMLReporter(ReporterBase):
         cards += f'<div class="stat-card detect"><div class="val">{ver.get("detected",0)}</div><div class="lbl">Detected</div></div>'
         return cards
 
+    def _get_evidence_html(self, f: Any) -> str:
+        """Render evidence from Finding (list) or legacy (string) format."""
+        evidence = f.get("evidence", "")
+        if not evidence and isinstance(evidence, list) and not evidence:
+            return ""
+        if isinstance(evidence, list):
+            parts = []
+            for i, ev in enumerate(evidence):
+                if hasattr(ev, 'to_dict'):
+                    ev_text = json.dumps(ev.to_dict(), indent=2)
+                else:
+                    ev_text = str(ev)
+                e_text = html.escape(ev_text)
+                desc = getattr(ev, 'description', f'Evidence #{i+1}') if hasattr(ev, 'description') else f'Evidence #{i+1}'
+                parts.append(
+                    f'<details><summary>{html.escape(desc)} ({len(ev_text)} chars)</summary>'
+                    f'<div class="evidence">{e_text}</div></details>'
+                )
+            return f'<div class="row"><strong>Evidence:</strong>{"".join(parts)}</div>'
+        e_evidence = html.escape(evidence)
+        return f'<div class="row"><strong>Evidence:</strong><details><summary>View evidence ({len(evidence)} chars)</summary><div class="evidence">{e_evidence}</div></details></div>'
+
     def _build_finding_cards_html(self, findings: List[Dict[str, Any]]) -> str:
         if not findings:
             return '<div class="empty-message">No vulnerabilities found.</div>'
@@ -187,7 +209,6 @@ class HTMLReporter(ReporterBase):
             sev = f.get("severity", "info").lower()
             stage = f.get("verification_stage", "detected").lower()
             score = f.get("confidence_score", 0)
-            evidence = f.get("evidence", "")
             details = f.get("details", "")
             vuln_url = f.get("url", "")
             fpr = f.get("false_positive_risk", "")
@@ -203,7 +224,6 @@ class HTMLReporter(ReporterBase):
             stage_label = stage.title()
 
             e_details = html.escape(details)
-            e_evidence = html.escape(evidence)
             e_vuln_url = html.escape(vuln_url)
             e_request = html.escape(request)
             e_response = html.escape(response_excerpt)
@@ -215,9 +235,7 @@ class HTMLReporter(ReporterBase):
                 items = "".join(f"<li>{html.escape(s)}</li>" for s in steps[:5])
                 steps_html = f'<div class="row"><strong>Steps:</strong><ol class="steps">{items}</ol></div>'
 
-            evidence_html = ""
-            if evidence:
-                evidence_html = f'<div class="row"><strong>Evidence:</strong><details><summary>View evidence ({len(evidence)} chars)</summary><div class="evidence">{e_evidence}</div></details></div>'
+            evidence_html = self._get_evidence_html(f)
 
             request_html = ""
             if request:
@@ -237,7 +255,16 @@ class HTMLReporter(ReporterBase):
                 steps_to_reproduce_html = f'<div class="row"><strong>Steps to Reproduce:</strong><ol class="steps">{items}</ol></div>'
 
             curl_cmd = self._build_curl_command(f)
-            cvss_html = f'<span>CVSS: {cvss:.1f}</span>' if isinstance(cvss, (int, float)) else ""
+            cvss_score = self._get_cvss_score(f)
+            cvss_vector = self._get_cvss_vector(f)
+            cvss_rating = self._severity_rating(cvss_score)
+            cvss_html = f'<span>CVSS: {cvss_score:.1f} ({cvss_rating})</span>' if cvss_score > 0 else ""
+
+            impact_narrative = self._build_impact_narrative(f)
+            e_impact = html.escape(impact_narrative)
+
+            remediation = self._build_remediation(f)
+            e_remediation = html.escape(remediation)
 
             html_out += f'''<div class="finding-card {sev_class}" data-severity="{sev}" data-stage="{stage}">
                 <div class="finding-header">
@@ -257,7 +284,9 @@ class HTMLReporter(ReporterBase):
                     {screenshot_html}
                     {steps_html}
                     {steps_to_reproduce_html}
-                    <div class="row"><strong>FP Risk:</strong> {e_fpr} {cvss_html}</div>
+                    <div class="row"><strong>FP Risk:</strong> {e_fpr} | {cvss_html}</div>
+                    <div class="row"><strong>Impact:</strong> {e_impact}</div>
+                    <div class="row"><strong>Remediation:</strong> {e_remediation}</div>
                 </div>
             </div>'''
 

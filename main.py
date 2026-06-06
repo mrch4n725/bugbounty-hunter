@@ -21,6 +21,7 @@ from modules.idor import IdorScanner
 from modules.reporter import Reporter
 from modules.js_intelligence import JSIntelligence
 from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score, prioritize_findings, reset_seen_findings, _build_curl, set_mask_sensitive_default
+from models.finding import Finding
 
 
 def parse_args():
@@ -540,9 +541,24 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         all_findings.extend(updated)
 
 
+def _findings_to_finding(config, all_findings, recon_data, js_data):
+    """Convert legacy dict findings to canonical Finding instances at the pipeline boundary."""
+    converted = []
+    for f in all_findings:
+        if isinstance(f, Finding):
+            converted.append(f)
+        elif isinstance(f, dict):
+            converted.append(Finding.from_dict(f))
+        else:
+            converted.append(Finding.from_dict({"type": "unknown", "url": str(f)}))
+    return converted
+
+
 def _write_report_and_summary(config, all_findings, recon_data, js_data=None) -> int:
+    # Adapt legacy dict findings to canonical Finding instances
+    adapted = _findings_to_finding(config, all_findings, recon_data, js_data)
     try:
-        report_path = Reporter(config, all_findings, recon_data, js_data=js_data).generate()
+        report_path = Reporter(config, adapted, recon_data, js_data=js_data).generate()
         log(f"\n[✓] Report saved → {report_path}", Colors.GREEN)
     except Exception as e:
         log(f"\n[✗] Failed to save report: {e}", Colors.RED)

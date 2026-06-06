@@ -17,29 +17,52 @@ class BugcrowdReporter(ReporterBase):
             stage = f.get("verification_stage", "").title() or "Detected"
             confidence = f.get("confidence_score")
             cs = f"{confidence:.0f}/100" if confidence is not None else "—"
-            summary_rows.append(f"| {i} | {title} | {sev} | `{url}` | {stage} | {cs} |")
+            cvss_score = self._get_cvss_score(f)
+            cvss_rating = self._severity_rating(cvss_score)
+            summary_rows.append(f"| {i} | {title} | {sev} | `{url}` | {stage} | {cs} | {cvss_score:.1f} ({cvss_rating}) |")
 
-        summary_table = "\n".join(summary_rows) if summary_rows else "No findings."
+        summary_header = "| # | Title | Severity | URL | Stage | Confidence | CVSS |"
+        summary_sep = "|---|-------|----------|-----|-------|------------|------|"
+        summary_table = "\n".join(summary_rows) if summary_rows else "| No findings. |"
 
         per_finding = []
         for i, f in enumerate(self.findings, 1):
             title = f.get("title") or f.get("details", "Untitled")
             sev = f.get("severity", "info").upper()
             what = f.get("what_is_it") or f.get("details", "")
-            impact = f.get("impact_assessment", {}).get("narrative", "")
+            impact_narrative = self._build_impact_narrative(f)
             steps = f.get("validation_steps") or f.get("steps_to_reproduce", "")
             if isinstance(steps, list):
                 steps = "\n".join(f"{j+1}. {s}" for j, s in enumerate(steps))
             remed = f.get("remediation") or f.get("recommendation", "")
+            remed = remed or self._build_remediation(f)
             evidence = f.get("proof") or f.get("evidence", "")
             if isinstance(evidence, dict):
                 evidence = json.dumps(evidence, indent=2)
+            elif isinstance(evidence, list):
+                evidence_parts = []
+                for j, ev in enumerate(evidence):
+                    if hasattr(ev, 'to_dict'):
+                        ev_text = json.dumps(ev.to_dict(), indent=2)
+                    else:
+                        ev_text = str(ev)
+                    desc = getattr(ev, 'description', f'Evidence #{j+1}') if hasattr(ev, 'description') else f'Evidence #{j+1}'
+                    evidence_parts.append(f"> **{desc}**\n```\n{ev_text}\n```")
+                evidence = "\n".join(evidence_parts) if evidence_parts else ""
 
             confidence = f.get("confidence_score")
             cs = f"{confidence:.0f}/100" if confidence is not None else "—"
 
+            cvss_score = self._get_cvss_score(f)
+            cvss_vector = self._get_cvss_vector(f)
+            cvss_rating = self._severity_rating(cvss_score)
+
             grouped = f.get("grouped_urls", [])
             urls = "\n".join(f"- {u}" for u in grouped) if grouped else f"- {f.get('url', self.target)}"
+
+            screenshot_path = f.get("screenshot_path", "")
+            screenshot_line = f"\n**Screenshot:** {screenshot_path}\n" if screenshot_path else ""
+            response_excerpt = f.get("response_excerpt", "")
 
             per_finding.append(f"""## Finding #{i}: {title}
 
@@ -49,8 +72,10 @@ class BugcrowdReporter(ReporterBase):
 | URL | `{f.get('url', self.target)}` |
 | Verification Stage | {f.get('verification_stage', '').title() or 'Detected'} |
 | Confidence | {cs} |
-| CVSS | {f.get('cvss_score', '—')} ({f.get('cvss_rating', '—')}) |
+| CVSS | {cvss_score:.1f} ({cvss_rating}) |
+| CVSS Vector | `{cvss_vector}` |
 | Parameter | `{f.get('parameter', '—')}` |
+| False Positive Risk | {f.get('false_positive_risk', '—')} |
 
 ### Description
 {what}
@@ -58,22 +83,19 @@ class BugcrowdReporter(ReporterBase):
 ### Affected URLs
 {urls}
 
-### Steps to Reproduce
-{steps}
-
 ### Evidence
-```
-{self._format_evidence(evidence, 50)}
-```
+{evidence if evidence else "*No evidence collected.*"}
 
 ### Request
 ```
 {self._build_curl_command(f)}
 ```
-{("### Response\n```\n" + f.get('response_excerpt', '') + "\n```\n") if f.get('response_excerpt') else ""}
-{("Screenshot: " + f.get('screenshot_path', '') + "\n") if f.get('screenshot_path') else ""}
+{"### Response Excerpt\n```\n" + response_excerpt + "\n```\n" if response_excerpt else ""}{screenshot_line}
+### Steps to Reproduce
+{steps or "1. Send a request to the affected endpoint to reproduce the vulnerability."}
+
 ### Impact
-{impact}
+{impact_narrative}
 
 ### Remediation
 {remed}
@@ -91,8 +113,8 @@ class BugcrowdReporter(ReporterBase):
 
 ## Finding Summary
 
-| # | Title | Severity | URL | Stage | Confidence |
-|---|-------|----------|-----|-------|------------|
+{summary_header}
+{summary_sep}
 {summary_table}
 
 ---

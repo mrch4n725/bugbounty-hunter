@@ -56,7 +56,8 @@ Key capabilities:
 - **Browser-based XSS validation** — Playwright executes payloads in a headless Chromium instance and captures screenshots of successful execution
 - **Intelligence-led scanning** — each URL is classified by signals (query params, path patterns, forms) and only relevant modules run
 - **Scope enforcement** — every outbound request, including redirect chains, is validated against allowed targets
-- **Submission-ready reports** — HTML, JSON, TXT, Markdown, HackerOne, and Bugcrowd formats with CVSS, reproduction steps, and curl commands
+- **Canonical Finding model** — all findings normalized to the `Finding` dataclass with UUIDv7 identifiers, SHA-256 root-cause fingerprints, CVSS vectors, impact narratives, and remediation guidance
+- **Submission-ready reports** — HTML, JSON, TXT, Markdown, HackerOne, and Bugcrowd formats with CVSS scoring, impact assessment, remediation guidance, structured evidence, and curl reproduction commands
 - **Resume support** — interrupted scans can be resumed from their last checkpoint
 - **Authenticated scanning** — cookie and header injection for session-based testing
 
@@ -427,16 +428,20 @@ Only validated secrets appear in findings. Invalid or unverifiable secrets are f
 
 ## Reports
 
+Every report format now computes **CVSS score + vector**, **impact narrative**, and **remediation guidance** per finding — even for findings from the legacy scanner that lacked these fields. The canonical `Finding` dataclass supports structured evidence via `EvidenceBase` polymorphic subclasses, UUIDv7 identifiers, and SHA-256 root-cause fingerprints for deduplication.
+
 | Format | Contents |
 |--------|----------|
-| **HTML** | Dark-themed dashboard with severity summary, verified badges, finding cards with collapsible evidence, screenshot display, and one-click curl copy |
-| **JSON** | Full structured scan result for programmatic processing |
-| **TXT** | Plain-text summary for terminals and CI |
-| **Markdown** (`markdown-report`) | Per-finding `.md` files with curl reproduction commands, CVSS, impact, and remediation |
-| **HackerOne** (`hackerone`) | Ready-to-submit format with per-finding sections, CVSS vector, evidence, impact, and reproduction steps |
-| **Bugcrowd** (`bugcrowd`) | Summary table plus per-finding detail with verification stage and confidence |
+| **HTML** | Dark-themed dashboard with severity summary, verified badges, finding cards with collapsible evidence blocks, CVSS score + rating, impact narrative, remediation guidance, screenshot display, and one-click curl copy |
+| **JSON** | Full structured scan result with CVSS, impact, remediation, and tool metadata for programmatic processing |
+| **TXT** | Plain-text CVSS + impact + remediation per finding, with structured evidence blocks |
+| **Markdown** (`markdown-report`) | Per-finding `.md` files with CVSS vector + score + rating, impact narrative, remediation guidance, structured evidence, and curl reproduction commands |
+| **HackerOne** (`hackerone`) | Submission-optimized format: evidence blocks → CVSS vector → component → parameter → verification stage → FP risk → summary → affected URLs → evidence → request → response → impact → remediation → reproduction steps |
+| **Bugcrowd** (`bugcrowd`) | CVSS vector in finding summary table plus per-finding detail with evidence, verification stage, impact, and remediation |
 
 Root-cause grouping can be enabled via config (`--module-param reporter.group_by_root_cause=true`) to group findings by their root-cause fingerprint. Enriched findings include `grouped_urls`, `group_severity`, and `group_verification_stage` fields used by HackerOne and Bugcrowd reporters.
+
+All report output is self-XSS safe — `html.escape()` applied to every user-provided field at render time, and copy buttons use a single delegated event listener (`no onclick=` attributes).
 
 Additional report features:
 
@@ -609,6 +614,7 @@ class MyCheckScanner(ScannerBase):
 3. **Configure per-URL dispatch** — Add to `classify_endpoint()` in `utils.py` so it only runs on applicable URLs.
 
 4. **Add impact narrative** — Add an entry to `IMPACT_MATRIX` in `reporting/base.py`.
+5. **Add remediation guidance** — Add an entry to `REMEDIATION_MATRIX` in `reporting/base.py` so reports include actionable fix guidance for the new vuln type.
 
 ### Legacy Method (VulnScanner subclass)
 

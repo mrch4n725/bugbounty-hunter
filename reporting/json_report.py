@@ -19,6 +19,8 @@ class JSONReporter(ReporterBase):
                 'timestamp': self.timestamp,
                 'report_date': datetime.now().isoformat(),
                 'total_findings': len(self.findings),
+                'tool': 'BugBounty-Hunter',
+                'report_format': 'JSON',
             },
             'scan_config': {
                 'modules': self.config.get('modules', []),
@@ -36,9 +38,10 @@ class JSONReporter(ReporterBase):
                 'severity': severity_counts,
                 'confidence': confidence_breakdown,
                 'verification_stage': verification_breakdown,
+                'confirmed': confirm_counts.get('confirmed', 0),
+                'total': len(self.findings),
             },
-            'verification': confirm_counts,
-            'findings': sorted_findings,
+            'findings': self._findings_as_dicts(sorted_findings),
             'recon_data': {
                 'subdomains': self.recon_data.get('subdomains', []),
                 'urls': self.recon_data.get('urls', []),

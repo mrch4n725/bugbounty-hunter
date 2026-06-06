@@ -4,9 +4,10 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from modules.utils import log, Colors, _build_curl
+from models.finding import Finding
 
 
 CVSS_BY_SEVERITY: Dict[str, float] = {
@@ -82,7 +83,100 @@ ATO_LABELS = {0: "No risk", 1: "Low", 2: "Medium", 3: "High", 4: "Very High", 5:
 RCE_LABELS = {0: "No risk", 1: "Low", 2: "Medium", 3: "High", 4: "Very High", 5: "Immediate RCE"}
 
 
-def assess_finding_impact(finding: Dict[str, Any]) -> Dict[str, Any]:
+REMEDIATION_MATRIX: Dict[str, str] = {
+    "xss": "Apply context-aware output encoding (HTML entity, JS string, CSS, URL). "
+           "Use Content-Security-Policy headers. Validate input on both client and server sides. "
+           "For reflected XSS: ensure user input is never rendered unsanitized in HTTP responses. "
+           "For stored XSS: sanitize on output, not input storage. "
+           "For DOM XSS: avoid dangerous sink methods (innerHTML, document.write, eval).",
+    "sqli": "Use parameterized queries / prepared statements. Apply strict input validation "
+            "allowing only expected character classes. Use an ORM layer that handles parameterization. "
+            "Least-privilege database accounts. WAF rules for SQL injection patterns.",
+    "sql injection": "Use parameterized queries / prepared statements. Apply strict input validation "
+                     "allowing only expected character classes. Use an ORM layer that handles parameterization. "
+                     "Least-privilege database accounts. WAF rules for SQL injection patterns.",
+    "lfi": "Validate and sanitize file paths. Use a whitelist of allowed files. Disable path traversal "
+           "sequences (../). Run application with least file-system privileges. Use a database or "
+           "secure storage instead of direct file inclusion.",
+    "ssrf": "Restrict outbound network access from the application server. Validate and whitelist "
+            "allowed URLs/schemes. Block access to private IP ranges (169.254.0.0/16, 10.0.0.0/8, "
+            "172.16.0.0/12, 192.168.0.0/16). Use a URL parser that rejects unexpected schemes.",
+    "xxe": "Disable XML external entity processing in your XML parser. Use less complex data formats "
+           "like JSON. If XML is required, configure the parser to disable DTDs and external entities.",
+    "ssti": "Never render user input as template content. Use sandboxed template engines. "
+            "Apply context-aware escaping. Validate input against expected patterns.",
+    "cmd_injection": "Avoid passing user input to system commands. Use language-native APIs instead "
+                     "of shell commands. Apply strict input validation and allowlisting. "
+                     "Run with least OS privileges.",
+    "command injection": "Avoid passing user input to system commands. Use language-native APIs instead "
+                        "of shell commands. Apply strict input validation and allowlisting. "
+                        "Run with least OS privileges.",
+    "blind_xss": "Apply Content-Security-Policy with strict script-src. Use X-XSS-Protection headers. "
+                 "Sanitize all user-controlled input before rendering. Monitor for unexpected HTTP callbacks.",
+    "open_redirect": "Avoid redirect parameters in URLs. If needed, use a hardcoded mapping of "
+                     "allowed destinations instead of accepting arbitrary URLs. Validate the "
+                     "redirect target matches an allowed allowlist.",
+    "csrf": "Implement anti-CSRF tokens on all state-changing endpoints. Use SameSite cookies "
+            "(Strict or Lax). Require re-authentication for sensitive actions. "
+            "Check Origin/Referer headers on the server side.",
+    "idor": "Implement proper authorization checks for every resource access. Use indirect "
+            "object references (mapped IDs). Verify user ownership for every requested resource. "
+            "Apply the principle of least privilege on all API endpoints.",
+    "graphql": "Disable introspection in production. Implement query cost analysis and depth limiting. "
+               "Rate-limit queries per user/IP. Apply field-level authorization. "
+               "Use persisted queries to limit allowed operations.",
+    "sensitive_data": "Remove secrets from client-side code and logs. Use environment variables "
+                      "or a secrets manager (AWS Secrets Manager, HashiCorp Vault). "
+                      "Rotate exposed credentials immediately.",
+    "sensitive data": "Remove secrets from client-side code and logs. Use environment variables "
+                     "or a secrets manager (AWS Secrets Manager, HashiCorp Vault). "
+                     "Rotate exposed credentials immediately.",
+    "exposed js secret": "Remove hardcoded secrets from JavaScript bundles. Use server-side proxies "
+                        "with proper authentication. Rotate the exposed credential and revoke it.",
+    "headers": "Set security headers: Strict-Transport-Security, X-Content-Type-Options, "
+               "X-Frame-Options, Content-Security-Policy, X-XSS-Protection, Referrer-Policy.",
+    "clickjacking": "Set X-Frame-Options: DENY or SAMEORIGIN. Use Content-Security-Policy "
+                    "frame-ancestors directive. Implement SameSite cookies.",
+    "subdomain_takeover": "Remove the DNS CNAME record pointing to the external service. "
+                          "Or claim the external service (cloud host, CDN, S3 bucket). "
+                          "Monitor for dangling DNS records regularly.",
+    "http_methods": "Restrict HTTP methods per endpoint. Disable PUT/DELETE on read-only endpoints. "
+                    "Use HEAD and OPTIONS only where needed. Return 405 Method Not Allowed for "
+                    "unsupported methods.",
+    "insecure_forms": "Serve forms over HTTPS only. Set form action to HTTPS URL. "
+                      "Use HSTS preload to enforce HTTPS across the domain.",
+    "exposed_files": "Remove sensitive files from public web root. Deny access to .git, .env, "
+                     "backup files via web server config. Store secrets outside webroot.",
+    "rate_limiting": "Implement rate limiting on authentication endpoints (login, register, "
+                     "password reset). Use exponential backoff account lockout. "
+                     "Consider CAPTCHA after N failed attempts per IP/user.",
+    "api": "Apply authentication and authorization on every API endpoint. Implement rate limiting. "
+           "Validate request schemas. Use proper HTTP status codes for errors. "
+           "Disable unnecessary HTTP methods. Log all security-relevant events.",
+    "bola": "Implement proper authorization checks for every object access. "
+            "Use indirect object references. Verify ownership before serving resources. "
+            "Apply consistent access control across all API endpoints.",
+    "mass assignment": "Use DTOs (Data Transfer Objects) to control which fields can be updated. "
+                       "Do not bind request bodies directly to ORM entities. "
+                       "Explicitly allowlist modifiable fields.",
+    "potential idor": "Implement authorization checks for the affected parameter. "
+                      "Use indirect object references. Verify that the requesting user "
+                      "owns the resource.",
+    "missing security header": "Set missing security headers. See the headers finding for "
+                               "the full list of recommended security headers.",
+    "weak csp": "Tighten Content-Security-Policy: remove 'unsafe-inline' and 'unsafe-eval' "
+                "where possible. Use nonces or hashes for inline scripts.",
+    "insecure cookie": "Set Secure, HttpOnly, and SameSite flags on all cookies. "
+                       "Use __Host- prefix for cookies that must be origin-bound.",
+    "server disclosure": "Remove or obfuscate server version headers. Use a reverse proxy "
+                         "to strip or normalize response headers.",
+    "missing rate limiting": "Implement rate limiting on the affected endpoint. "
+                            "Use sliding window or token bucket algorithms. "
+                            "Return 429 Too Many Requests with Retry-After header.",
+}
+
+
+def assess_finding_impact(finding: Union[Dict[str, Any], Finding]) -> Union[Dict[str, Any], Finding]:
     title = (finding.get("title") or finding.get("details") or "").lower()
     sev = finding.get("severity", "info").lower()
     matrix_entry = None
@@ -169,10 +263,22 @@ class ReporterBase:
     }
     SEVERITY_ORDER = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
 
-    def __init__(self, config: Dict[str, Any], findings: List[Dict[str, Any]],
-                 recon_data: Dict[str, Any], js_data: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Dict[str, Any],
+                 findings: Union[List[Dict[str, Any]], List[Finding]],
+                 recon_data: Dict[str, Any],
+                 js_data: Optional[Dict[str, Any]] = None):
         self.config = config
-        self.findings = [assess_finding_impact(f) for f in findings]
+        # Normalize all findings to Finding instances
+        normalized: list[Finding] = []
+        for f in findings:
+            if isinstance(f, Finding):
+                normalized.append(f)
+            elif isinstance(f, dict):
+                normalized.append(Finding.from_dict(f))
+            else:
+                normalized.append(Finding.from_dict({"type": "unknown", "url": str(f)}))
+        # Apply impact assessment (mutates finding in-place for dict-compat fields)
+        self.findings: list[Finding] = [assess_finding_impact(f) for f in normalized]
         self.recon_data = recon_data or {}
         self.js_data = js_data or {}
         self.target = config.get('target', 'target')
@@ -279,6 +385,38 @@ class ReporterBase:
             return "Low"
         return "None"
 
+    def _finding_to_report_dict(self, f: Any) -> Dict[str, Any]:
+        """Convert Finding to full report dict, preserving dynamic fields."""
+        if isinstance(f, dict):
+            return f
+        result = f.to_dict()
+        # Compute CVSS if not set
+        if result.get("cvss_score") is None:
+            result["cvss_score"] = self._get_cvss_score(f)
+            result["cvss_vector"] = self._get_cvss_vector(f)
+            result["cvss_rating"] = self._severity_rating(result["cvss_score"])
+        # Compute remediation if not set
+        if not result.get("remediation"):
+            result["remediation"] = self._build_remediation(f)
+        # Compute impact if not set
+        if not result.get("impact"):
+            result["impact"] = self._build_impact_narrative(f)
+        # Preserve dynamic attributes set by assess_finding_impact / group_by_root_cause
+        for attr in ('impact_assessment', 'confirmed', 'priority_score',
+                     'group_severity', 'group_verification_stage', 'group_confidence',
+                     'component', 'request_response', 'what_is_it', 'grouped_urls',
+                     'business_impact', 'demonstrated_impact'):
+            if hasattr(f, attr):
+                val = getattr(f, attr)
+                if val is not None and val != "":
+                    result[attr] = val
+        return result
+
+    def _findings_as_dicts(self, findings: Optional[List] = None) -> List[Dict[str, Any]]:
+        if findings is None:
+            findings = self.findings
+        return [self._finding_to_report_dict(f) for f in findings]
+
     def _format_evidence(self, evidence: Any, max_lines: int = 15) -> str:
         if not evidence:
             return ""
@@ -343,12 +481,19 @@ class ReporterBase:
         }
         return templates.get(sev, f"See details for impact information at `{url}`.{ev_line}")
 
-    def _build_remediation(self, finding: Dict[str, Any]) -> str:
+    def _build_remediation(self, finding: Union[Dict[str, Any], Finding]) -> str:
         rem = finding.get("remediation") or finding.get("recommendation", "")
         if rem:
-            return rem.format(url=finding.get("url", "the affected endpoint"),
-                              parameter=finding.get("parameter", ""),
-                              evidence=finding.get("evidence", ""))
+            return rem
+        vuln_type = (finding.get("title") or finding.get("details") or "").lower()
+        # Check REMEDIATION_MATRIX first
+        for key in REMEDIATION_MATRIX:
+            if key in vuln_type:
+                return REMEDIATION_MATRIX[key]
+        finding_type = (finding.get("type") or "").lower()
+        for key in REMEDIATION_MATRIX:
+            if key in finding_type:
+                return REMEDIATION_MATRIX[key]
         url = finding.get("url", "the affected endpoint")
         fallbacks = {
             "critical": f"Immediately review and fix the root cause at `{url}`. "

@@ -4,7 +4,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, ClassVar
 
 
 # ── UUIDv7 generation (Python < 3.14 compat) ──────────────────────────────
@@ -134,6 +134,87 @@ class Finding:
     root_cause_fingerprint: str = ""
     evidence_fingerprint: str = ""
 
+    # ── Dict-compatible access ─────────────────────────────────────────
+    # Makes Finding instances look like dicts to reporters and utilities.
+    # Supports f.get("key"), f["key"], f.setdefault("key", val), etc.
+
+    # Dict keys that map to different Finding field names
+    _DICT_ATTR_MAP: ClassVar[dict[str, str]] = {
+        "type": "vuln_type",
+        "steps_to_reproduce": "reproduction_steps",
+        "validation_steps": "reproduction_steps",
+        "recommendation": "remediation",
+        "what_is_it": "details",
+        "proof": "evidence",
+    }
+    # Legacy dict keys that don't have a Finding field but are preserved dynamically
+    _DICT_LEGACY_KEYS: ClassVar[set[str]] = {
+        "screenshot_path", "confirmed", "priority_score", "component",
+        "what_is_it", "request_response", "demonstrated_impact",
+    }
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self._DICT_ATTR_MAP:
+            key = self._DICT_ATTR_MAP[key]
+        try:
+            val = getattr(self, key)
+        except AttributeError:
+            # Check for legacy keys stored as dynamic attrs
+            if key in self._DICT_LEGACY_KEYS:
+                return ""
+            return ""
+        if key == "evidence" and isinstance(val, list):
+            # Legacy: evidence is a string. Return first item's str or empty.
+            if not val:
+                return ""
+            first = val[0]
+            if hasattr(first, "to_dict"):
+                return str(first.to_dict())
+            return str(first)
+        return val
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if key in self._DICT_ATTR_MAP:
+            key = self._DICT_ATTR_MAP[key]
+        if key in self.__dataclass_fields__:
+            object.__setattr__(self, key, value)
+        else:
+            # Allow dynamic attributes (e.g. impact_assessment, grouped_urls)
+            object.__setattr__(self, key, value)
+
+    def __contains__(self, key: str) -> bool:
+        if key in self._DICT_ATTR_MAP:
+            key = self._DICT_ATTR_MAP[key]
+        return key in self.__dataclass_fields__ or hasattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            val = self[key]
+            if val == "" or val is None:
+                return default
+            if isinstance(val, list) and not val:
+                return default
+            return val
+        except (AttributeError, KeyError, TypeError):
+            return default
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        try:
+            if key not in self:
+                self[key] = default
+            return self[key]
+        except (AttributeError, KeyError, TypeError):
+            return default
+
+    def keys(self) -> list[str]:
+        return list(self.__dataclass_fields__.keys())
+
+    def values(self) -> list[Any]:
+        return [self[k] for k in self.keys()]
+
+    def items(self) -> list[tuple[str, Any]]:
+        return [(k, self[k]) for k in self.keys()]
+
     target: str = ""
     url: str = ""
     parameter: str = ""
@@ -256,4 +337,8 @@ class Finding:
             timestamp=d.get("timestamp", ""),
         )
         f.evidence = evidence_list
+        # Preserve legacy keys as dynamic attributes for backward compat
+        for legacy_key in Finding._DICT_LEGACY_KEYS:
+            if legacy_key in d and d[legacy_key]:
+                object.__setattr__(f, legacy_key, d[legacy_key])
         return f
