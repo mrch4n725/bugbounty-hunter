@@ -478,9 +478,12 @@ class VulnScanner:
         if not f:
             return False
         with self._lock:
-            added = self.dedup.add_legacy(f)
-            if added is None:
+            if not self.dedup.add_legacy(f):
                 return False
+            sev = f.get("severity", "info").upper()
+            title = f.get("title", "Finding")[:60]
+            url = f.get("url", "")[:60]
+            log(f"  [FOUND] [{sev}] {title} @ {url}", Colors.RED if sev in ("CRITICAL", "HIGH") else Colors.YELLOW)
             return True
 
     def _get_findings(self) -> list[dict]:
@@ -515,7 +518,7 @@ class VulnScanner:
                 # Try time-based if error-based was used
                 payloads = self._load_payloads("sqli")
                 original_val = f.get("original_value", "1")
-                signals = self._sqli_test_parameter(url, param or "id", original_val, payloads, self.config.get("oob_host"))
+                signals, _ = self._sqli_test_parameter(url, param or "id", original_val, payloads, self.config.get("oob_host"))
                 if signals.get("time") or signals.get("union") or signals.get("oob"):
                     f["verification_stage"] = VerificationStage.VALIDATED.value
                     log(f"  [Re-verify] SQLi at {url} promoted to VALIDATED via alternative signal", Colors.GREEN, verbose_only=True, verbose=self.verbose)
@@ -565,35 +568,45 @@ class VulnScanner:
             c_origin = VulnScanner._origin(c["url"])
             match = next((x for x in xss if VulnScanner._origin(x["url"]) == c_origin), None)
             if match:
-                chain_finding = {
-                    "title": "Chained: CSRF + XSS → Account Takeover",
-                    "type": "chain",
-                    "severity": "critical",
-                    "details": "CSRF vulnerabilities allow an attacker to forge requests; combined with stored XSS, this enables silent account takeover without user interaction beyond visiting a page.",
-                    "impact": "Full account takeover via CSRF-triggered stored XSS payload injection.",
-                    "url": c["url"] + " & " + match["url"],
-                    "verification_stage": VerificationStage.VALIDATED.value,
-                    "evidence": f"Same-origin CSRF ({c['url']}) + XSS ({match['url']})",
-                    "chains": True,
-                }
-                chains_found.append(chain_finding)
+                cf = finding(
+                    vuln_type="Chained: CSRF + XSS → Account Takeover",
+                    url=c["url"] + " & " + match["url"],
+                    severity="critical",
+                    details="CSRF vulnerabilities allow an attacker to forge requests; combined with stored XSS, this enables silent account takeover without user interaction beyond visiting a page.",
+                    evidence=f"Same-origin CSRF ({c['url']}) + XSS ({match['url']})",
+                    verification_stage=VerificationStage.VALIDATED.value,
+                    steps_to_reproduce=[
+                        f"1. Trigger XSS at {match['url']} to inject CSRF payload",
+                        f"2. Victim visits page; CSRF fires to {c['url']}",
+                        "3. Account state changed without victim interaction",
+                    ],
+                )
+                if cf:
+                    cf["chains"] = True
+                    cf["impact"] = "Full account takeover via CSRF-triggered stored XSS payload injection."
+                    chains_found.append(cf)
                 break
 
         # SSRF (exploitable only) → RCE potential
         ssrf = [f for f in exploitable if "ssrf" in f.get("type", "").lower()]
         if ssrf:
-            chain_finding = {
-                "title": "Chained: SSRF → Internal Service Enumeration / RCE",
-                "type": "chain",
-                "severity": "critical",
-                "details": "SSRF can be leveraged to probe internal services, access cloud metadata endpoints, or exploit internal-facing RCE (e.g., Jenkins, Hadoop, Consul).",
-                "impact": "Potential lateral movement and remote code execution on internal infrastructure.",
-                "url": ssrf[0].get("url"),
-                "verification_stage": VerificationStage.EXPLOITABLE.value,
-                "evidence": f"Exploitable SSRF: {len(ssrf)} finding(s)",
-                "chains": True,
-            }
-            chains_found.append(chain_finding)
+            cf = finding(
+                vuln_type="Chained: SSRF → Internal Service Enumeration / RCE",
+                url=ssrf[0].get("url", ""),
+                severity="critical",
+                details="SSRF can be leveraged to probe internal services, access cloud metadata endpoints, or exploit internal-facing RCE (e.g., Jenkins, Hadoop, Consul).",
+                evidence=f"Exploitable SSRF: {len(ssrf)} finding(s)",
+                verification_stage=VerificationStage.EXPLOITABLE.value,
+                steps_to_reproduce=[
+                    f"1. Send crafted request to {ssrf[0].get('url', '')} with SSRF payload",
+                    "2. Observe callback on OOB listener or probe internal services",
+                    "3. Use access to internal network for lateral movement or RCE",
+                ],
+            )
+            if cf:
+                cf["chains"] = True
+                cf["impact"] = "Potential lateral movement and remote code execution on internal infrastructure."
+                chains_found.append(cf)
 
         # IDOR + sensitive data (same origin) → PII breach
         idor = [f for f in exploitable if "idor" in f.get("type", "").lower() or "id" in f.get("parameter", "").lower()]
@@ -602,18 +615,23 @@ class VulnScanner:
             i_origin = VulnScanner._origin(i["url"])
             match = next((s for s in sensitive if VulnScanner._origin(s["url"]) == i_origin), None)
             if match:
-                chain_finding = {
-                    "title": "Chained: IDOR + Sensitive Data Exposure → PII Breach",
-                    "type": "chain",
-                    "severity": "critical",
-                    "details": "IDOR vulnerabilities allow enumerating user/object identifiers; combined with sensitive data exposure, this enables mass PII harvesting.",
-                    "impact": "Massive personal data breach via predictable ID enumeration.",
-                    "url": i["url"] + " & " + match["url"],
-                    "verification_stage": VerificationStage.EXPLOITABLE.value,
-                    "evidence": f"Same-origin IDOR ({i['url']}) + Sensitive Data ({match['url']})",
-                    "chains": True,
-                }
-                chains_found.append(chain_finding)
+                cf = finding(
+                    vuln_type="Chained: IDOR + Sensitive Data Exposure → PII Breach",
+                    url=i["url"] + " & " + match["url"],
+                    severity="critical",
+                    details="IDOR vulnerabilities allow enumerating user/object identifiers; combined with sensitive data exposure, this enables mass PII harvesting.",
+                    evidence=f"Same-origin IDOR ({i['url']}) + Sensitive Data ({match['url']})",
+                    verification_stage=VerificationStage.EXPLOITABLE.value,
+                    steps_to_reproduce=[
+                        f"1. Enumerate IDs at {i['url']} using sequential/predictable patterns",
+                        f"2. Access results at {match['url']} to extract sensitive data",
+                        "3. Mass PII harvesting via automated enumeration",
+                    ],
+                )
+                if cf:
+                    cf["chains"] = True
+                    cf["impact"] = "Massive personal data breach via predictable ID enumeration."
+                    chains_found.append(cf)
                 break
 
         existing_titles = {f.get("title", "") for f in findings}
@@ -926,6 +944,12 @@ class VulnScanner:
             return None
 
         has_arithmetic = any(r[0] == "arithmetic" for r in arithmetic_results)
+        # Override response_excerpt with the arithmetic triggering response (not baseline)
+        if has_arithmetic:
+            for r in arithmetic_results:
+                if r[0] == "arithmetic":
+                    response_excerpt_str = r[3][:500]
+                    break
 
         # Stage 2: Engine fingerprinting
         engine_sigs = []
@@ -1037,12 +1061,11 @@ class VulnScanner:
                 query = parse_qs(parsed.query, keep_blank_values=True)
                 for param, values in query.items():
                     original_value = values[0] if values else "1"
-                    signals = self._sqli_test_parameter(url, param, original_value, payloads, oob_host)
-                    if signals:
-                        resp = safe_get(self.session, url, self.timeout)
+                    signals, trigger_resp = self._sqli_test_parameter(url, param, original_value, payloads, oob_host)
+                    if any(signals.values()):
                         f = self._sqli_build_finding(url, param, signals, original_value=original_value,
                             request_str=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
-                            response_excerpt_str=resp.text[:500] if resp else "")
+                            response_excerpt_str=trigger_resp or "")
                         if f:
                             self._add(f)
             except Exception as e:
@@ -1060,9 +1083,10 @@ class VulnScanner:
         return self._get_findings()
 
     def _sqli_test_parameter(self, url: str, param: str, original_value: str,
-                              payloads: dict, oob_host: Optional[str]) -> dict:
+                              payloads: dict, oob_host: Optional[str]) -> tuple[dict, Optional[str]]:
         signals = {"error": False, "boolean": False, "time": False, "union": False, "oob": False}
         evidence_parts = []
+        triggering_response: Optional[str] = None
 
         # ── Error-based (with baseline comparison) ────────────────────
         baseline_resp = safe_get(self.session, url, self.timeout)
@@ -1080,6 +1104,7 @@ class VulnScanner:
             if matched:
                 signals["error"] = True
                 evidence_parts.append(f"error:{matched[0]}")
+                triggering_response = resp.text[:500]
                 break
 
         # ── Boolean-based ────────────────────────────────────────────
@@ -1105,6 +1130,7 @@ class VulnScanner:
                     if true_normal and false_diff:
                         signals["boolean"] = True
                         evidence_parts.append("boolean:AND 1=1 vs AND 1=2 diff")
+                        triggering_response = false_resp.text[:500]
                         break
 
         # ── Time-based (baseline comparison) ─────────────────────────
@@ -1114,14 +1140,17 @@ class VulnScanner:
         for payload in payloads.get("time_based", []):
             test_url = self._inject_param(url, param, payload)
             delays = []
+            time_resp = None
             for _ in range(2):
                 start = time.time()
-                safe_get(self.session, test_url, 15, raise_for_status=False)
+                time_resp = safe_get(self.session, test_url, 15, raise_for_status=False)
                 delays.append(time.time() - start)
             min_delay = min(delays)
             if min_delay > baseline_delay + 4 and all(d > baseline_delay + 3 for d in delays):
                 signals["time"] = True
                 evidence_parts.append(f"time:delays={delays}, baseline={baseline_delay:.2f}s")
+                if time_resp:
+                    triggering_response = time_resp.text[:500]
                 break
 
         # ── UNION-based (column counting via ORDER BY + UNION SELECT NULL) ──
@@ -1139,6 +1168,7 @@ class VulnScanner:
                     # ORDER BY succeeded at this column count — good sign
                     evidence_parts.append(f"union:order_by_ok:{payload}")
                     signals["union"] = True
+                    triggering_response = resp.text[:500]
                     continue
             # UNION SELECT NULL... success = different content than normal
             if "union select" in payload.lower() and "null" in payload.lower():
@@ -1146,6 +1176,7 @@ class VulnScanner:
                     # UNION succeeded — column count matches
                     evidence_parts.append(f"union:matching_columns:{payload}")
                     signals["union"] = True
+                    triggering_response = resp.text[:500]
                     break
 
         # ── OOB ──────────────────────────────────────────────────────
@@ -1165,7 +1196,7 @@ class VulnScanner:
                     evidence_parts.append(f"oob:sent to {oob_host} (no callback yet)")
                 break
 
-        return signals
+        return signals, triggering_response
 
     def _sqli_build_finding(self, url: str, param: str, signals: dict,
                             original_value: str = "1",
@@ -1622,12 +1653,11 @@ class VulnScanner:
                 parsed = urlparse(url)
                 params = list(parse_qs(parsed.query).keys())
                 for param in params:
-                    signals = self._cmd_injection_test_parameter(url, param, oob_host)
+                    signals, trigger_resp = self._cmd_injection_test_parameter(url, param, oob_host)
                     if signals and any(signals.values()):
-                        resp = safe_get(self.session, url, self.timeout)
                         f = self._cmd_injection_build_finding(url, param, signals,
                             request_str=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
-                            response_excerpt_str=resp.text[:500] if resp else "")
+                            response_excerpt_str=trigger_resp or "")
                         if f and self._add(f):
                             findings.append(f)
             except Exception as e:
@@ -1652,10 +1682,11 @@ class VulnScanner:
         return findings
 
     def _cmd_injection_test_parameter(self, url: str, param: str,
-                                      oob_host: Optional[str]) -> Dict[str, bool]:
+                                      oob_host: Optional[str]) -> tuple[Dict[str, bool], Optional[str]]:
         cmdi_payloads = self._load_payloads("cmdi")
         signals: Dict[str, bool] = {"output": False, "time": False, "oob": False}
         evidence_parts = []
+        triggering_response: Optional[str] = None
 
         # Output-based detection
         for payload, expected in cmdi_payloads.get("unix", CMD_INJECTION_PAYLOADS.get("unix", [])):
@@ -1667,11 +1698,13 @@ class VulnScanner:
             if expected and expected in body:
                 signals["output"] = True
                 evidence_parts.append(f"output:{expected}")
+                triggering_response = resp.text[:500]
                 break
             for sig in CMD_INJECTION_OUTPUT_SIGNATURES:
                 if sig in body:
                     signals["output"] = True
                     evidence_parts.append(f"output:{sig}")
+                    triggering_response = resp.text[:500]
                     break
             if signals["output"]:
                 break
@@ -1686,29 +1719,35 @@ class VulnScanner:
                 if expected and expected in body:
                     signals["output"] = True
                     evidence_parts.append(f"output:{expected}")
+                    triggering_response = resp.text[:500]
                     break
                 for sig in CMD_INJECTION_OUTPUT_SIGNATURES_WIN:
                     if sig in body:
                         signals["output"] = True
                         evidence_parts.append(f"output:{sig}")
+                        triggering_response = resp.text[:500]
                         break
 
         # Time-based detection (with baseline comparison)
-        baseline_start = time.time()
-        safe_get(self.session, url, timeout=15, raise_for_status=False)
-        baseline_delay = time.time() - baseline_start
-        for payload, min_delay in cmdi_payloads.get("time_based", CMD_INJECTION_PAYLOADS.get("time_based", [])):
-            test_url = self._inject_param(url, param, payload)
-            delays = []
-            for _ in range(2):
-                start = time.time()
-                safe_get(self.session, test_url, timeout=15, raise_for_status=False)
-                delays.append(time.time() - start)
-            min_delay = min(delays)
-            if min_delay > baseline_delay + 4 and all(d > baseline_delay + 3 for d in delays):
-                signals["time"] = True
-                evidence_parts.append(f"time:delays={[round(d, 1) for d in delays]}, baseline={baseline_delay:.2f}s")
-                break
+        if not signals["output"] and not triggering_response:
+            baseline_start = time.time()
+            safe_get(self.session, url, timeout=15, raise_for_status=False)
+            baseline_delay = time.time() - baseline_start
+            for payload, min_delay in cmdi_payloads.get("time_based", CMD_INJECTION_PAYLOADS.get("time_based", [])):
+                test_url = self._inject_param(url, param, payload)
+                delays = []
+                time_resp = None
+                for _ in range(2):
+                    start = time.time()
+                    time_resp = safe_get(self.session, test_url, timeout=15, raise_for_status=False)
+                    delays.append(time.time() - start)
+                min_delay = min(delays)
+                if min_delay > baseline_delay + 4 and all(d > baseline_delay + 3 for d in delays):
+                    signals["time"] = True
+                    evidence_parts.append(f"time:delays={[round(d, 1) for d in delays]}, baseline={baseline_delay:.2f}s")
+                    if time_resp:
+                        triggering_response = time_resp.text[:500]
+                    break
 
         # OOB-based detection (always runs regardless of other signals)
         if oob_host:
@@ -1726,7 +1765,7 @@ class VulnScanner:
                     evidence_parts.append(f"oob:sent to {oob_host} (no callback yet)")
                 break
 
-        return signals
+        return signals, triggering_response
 
     def _cmd_injection_build_finding(self, url: str, param: str,
                                      signals: Dict[str, bool],
@@ -2962,9 +3001,16 @@ class VulnScanner:
             results: list[tuple[int, str]] = []
             start = time.time()
 
-            def _probe(_idx: int, _url=test_url, _data=probe_data, _timeout=self.timeout) -> tuple[int, str]:
+            # Use stateless requests.post() per thread, not shared self.session (not thread-safe)
+            _probe_cookies = dict(self.session.cookies)
+            _probe_headers = dict(self.session.headers)
+
+            def _probe(_idx: int, _url=test_url, _data=probe_data, _timeout=self.timeout,
+                       _cookies=_probe_cookies, _headers=_probe_headers) -> tuple[int, str]:
                 try:
-                    r = self.session.post(_url, data=_data, timeout=_timeout)
+                    import requests as _requests
+                    r = _requests.post(_url, data=_data, timeout=_timeout,
+                                       cookies=_cookies, headers=_headers, verify=False)
                     return (r.status_code, r.text[:500])
                 except Exception:
                     return (0, "")

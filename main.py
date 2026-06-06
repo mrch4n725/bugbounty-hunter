@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument("--config", "-C", help="Path to YAML configuration file")
     parser.add_argument("--target", "-t", help="Target URL (e.g. https://example.com)")
     parser.add_argument("--modules", "-m", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "all"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "idor_path", "js_secrets", "api", "rate_limiting", "openapi", "all"],
         default=["all"])
     parser.add_argument("--output", "-o", default="reports")
     parser.add_argument("--format", "-f", choices=["json", "html", "txt", "markdown-report", "hackerone", "bugcrowd"], default="html")
@@ -54,7 +54,7 @@ def parse_args():
         help="Out-of-band callback host for SSRF and SQLi OOB verification (e.g. Burp Collaborator or interactsh URL)")
     parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
     parser.add_argument("--disable-modules", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "idor_path", "js_secrets", "api", "rate_limiting", "openapi"],
         default=[], help="Disable specific modules when scanning all or default modules")
     parser.add_argument("--module-param", action="append", default=[],
         help="Override module settings using module.key=value")
@@ -86,6 +86,8 @@ def parse_args():
         help="Maximum number of JS files to scan for secrets/endpoints (default: 50)")
     parser.add_argument("--no-mask-curl", action="store_true",
         help="Disable sensitive header masking in curl commands within reports (shows Authorization, Cookie, etc.)")
+    parser.add_argument("--dry-run", action="store_true",
+        help="Run recon and JS intelligence only, then print attack-surface summary and exit. Skips all active fuzzing.")
     return parser.parse_args()
 
 
@@ -264,6 +266,7 @@ def build_config(args):
         "headless": getattr(args, "headless", False),
         "verify_only": getattr(args, "verify_only", None),
         "resume": getattr(args, "resume", False),
+        "dry_run": getattr(args, "dry_run", False),
         "no_mask_curl": getattr(args, "no_mask_curl", False),
         "rps": args.rps,
         "stealth": args.stealth,
@@ -374,7 +377,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     # ── TARGET_LEVEL: modules that run once per target, not per URL ──
     TARGET_LEVEL: set[str] = {
         "headers", "dirb", "exposed_files", "clickjacking",
-        "subdomain_takeover", "graphql", "blind_xss", "js_secrets", "api", "openapi",
+        "subdomain_takeover", "graphql", "blind_xss", "js_secrets", "api", "openapi", "idor_path",
     }
 
     if config["passive"]:
@@ -413,6 +416,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     module_map["api"] = _api_scanner.run_all
     _idor_scanner = IdorScanner(scanner.config, scanner.recon)
     module_map["idor"] = _idor_scanner.run_all
+    module_map["idor_path"] = scanner.scan_idor
 
     # ── Step 2: Run TARGET_LEVEL modules first ───────────────────────────
     target_modules = {k: v for k, v in module_map.items() if k in TARGET_LEVEL}
@@ -672,11 +676,31 @@ def main():
         log(f"[+] JS Intelligence scan complete: {secret_count} secrets, {endpoint_count} endpoints",
             Colors.GREEN)
 
+    if config.get("dry_run"):
+        secret_count = len(js_data.get("secrets", []))
+        ep_count = len(recon_data.get("urls", []))
+        form_count = len(recon_data.get("forms", []))
+        subdomain_count = len(recon_data.get("subdomains", []))
+        js_ep_count = len(js_data.get("endpoints", [])) + len(js_data.get("hidden_endpoints", []))
+        log(f"\n{'─'*50}", Colors.CYAN)
+        log("  DRY-RUN SUMMARY", Colors.BOLD)
+        log(f"{'─'*50}", Colors.CYAN)
+        log(f"  URLs:              {ep_count}", Colors.WHITE)
+        log(f"  Forms:             {form_count}", Colors.WHITE)
+        log(f"  Subdomains:        {subdomain_count}", Colors.WHITE)
+        log(f"  JS Endpoints:      {js_ep_count}", Colors.WHITE)
+        log(f"  JS Secrets:        {secret_count}", Colors.YELLOW if secret_count else Colors.WHITE)
+        log(f"{'─'*50}\n", Colors.CYAN)
+        return 0
+
     all_findings_lock = threading.Lock()
     stop_autosave, autosave_thread = _start_autosave(
         config, recon_data, all_findings, all_findings_lock, js_data=js_data
     )
-    _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, all_findings_lock)
+    try:
+        _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, all_findings_lock)
+    except KeyboardInterrupt:
+        log("\n[!] Scan interrupted — saving partial report...", Colors.YELLOW)
 
     # Merge JS secret findings AFTER _run_scans (so they appear after scanner findings)
     all_findings.extend(js_findings)

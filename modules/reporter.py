@@ -1,4 +1,5 @@
 import hashlib
+import html
 import json
 import os
 import re
@@ -6,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
-from modules.utils import log, Colors
+from modules.utils import log, Colors, _build_curl
 
 
 # Severity → CVSS 3.1 base score mapping (fallback when finding lacks cvss_score)
@@ -460,24 +461,26 @@ class Reporter:
             verification_stage = finding.get('verification_stage', '')
             evidence_strength = finding.get('evidence_strength', '')
             fpr = finding.get('false_positive_risk', '')
-            details = finding.get('details', 'N/A')
-            evidence = finding.get('evidence', '')
+            details = html.escape(finding.get('details', 'N/A'))
+            evidence = html.escape(finding.get('evidence', ''))
             validation_steps = finding.get('validation_steps', [])
-            recommendation = finding.get('recommendation', '')
+            recommendation = html.escape(finding.get('recommendation', ''))
+            title_escaped = html.escape(finding.get('title', 'N/A'))
+            url_escaped = html.escape(finding.get('url', 'N/A'))
             details_html = f"<div>{details}</div>"
             if evidence:
                 details_html += f"<div><strong>Evidence:</strong> {evidence}</div>"
             if validation_steps:
-                steps = "<br>".join(f"▸ {s}" for s in validation_steps[:5])
+                steps = "<br>".join(f"▸ {html.escape(s)}" for s in validation_steps[:5])
                 details_html += f"<div><strong>Validation:</strong><br>{steps}</div>"
             if recommendation:
                 details_html += f"<div><strong>Recommendation:</strong> {recommendation}</div>"
             if fpr:
-                details_html += f"<div><strong>FP Risk:</strong> {fpr}</div>"
+                details_html += f"<div><strong>FP Risk:</strong> {html.escape(str(fpr))}</div>"
 
             rows += f'''<tr>
-                    <td>{finding.get('title', 'N/A')}</td>
-                    <td><span class="url">{finding.get('url', 'N/A')}</span></td>
+                    <td>{title_escaped}</td>
+                    <td><span class="url">{url_escaped}</span></td>
                     <td><span class="severity-badge severity-{severity}">{severity.upper()}</span></td>
                     <td style="text-align:center">{self._confidence_badge_html(confidence_score)}</td>
                     <td style="text-align:center">{self._verification_badge_html(verification_stage)}</td>
@@ -501,7 +504,7 @@ class Reporter:
         
         content = '<section><h2>Discovered Subdomains</h2><ul>'
         for subdomain in subdomains:
-            content += f'<li><span class="url">{subdomain}</span></li>'
+            content += f'<li><span class="url">{html.escape(subdomain)}</span></li>'
         content += '</ul></section>'
         return content
     
@@ -520,7 +523,7 @@ class Reporter:
         
         content = '<section><h2>Discovered URLs</h2><ul>'
         for url in urls:
-            content += f'<li><span class="url">{url}</span></li>'
+            content += f'<li><span class="url">{html.escape(url)}</span></li>'
         content += '</ul></section>'
         return content
 
@@ -735,17 +738,20 @@ class Reporter:
     def _build_curl_command(self, finding: Dict[str, Any]) -> str:
         """Build a curl command from finding request metadata.
         Prefer the stored request field (may already be a full curl string).
+        Falls back to _build_curl with empty headers when no curl string is stored
+        (e.g. synthetic chain-analysis findings, reverification-promoted findings).
         """
         req = finding.get("request", "")
         if req.startswith("curl"):
             return req
         url = finding.get("url", "")
-        return f"curl -X GET '{url}'"
+        method = "POST" if finding.get("parameter") and "form" in finding.get("details", "").lower() else "GET"
+        return _build_curl(method, url, {})
 
     def _build_finding_cards_html(self, findings: List[Dict[str, Any]]) -> str:
         if not findings:
             return '<div class="empty-message">No vulnerabilities found.</div>'
-        html = ""
+        html_out = ""
         for f in findings:
             sev = f.get("severity", "info").lower()
             stage = f.get("verification_stage", "detected").lower()
@@ -764,9 +770,18 @@ class Reporter:
             conf_class = "high" if score >= 61 else ("mid" if score >= 31 else "low")
             stage_label = stage.title()
 
+            # Escape all user-provided content
+            e_details = html.escape(details)
+            e_evidence = html.escape(evidence)
+            e_vuln_url = html.escape(vuln_url)
+            e_request = html.escape(request)
+            e_response = html.escape(response_excerpt)
+            e_fpr = html.escape(str(fpr).title() if fpr else "—")
+            e_title = html.escape(f.get("title", "Finding"))
+
             steps_html = ""
             if steps:
-                items = "".join(f"<li>{s}</li>" for s in steps[:5])
+                items = "".join(f"<li>{html.escape(s)}</li>" for s in steps[:5])
                 steps_html = f'<div class="row"><strong>Steps:</strong><ol class="steps">{items}</ol></div>'
 
             evidence_html = ""
@@ -774,7 +789,7 @@ class Reporter:
                 evidence_html = (
                     '<div class="row"><strong>Evidence:</strong>'
                     f'<details><summary>View evidence ({len(evidence)} chars)</summary>'
-                    f'<div class="evidence">{evidence}</div>'
+                    f'<div class="evidence">{e_evidence}</div>'
                     "</details></div>"
                 )
 
@@ -783,7 +798,7 @@ class Reporter:
                 request_html = (
                     '<div class="row"><strong>Request:</strong>'
                     f'<details><summary>View request</summary>'
-                    f'<pre class="evidence">{request}</pre>'
+                    f'<pre class="evidence">{e_request}</pre>'
                     "</details></div>"
                 )
 
@@ -792,21 +807,21 @@ class Reporter:
                 response_html = (
                     '<div class="row"><strong>Response:</strong>'
                     f'<details><summary>View response excerpt ({len(response_excerpt)} chars)</summary>'
-                    f'<pre class="evidence">{response_excerpt}</pre>'
+                    f'<pre class="evidence">{e_response}</pre>'
                     "</details></div>"
                 )
 
             steps_to_reproduce_html = ""
             if steps_to_reproduce:
-                items = "".join(f"<li>{s}</li>" for s in steps_to_reproduce[:10])
+                items = "".join(f"<li>{html.escape(s)}</li>" for s in steps_to_reproduce[:10])
                 steps_to_reproduce_html = f'<div class="row"><strong>Steps to Reproduce:</strong><ol class="steps">{items}</ol></div>'
 
             curl_cmd = self._build_curl_command(f)
             cvss_html = f'<span>CVSS: {cvss:.1f}</span>' if isinstance(cvss, (int, float)) else ""
 
-            html += f'''<div class="finding-card {sev_class}" data-severity="{sev}" data-stage="{stage}">
+            html_out += f'''<div class="finding-card {sev_class}" data-severity="{sev}" data-stage="{stage}">
                 <div class="finding-header">
-                    <div class="finding-title">{f.get("title", "Finding")}</div>
+                    <div class="finding-title">{e_title}</div>
                     <div class="finding-meta">
                         <span class="sev-badge sev-{sev_class}">{sev.upper()}</span>
                         <span class="conf-badge conf-{conf_class}">{score:.0f}%</span>
@@ -814,17 +829,29 @@ class Reporter:
                     </div>
                 </div>
                 <div class="finding-body">
-                    <div class="row"><strong>URL:</strong> <span class="url">{vuln_url}</span> <button class="copy-btn" onclick="copyUrl('{vuln_url.replace("'", "\\'")}')">Copy URL</button> <button class="copy-btn" onclick="copyCurl('{curl_cmd.replace("'", "\\'")}')">Copy Curl</button></div>
-                    <div class="row"><strong>Details:</strong> {details}</div>
+                    <div class="row"><strong>URL:</strong> <span class="url">{e_vuln_url}</span> <button class="copy-btn" data-copy="{html.escape(vuln_url, quote=True)}">Copy URL</button> <button class="copy-btn copy-curl" data-copy="{html.escape(curl_cmd, quote=True)}">Copy Curl</button></div>
+                    <div class="row"><strong>Details:</strong> {e_details}</div>
                     {evidence_html}
                     {request_html}
                     {response_html}
                     {steps_html}
                     {steps_to_reproduce_html}
-                    <div class="row"><strong>FP Risk:</strong> {fpr.title() if fpr else "—"} {cvss_html}</div>
+                    <div class="row"><strong>FP Risk:</strong> {e_fpr} {cvss_html}</div>
                 </div>
             </div>'''
-        return html
+
+        # Replace onclick handlers with a single event listener
+        html_out += '''
+<script>
+document.addEventListener('click', function(e) {
+    var btn = e.target.closest('.copy-btn');
+    if (btn) {
+        navigator.clipboard.writeText(btn.getAttribute('data-copy')).catch(function(){});
+    }
+});
+</script>
+'''
+        return html_out
 
     def _create_js_section_html(self, js_data: dict) -> str:
         """Render JS Intelligence section from js_data dict."""
@@ -846,8 +873,10 @@ class Reporter:
             for s in secrets:
                 if s.get("confidence") == "none":
                     continue
-                val = s.get("value", "")[:40] + "..." if len(s.get("value", "")) > 40 else s.get("value", "")
-                source = s.get("source_url", "").split("/")[-1] or s.get("source_url", "")
+                raw_val = s.get("value", "")
+                val = (html.escape(raw_val[:40]) + "...") if len(raw_val) > 40 else html.escape(raw_val)
+                source = html.escape(s.get("source_url", "").split("/")[-1] or s.get("source_url", ""))
+                s_type = html.escape(s.get("type", ""))
                 validated = s.get("validated")
                 if validated is True:
                     badge = '<span style="color:#2ecc71;font-weight:bold">✓ Confirmed</span>'
@@ -855,7 +884,7 @@ class Reporter:
                 else:
                     badge = '<span style="color:#f1c40f;font-weight:bold">? Unverified</span>'
                     row_class = "style=\"background:rgba(241,196,15,.06)\""
-                html += f'<tr {row_class}><td>{s.get("type", "")}</td><td style="font-family:monospace;font-size:.85em">{val}</td><td>{source}</td><td>{badge}</td></tr>'
+                html += f'<tr {row_class}><td>{s_type}</td><td style="font-family:monospace;font-size:.85em">{val}</td><td>{source}</td><td>{badge}</td></tr>'
             html += '</tbody></table>'
         else:
             html += '<p>No secrets found in JavaScript files.</p>'
@@ -866,9 +895,9 @@ class Reporter:
             html += '<h3 style="font-size:1.1em;margin:20px 0 8px;color:var(--text)">Discovered Endpoints</h3>'
             html += '<table><thead><tr><th>Type</th><th>Endpoint</th><th>Source File</th></tr></thead><tbody>'
             for ep in all_eps[:100]:
-                ep_url = ep.get("url", "")
-                ep_type = ep.get("type", "")
-                source = ep.get("source_url", "").split("/")[-1] or ""
+                ep_url = html.escape(ep.get("url", ""))
+                ep_type = html.escape(ep.get("type", ""))
+                source = html.escape(ep.get("source_url", "").split("/")[-1] or "")
                 style = ""
                 if ep in hidden:
                     style = "style=\"color:#e67e22;\""
@@ -883,7 +912,7 @@ class Reporter:
             html += '<p style="margin-bottom:8px;color:var(--text2);font-size:.85em">These indicate what configuration the application expects — useful for identifying further attack surface.</p>'
             html += '<div class="recon-grid">'
             for ev in env_vars:
-                html += f'<span class="url" style="font-size:.82em">{ev.get("variable", "")}</span>'
+                html += f'<span class="url" style="font-size:.82em">{html.escape(ev.get("variable", ""))}</span>'
             html += '</div>'
 
         html += '</section>'
