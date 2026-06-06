@@ -663,15 +663,16 @@ class Recon:
                 if f:
                     findings.append(f)
 
-            # Report unvalidated secrets
+            # Report unvalidated secrets (skip known-fake ones)
             for secret in analysis.get("secrets", []):
                 if secret.get("validated"):
                     continue
+                if secret.get("validated") is False:
+                    continue
                 if not self._confirm_js_evidence(js_url, secret["value"]):
                     continue
-                sev = "info" if secret.get("validated") is False else "high"
                 f = finding(
-                    f"JS Secret: {secret['type']}", js_url, sev,
+                    f"JS Secret: {secret['type']}", js_url, "high",
                     f"Pattern '{secret['type']}' matched in JS bundle",
                     secret["value"],
                 )

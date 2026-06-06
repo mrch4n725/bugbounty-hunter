@@ -1354,6 +1354,10 @@ class VulnScanner:
                     confidence_score = self._calculate_ssrf_confidence(
                         list(all_matched_sigs), baseline_diff, json_detected, credentials_found,
                     )
+                    if confidence_score < 40:
+                        log(f"  [SSRF] Skipped {url} (confidence {confidence_score}% < 40%)",
+                            Colors.WHITE, verbose_only=True, verbose=self.verbose)
+                        continue
                     f = finding(
                         vuln_type="Confirmed SSRF",
                         url=url,

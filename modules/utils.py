@@ -775,18 +775,26 @@ class SecretValidator:
             return {"valid": None, "type": "slack", "details": f"Error: {e}"}
 
     @staticmethod
+    def _has_long_run(value: str, length: int = 4) -> bool:
+        """Check if value has a run of `length` consecutive identical characters."""
+        for i in range(len(value) - length + 1):
+            if len(set(value[i:i + length])) == 1:
+                return True
+        return False
+
+    @staticmethod
     def validate_twilio_sid(sid: str) -> Dict[str, Any]:
         """Validate Twilio Account SID format and entropy (offline)."""
         if not sid.startswith("AC") or len(sid) != 34:
             return {"valid": False, "type": "twilio_sid", "details": "Invalid format"}
         body = sid[2:]
-        # Reject base64 padding characters
         if "=" in body:
             return {"valid": False, "type": "twilio_sid", "details": "Base64 padding detected — not a real SID"}
-        # Entropy check: must have at least 20 unique characters
+        if SecretValidator._has_long_run(body, 4):
+            return {"valid": False, "type": "twilio_sid", "details": "Long repeated-char run detected — not a real SID"}
         unique_chars = len(set(body))
-        if unique_chars < 20:
-            return {"valid": False, "type": "twilio_sid", "details": f"Too few unique chars ({unique_chars}/20) — likely garbage"}
+        if unique_chars < 24:
+            return {"valid": False, "type": "twilio_sid", "details": f"Too few unique chars ({unique_chars}/24) — likely garbage"}
         return {"valid": True, "type": "twilio_sid", "details": "Format and entropy pass"}
 
     @staticmethod
@@ -797,9 +805,11 @@ class SecretValidator:
         body = token[2:]
         if "=" in body:
             return {"valid": False, "type": "twilio_token", "details": "Base64 padding detected — not a real token"}
+        if SecretValidator._has_long_run(body, 4):
+            return {"valid": False, "type": "twilio_token", "details": "Long repeated-char run detected — not a real token"}
         unique_chars = len(set(body))
-        if unique_chars < 20:
-            return {"valid": False, "type": "twilio_token", "details": f"Too few unique chars ({unique_chars}/20) — likely garbage"}
+        if unique_chars < 24:
+            return {"valid": False, "type": "twilio_token", "details": f"Too few unique chars ({unique_chars}/24) — likely garbage"}
         return {"valid": True, "type": "twilio_token", "details": "Format and entropy pass"}
 
     @classmethod
