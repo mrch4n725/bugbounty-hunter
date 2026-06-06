@@ -900,7 +900,7 @@ class VulnScanner:
 
     def _ssti_test_parameter(self, url: str, param: str) -> Optional[dict]:
         ssti_payloads = self._load_payloads("ssti")
-            # Stage 1: Arithmetic reflection detection
+        # Stage 1: Arithmetic reflection detection
         arithmetic_results = []
         for payload in ssti_payloads.get("arithmetic", SSTI_PAYLOADS.get("arithmetic", [])):
             test_url = self._inject_param(url, param, payload)
@@ -1202,24 +1202,38 @@ class VulnScanner:
     def _sqli_test_post_body(self, url: str, payloads: dict, oob_host: Optional[str]) -> None:
         """Test POST endpoints with SQLi payloads in JSON, XML, and form bodies."""
         post_payloads = POST_SQLI_PAYLOADS
+
+        # Baseline: neutral POST to capture pre-existing SQL error noise
+        baseline_errors: set[str] = set()
+        try:
+            baseline_resp = safe_post(self.session, url, data=json.dumps({"id": "1"}), headers={"Content-Type": "application/json"}, timeout=self.timeout)
+            if baseline_resp:
+                baseline_errors = {e for e in SQLI_ERRORS if e in baseline_resp.text.lower()}
+        except Exception:
+            pass
+
         headers = {"Content-Type": "application/json"}
         for payload in post_payloads["json"]:
             resp = safe_post(self.session, url, data=payload, headers=headers, timeout=self.timeout)
-            if resp and any(err in resp.text.lower() for err in SQLI_ERRORS):
-                signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
-                f = self._sqli_build_finding(url, "POST JSON body", signals)
-                if f:
-                    self._add(f)
+            if resp:
+                new_errors = {e for e in SQLI_ERRORS if e in resp.text.lower()} - baseline_errors
+                if new_errors:
+                    signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
+                    f = self._sqli_build_finding(url, "POST JSON body", signals)
+                    if f:
+                        self._add(f)
                 break
 
         headers = {"Content-Type": "application/xml"}
         for payload in post_payloads["xml"]:
             resp = safe_post(self.session, url, data=payload, headers=headers, timeout=self.timeout)
-            if resp and any(err in resp.text.lower() for err in SQLI_ERRORS):
-                signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
-                f = self._sqli_build_finding(url, "POST XML body", signals)
-                if f:
-                    self._add(f)
+            if resp:
+                new_errors = {e for e in SQLI_ERRORS if e in resp.text.lower()} - baseline_errors
+                if new_errors:
+                    signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
+                    f = self._sqli_build_finding(url, "POST XML body", signals)
+                    if f:
+                        self._add(f)
                 break
 
         # Try form fields from recon first, then fall back to hardcoded
@@ -1239,12 +1253,14 @@ class VulnScanner:
             for field_name in form_fields:
                 post_data = {field_name: payload}
                 resp = safe_post(self.session, url, data=post_data, headers=headers, timeout=self.timeout)
-                if resp and any(err in resp.text.lower() for err in SQLI_ERRORS):
-                    signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
-                    f = self._sqli_build_finding(url, f"POST form body ({field_name})", signals)
-                    if f:
-                        self._add(f)
-                    break
+                if resp:
+                    new_errors = {e for e in SQLI_ERRORS if e in resp.text.lower()} - baseline_errors
+                    if new_errors:
+                        signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
+                        f = self._sqli_build_finding(url, f"POST form body ({field_name})", signals)
+                        if f:
+                            self._add(f)
+                        break
             else:
                 continue
             break
@@ -2022,11 +2038,11 @@ class VulnScanner:
                     "OOB callback received: JavaScript executed in victim browser",
                 ],
             )
-            if f:
-                self._add(f)
+            if f and self._add(f):
+                findings.append(f)
             log(f"  [Blind XSS OOB] {entry.get('url', '')}", Colors.RED, verbose_only=True, verbose=self.verbose)
 
-        return self._get_findings()
+        return findings
 
     # ═════════════════════════════════════════════════════════════════════
     # LFI
@@ -2182,12 +2198,15 @@ class VulnScanner:
             except Exception:
                 pass
 
+        delay = self.config.get("delay", 0)
         for path in paths:
             try:
                 target_url = f"{self.config.get('target').rstrip('/')}/{path.lstrip('/')}"
                 if not self._in_scope(target_url):
                     continue
                 resp = safe_get(self.session, target_url, self.timeout, raise_for_status=False)
+                if delay:
+                    time.sleep(delay)
                 if resp and resp.status_code == 200:
                     title = "Exposed Common Path"
                     details = f"Accessible path found: {target_url}"
@@ -2249,6 +2268,26 @@ class VulnScanner:
                 if not (resp and resp.status_code == 200):
                     continue
                 severity, details = self._exposed_file_metadata(exposed_file)
+                body = resp.text
+                ext = exposed_file.lower()
+                content_ok = True
+                if ".env" in ext and "=" not in body:
+                    content_ok = False
+                elif "/.git/config" in ext and "[core]" not in body:
+                    content_ok = False
+                elif "phpinfo" in ext and "PHP Version" not in body:
+                    content_ok = False
+                elif any(ext.endswith(s) for s in (".zip", ".tar.gz", ".gz", ".sql")):
+                    raw = resp.content
+                    if ext.endswith(".zip") and raw[:2] != b"PK":
+                        content_ok = False
+                    elif ext.endswith(".gz") and raw[:2] != b"\x1f\x8b":
+                        content_ok = False
+                    elif ext.endswith(".sql") and not any(body.lstrip().startswith(w) for w in ("-- ", "CREATE", "INSERT", "DROP", "ALTER", "SELECT")):
+                        content_ok = False
+                if not content_ok:
+                    severity = "info"
+                    details += " (content check failed — may be a generic 200 response)"
                 f = finding(
                     vuln_type="Exposed Sensitive File",
                     url=file_url,
@@ -2258,12 +2297,12 @@ class VulnScanner:
                     verification_stage=VerificationStage.VALIDATED.value,
                     validation_steps=[f"File accessible at {file_url} (HTTP 200)"],
                 )
-                if f:
-                    self._add(f)
+                if f and self._add(f):
+                    findings.append(f)
                 log(f"  [EXPOSED] {file_url}", Colors.RED, verbose_only=True, verbose=self.verbose)
             except Exception:
                 continue
-        return self._get_findings()
+        return findings
 
     def _exposed_file_metadata(self, exposed_file: str) -> tuple[str, str]:
         lower_path = exposed_file.lower()
@@ -2289,6 +2328,9 @@ class VulnScanner:
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
         for url in urls:
             if not self._in_scope(url):
+                continue
+            parsed_path = urlparse(url).path.lower()
+            if any(parsed_path.endswith(ext) for ext in (".css", ".png", ".jpg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".ico", ".mp4", ".pdf")):
                 continue
             try:
                 resp = safe_get(self.session, url, self.timeout, raise_for_status=False)
@@ -2356,12 +2398,12 @@ class VulnScanner:
         try:
             target = self.config.get("target", "")
             if not target:
-                return self._get_findings()
+                return findings
             if not self._in_scope(target):
-                return self._get_findings()
+                return findings
             resp = safe_get(self.session, target, self.timeout)
             if not resp:
-                return self._get_findings()
+                return findings
             self._scan_missing_headers(findings, target, resp)
             self._scan_disclosure_headers(findings, target, resp)
             self._scan_policy_headers(findings, target, resp)
@@ -2381,9 +2423,11 @@ class VulnScanner:
                 self._scan_cookie_headers(findings, sub_url, sub_resp)
         except Exception:
             pass
+        returned = []
         for f in findings:
-            self._add(f)
-        return self._get_findings()
+            if self._add(f):
+                returned.append(f)
+        return returned
 
     def _scan_missing_headers(self, findings: list[dict], target: str, resp) -> None:
         for header, severity in SECURITY_HEADERS.items():
@@ -2476,7 +2520,7 @@ class VulnScanner:
             if probe_resp:
                 reflected_acao = probe_resp.headers.get("Access-Control-Allow-Origin", "")
                 reflected_acc = probe_resp.headers.get("Access-Control-Allow-Credentials", "").lower()
-                if evil_origin in reflected_acao and reflected_acc == "true":
+                if reflected_acao.strip() == evil_origin and reflected_acc == "true":
                     f = finding(
                         vuln_type="CORS Origin Reflection",
                         url=target,
@@ -2525,11 +2569,11 @@ class VulnScanner:
         findings: list[dict] = []
         target = self.config.get("target", "")
         if not target or not self._in_scope(target):
-            return self._get_findings()
+            return findings
         try:
             resp = safe_get(self.session, target, self.timeout, raise_for_status=False)
             if not resp:
-                return self._get_findings()
+                return findings
             x_frame = resp.headers.get("X-Frame-Options", "").lower()
             csp = resp.headers.get("Content-Security-Policy", "").lower()
             allows_frame = not any(directive in csp for directive in CLICKJACKING_SAFE_DIRECTIVES)
@@ -2543,12 +2587,12 @@ class VulnScanner:
                     evidence=f"X-Frame-Options: {x_frame or 'missing'}, CSP: {csp or 'missing'}",
                     verification_stage=VerificationStage.DETECTED.value,
                 )
-                if f:
-                    self._add(f)
+                if f and self._add(f):
+                    findings.append(f)
                 log(f"  [CLICKJACKING] {target}", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
         except Exception:
             pass
-        return self._get_findings()
+        return findings
 
     # ═════════════════════════════════════════════════════════════════════
     # HTTP Methods
@@ -2556,33 +2600,34 @@ class VulnScanner:
 
     def scan_http_methods(self, target_urls: list[str] | None = None) -> list[dict]:
         findings: list[dict] = []
-        target = target_urls[0] if target_urls else self.config.get("target", "")
-        if not target or not self._in_scope(target):
-            return self._get_findings()
-        try:
-            resp = self.session.options(target, timeout=self.timeout)
-            if not resp:
-                return self._get_findings()
-            allow_header = resp.headers.get("Allow", "")
-            cors_methods = resp.headers.get("Access-Control-Allow-Methods", "")
-            methods = set(self._normalize_list(allow_header) + self._normalize_list(cors_methods))
-            dangerous = {"TRACE", "PUT", "DELETE", "PATCH", "PROPFIND"}
-            exposed = [m for m in methods if m.upper() in dangerous]
-            if exposed:
-                f = finding(
-                    vuln_type="Dangerous HTTP Methods Enabled",
-                    url=target,
-                    severity="medium",
-                    details="The server supports non-safe HTTP methods.",
-                    evidence=f"Allowed methods: {', '.join(sorted(methods))}",
-                    verification_stage=VerificationStage.DETECTED.value,
-                )
-                if f:
-                    self._add(f)
-                log(f"  [HTTP METHODS] {target} -> {', '.join(exposed)}", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
-        except Exception:
-            pass
-        return self._get_findings()
+        targets = target_urls if target_urls else [self.config.get("target", "")]
+        for target in targets:
+            if not target or not self._in_scope(target):
+                continue
+            try:
+                resp = self.session.options(target, timeout=self.timeout)
+                if not resp:
+                    continue
+                allow_header = resp.headers.get("Allow", "")
+                cors_methods = resp.headers.get("Access-Control-Allow-Methods", "")
+                methods = set(self._normalize_list(allow_header) + self._normalize_list(cors_methods))
+                dangerous = {"TRACE", "PUT", "DELETE", "PATCH", "PROPFIND"}
+                exposed = [m for m in methods if m.upper() in dangerous]
+                if exposed:
+                    f = finding(
+                        vuln_type="Dangerous HTTP Methods Enabled",
+                        url=target,
+                        severity="medium",
+                        details="The server supports non-safe HTTP methods.",
+                        evidence=f"Allowed methods: {', '.join(sorted(methods))}",
+                        verification_stage=VerificationStage.DETECTED.value,
+                    )
+                    if f and self._add(f):
+                        findings.append(f)
+                    log(f"  [HTTP METHODS] {target} -> {', '.join(exposed)}", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+            except Exception:
+                pass
+        return findings
 
     # ═════════════════════════════════════════════════════════════════════
     # Insecure Forms
@@ -2613,8 +2658,8 @@ class VulnScanner:
                         evidence="Form action uses http:// scheme",
                         verification_stage=VerificationStage.DETECTED.value,
                     )
-                    if f:
-                        self._add(f)
+                    if f and self._add(f):
+                        findings.append(f)
                     log(f"  [FORM] {action}", Colors.RED, verbose_only=True, verbose=self.verbose)
                     continue
                 if any(field.get("type") == "password" for field in form.get("fields", [])):
@@ -2627,12 +2672,12 @@ class VulnScanner:
                             evidence=f"Action host: {parsed.netloc}",
                             verification_stage=VerificationStage.DETECTED.value,
                         )
-                        if f:
-                            self._add(f)
+                        if f and self._add(f):
+                            findings.append(f)
                         log(f"  [FORM] {action}", Colors.RED, verbose_only=True, verbose=self.verbose)
             except Exception:
                 continue
-        return self._get_findings()
+        return findings
 
     # ═════════════════════════════════════════════════════════════════════
     # Subdomain Takeover
@@ -2660,15 +2705,15 @@ class VulnScanner:
                                 evidence=f"Signature: {signature}",
                                 verification_stage=VerificationStage.DETECTED.value,
                             )
-                            if f:
-                                self._add(f)
+                            if f and self._add(f):
+                                findings.append(f)
                             log(f"  [TAKEOVER] {target_url}", Colors.RED, verbose_only=True, verbose=self.verbose)
                             raise StopIteration
             except StopIteration:
                 continue
             except Exception:
                 continue
-        return self._get_findings()
+        return findings
 
     # ═════════════════════════════════════════════════════════════════════
     # Rate Limiting
@@ -2781,9 +2826,9 @@ class VulnScanner:
             results: list[tuple[int, str]] = []
             start = time.time()
 
-            def _probe(_idx: int) -> tuple[int, str]:
+            def _probe(_idx: int, _url=test_url, _data=probe_data, _timeout=self.timeout) -> tuple[int, str]:
                 try:
-                    r = self.session.post(test_url, data=probe_data, timeout=self.timeout)
+                    r = self.session.post(_url, data=_data, timeout=_timeout)
                     return (r.status_code, r.text[:500])
                 except Exception:
                     return (0, "")
@@ -2912,6 +2957,7 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_graphql(self) -> list[dict]:
+        findings: list[dict] = []
         endpoints = ["/graphql", "/api/graphql", "/nerdgraph/graphql", "/v1/graphql", "/query"]
         introspection_query = {"query": r"{ __schema { types { name } } }"}
         batch_payload = [{"query": "{ __typename }"}] * 50
@@ -2935,8 +2981,8 @@ class VulnScanner:
                         verification_stage=VerificationStage.VALIDATED.value,
                         validation_steps=["GraphQL introspection response received"],
                     )
-                    if f:
-                        self._add(f)
+                    if f and self._add(f):
+                        findings.append(f)
             except Exception:
                 pass
 
@@ -2953,8 +2999,8 @@ class VulnScanner:
                         verification_stage=VerificationStage.VALIDATED.value,
                         validation_steps=["Batch of 50 queries returned 50 responses"],
                     )
-                    if f:
-                        self._add(f)
+                    if f and self._add(f):
+                        findings.append(f)
             except Exception:
                 pass
 
@@ -2972,8 +3018,8 @@ class VulnScanner:
                         verification_stage=VerificationStage.VALIDATED.value,
                         validation_steps=["Malformed query returned field suggestions"],
                     )
-                    if f:
-                        self._add(f)
+                    if f and self._add(f):
+                        findings.append(f)
             except Exception:
                 pass
 
@@ -2992,8 +3038,8 @@ class VulnScanner:
                         verification_stage=VerificationStage.DETECTED.value,
                         validation_steps=["200 aliased __typename queries returned 200 results"],
                     )
-                    if f:
-                        self._add(f)
+                    if f and self._add(f):
+                        findings.append(f)
             except Exception:
                 pass
 
@@ -3012,12 +3058,12 @@ class VulnScanner:
                         verification_stage=VerificationStage.DETECTED.value,
                         validation_steps=["Deeply nested query returned 200 without errors"],
                     )
-                    if f:
-                        self._add(f)
+                    if f and self._add(f):
+                        findings.append(f)
             except Exception:
                 pass
 
-        return self._get_findings()
+        return findings
 
     # ═════════════════════════════════════════════════════════════════════
     # IDOR (legacy, kept for backward compat in scanner.py)
