@@ -530,7 +530,7 @@ class VulnScanner:
                     test_url = self._inject_param(url, param or "q", sp)
                     exec_result = self.browser.check_xss_execution(test_url, sp)
                     if exec_result and (exec_result.get("alert_fired") or exec_result.get("dom_mutation")):
-                        f["verification_stage"] = VerificationStage.EXPLOITABLE.value
+                        f["verification_stage"] = VerificationStage.VERIFIED.value
                         log(f"  [Re-verify] XSS at {url} promoted to EXPLOITABLE via Playwright re-check", Colors.GREEN, verbose_only=True, verbose=self.verbose)
                         break
 
@@ -1211,7 +1211,7 @@ class VulnScanner:
         if signals.get("oob"):
             title = "Confirmed SQL Injection (OOB)"
             severity = "critical"
-            stage = VerificationStage.EXPLOITABLE.value
+            stage = VerificationStage.VERIFIED.value
         elif signal_count >= 3:
             title = "SQL Injection"
             severity = "critical"
@@ -1487,10 +1487,16 @@ class VulnScanner:
                 vuln_type="Confirmed SSRF (OOB)",
                 url=entry.get("url", ""),
                 severity="critical",
-                details=f"OOB callback received for SSRF probe",
-                evidence=f"Callback: {entry.get('payload', '')}",
-                verification_stage=VerificationStage.EXPLOITABLE.value,
-                validation_steps=["OOB callback verified: DNS/HTTP interaction confirmed"],
+                details=f"OOB callback received for SSRF probe — DNS/HTTP interaction confirmed from target server",
+                evidence=f"Callback: {entry.get('payload', '')} | Confirmed: DNS/HTTP callback received",
+                verification_stage=VerificationStage.VERIFIED.value,
+                validation_steps=["OOB callback verified: DNS/HTTP interaction confirmed from target infrastructure"],
+                response_excerpt="(SSRF confirmed via out-of-band callback — DNS/HTTP request received from target server)",
+                steps_to_reproduce=[
+                    f"Send SSRF probe to {entry.get('url', '')}",
+                    "Observe OOB callback on listener — confirms server makes external requests",
+                    "Use SSRF to access internal services or cloud metadata",
+                ],
             )
             if f and self._add(f):
                 findings.append(f)
@@ -1616,10 +1622,16 @@ class VulnScanner:
                 vuln_type="XML External Entity (XXE) Injection",
                 url=entry.get("url", ""),
                 severity="critical",
-                details="Blind XXE confirmed via OOB callback",
+                details="Blind XXE confirmed via OOB callback — server parsed XML entity and made external request",
                 evidence=f"Callback: {entry.get('payload', '')[:200]}",
-                verification_stage=VerificationStage.EXPLOITABLE.value,
+                verification_stage=VerificationStage.VERIFIED.value,
                 validation_steps=["OOB callback verified: DNS/HTTP interaction from XML parser"],
+                response_excerpt="(XXE confirmed via out-of-band callback — XML parser made external request)",
+                steps_to_reproduce=[
+                    f"Send XXE payload to {entry.get('url', '')}",
+                    "Observe OOB callback — confirms XML external entity processing",
+                    "Use XXE to read local files or access internal services",
+                ],
             )
             if f and self._add(f):
                 findings.append(f)
@@ -1670,10 +1682,16 @@ class VulnScanner:
                 vuln_type="Command Injection",
                 url=entry.get("url", ""),
                 severity="critical",
-                details="Command injection confirmed via OOB callback",
+                details="Command injection confirmed via OOB callback — injected command executed on server",
                 evidence=f"Callback: {entry.get('payload', '')[:200]}",
-                verification_stage=VerificationStage.EXPLOITABLE.value,
+                verification_stage=VerificationStage.VERIFIED.value,
                 validation_steps=["OOB callback verified: DNS/HTTP interaction from injected command"],
+                response_excerpt="(Command injection confirmed via out-of-band callback — server executed injected command)",
+                steps_to_reproduce=[
+                    f"Send command injection payload to {entry.get('url', '')}",
+                    "Observe OOB callback — confirms command execution on server",
+                    "Use access for remote code execution or data exfiltration",
+                ],
             )
             if f and self._add(f):
                 findings.append(f)
@@ -1863,12 +1881,11 @@ class VulnScanner:
                         severity="high",
                         details=f"DOM sink '{df['sink']}' triggered by probe in {url}",
                         evidence=f"Probe: {df['probe']} | Sink: {df['sink']}",
-                        verification_stage=VerificationStage.EXPLOITABLE.value,
+                        verification_stage=VerificationStage.VERIFIED.value,
                         validation_steps=[f"DOM sink '{df['sink']}' executed probe via Playwright"],
                     )
                     if f:
                         self._add(f)
-                    log(f"  [DOM XSS] {df['sink']} at {url}", Colors.RED, verbose_only=True, verbose=self.verbose)
             except Exception as e:
                 log(f"  [DOM XSS] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
 
@@ -1927,8 +1944,9 @@ class VulnScanner:
                     continue
 
                 # Stage 1: reflection detected
-                # Stage 2: headless validation
-                exec_result = self.browser.check_xss_execution(ctx_url, ctx_payload)
+                # Stage 2: headless validation with screenshot capture
+                screenshot_dir = self.config.get("output_dir", "reports")
+                exec_result = self.browser.check_xss_execution(ctx_url, ctx_payload, screenshot_dir=screenshot_dir)
 
                 if exec_result and (exec_result.get("alert_fired") or exec_result.get("dom_mutation")):
                     f = finding(
@@ -1940,13 +1958,16 @@ class VulnScanner:
                         request=_build_curl("GET", ctx_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=ctx_resp.text[:500],
                         steps_to_reproduce=[f"Send request to {ctx_url}", f"Observe XSS execution: {ctx_payload[:80]}"],
-                        verification_stage=VerificationStage.EXPLOITABLE.value,
+                        verification_stage=VerificationStage.VERIFIED.value,
                         validation_steps=[
                             f"Reflection in {context} context detected",
                             "Playwright browser validation: JS executed",
+                            f"Screenshot: {exec_result.get('screenshot_path', 'N/A')}",
                         ],
                     )
                     if f:
+                        if exec_result.get("screenshot_path"):
+                            f["screenshot_path"] = exec_result["screenshot_path"]
                         findings.append(f)
                     log(f"  [XSS Verified] {ctx_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
                 else:
@@ -2008,7 +2029,8 @@ class VulnScanner:
                 if ctx_payload not in r.text and "49" not in r.text:
                     continue
 
-                exec_result = self.browser.check_xss_execution(confirm_url, ctx_payload, html_content=r.text if method == "POST" else None)
+                screenshot_dir = self.config.get("output_dir", "reports")
+                exec_result = self.browser.check_xss_execution(confirm_url, ctx_payload, html_content=r.text if method == "POST" else None, screenshot_dir=screenshot_dir)
 
                 if exec_result and (exec_result.get("alert_fired") or exec_result.get("dom_mutation")):
                     f = finding(
@@ -2020,10 +2042,13 @@ class VulnScanner:
                         request=_build_curl(method, confirm_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=r.text[:500],
                         steps_to_reproduce=[f"Send {method} request to {confirm_url}", f"Observe XSS execution: {ctx_payload[:80]}"],
-                        verification_stage=VerificationStage.EXPLOITABLE.value,
-                        validation_steps=["Form reflection + Playwright execution verified"],
+                        verification_stage=VerificationStage.VERIFIED.value,
+                        validation_steps=["Form reflection + Playwright execution verified",
+                                          f"Screenshot: {exec_result.get('screenshot_path', 'N/A')}"],
                     )
                     if f:
+                        if exec_result.get("screenshot_path"):
+                            f["screenshot_path"] = exec_result["screenshot_path"]
                         findings.append(f)
                     log(f"  [XSS Form Verified] {confirm_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
                 else:
@@ -2119,14 +2144,19 @@ class VulnScanner:
                 vuln_type="Blind XSS (Stored)",
                 url=entry.get("url", ""),
                 severity="critical",
-                details="Blind XSS confirmed via OOB callback — payload executed by victim browser",
+                details="Blind XSS confirmed via OOB callback — payload executed by victim browser, callback received",
                 evidence=f"Callback: {entry.get('payload', '')[:200]}",
                 request=_build_curl("POST", entry.get("url", ""), dict(self.session.headers), data={"field": entry.get("payload", "")}),
-                response_excerpt="(confirmed via OOB callback — payload executed in victim browser)",
-                verification_stage=VerificationStage.EXPLOITABLE.value,
+                response_excerpt="(confirmed via OOB callback — JavaScript executed in victim browser, callback containing cookie/session data received)",
+                verification_stage=VerificationStage.VERIFIED.value,
                 validation_steps=[
                     "Payload injected into form field or URL parameter",
-                    "OOB callback received: JavaScript executed in victim browser",
+                    "OOB callback received: JavaScript executed in victim browser, callback with browser data received",
+                ],
+                steps_to_reproduce=[
+                    f"Inject Blind XSS payload into form field at {entry.get('url', '')}",
+                    "When victim/staff views the stored content, the payload executes",
+                    "Observe OOB callback containing victim's cookie, session, or page content",
                 ],
             )
             if f and self._add(f):

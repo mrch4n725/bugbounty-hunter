@@ -764,6 +764,7 @@ class Reporter:
             steps = f.get("validation_steps", [])
             request = f.get("request", "")
             response_excerpt = f.get("response_excerpt", "")
+            screenshot_path = f.get("screenshot_path", "")
             steps_to_reproduce = f.get("steps_to_reproduce", [])
 
             sev_class = {"critical": "critical", "high": "high", "medium": "medium", "low": "low", "info": "info"}.get(sev, "info")
@@ -811,6 +812,17 @@ class Reporter:
                     "</details></div>"
                 )
 
+            screenshot_html = ""
+            if screenshot_path:
+                screenshot_html = (
+                    '<div class="row"><strong>Validation Screenshot:</strong>'
+                    f'<details open><summary>View Playwright screenshot</summary>'
+                    f'<a href="{html.escape(screenshot_path)}" target="_blank">'
+                    f'<img src="{html.escape(screenshot_path)}" alt="XSS execution screenshot" '
+                    f'style="max-width:100%;border:1px solid var(--border);border-radius:4px;cursor:zoom-in" />'
+                    f'</a></details></div>'
+                )
+
             steps_to_reproduce_html = ""
             if steps_to_reproduce:
                 items = "".join(f"<li>{html.escape(s)}</li>" for s in steps_to_reproduce[:10])
@@ -834,6 +846,7 @@ class Reporter:
                     {evidence_html}
                     {request_html}
                     {response_html}
+                    {screenshot_html}
                     {steps_html}
                     {steps_to_reproduce_html}
                     <div class="row"><strong>FP Risk:</strong> {e_fpr} {cvss_html}</div>

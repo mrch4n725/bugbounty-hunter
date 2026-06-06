@@ -498,6 +498,7 @@ class BrowserValidator:
         self._pw = None
         self._browser = None
         self._lock = threading.Lock()
+        self._screenshot_counter = 0
 
     def _ensure_browser(self):
         if self._browser is not None:
@@ -536,19 +537,25 @@ class BrowserValidator:
         return browser.new_page()
 
     def check_xss_execution(self, url: str, payload: str,
-                            html_content: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Load URL (or HTML content for POST forms) and check if JS executes."""
+                            html_content: Optional[str] = None,
+                            screenshot_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Load URL (or HTML content for POST forms) and check if JS executes.
+        
+        If Playwright confirms JS execution and screenshot_dir is provided,
+        captures a full-page PNG screenshot and includes its path in the result.
+        """
         page = self._new_page()
         if not page:
             return None
         try:
-            result = {"alert_fired": False, "dom_mutation": False, "callback": False}
+            result = {"alert_fired": False, "dom_mutation": False, "callback": False, "screenshot_path": ""}
 
             def on_dialog(dialog):
                 result["alert_fired"] = True
                 dialog.dismiss()
 
             page.on("dialog", on_dialog)
+            page.set_viewport_size({"width": 1280, "height": 720})
             if html_content:
                 page.set_content(html_content, wait_until="domcontentloaded")
             else:
@@ -565,6 +572,21 @@ class BrowserValidator:
                 };
             }""")
             result["dom_mutation"] = dom_evidence.get("has_bbh_marker", False)
+
+            # Capture screenshot when execution confirmed and output dir available
+            execution_confirmed = result["alert_fired"] or result["dom_mutation"]
+            if execution_confirmed and screenshot_dir:
+                import os
+                os.makedirs(screenshot_dir, exist_ok=True)
+                self._screenshot_counter += 1
+                safe_name = re.sub(r'[^\w\-]', '_', url.split('//')[-1][:60])
+                shot_path = os.path.join(screenshot_dir, f"xss_{self._screenshot_counter:03d}_{safe_name}.png")
+                try:
+                    page.screenshot(path=shot_path, full_page=True)
+                    result["screenshot_path"] = shot_path
+                except Exception:
+                    pass
+
             page.close()
             return result
         except Exception:
@@ -1403,8 +1425,8 @@ def finding(
         stage = verification_stage or "detected"
         confidence_score = calculate_confidence(
             detection=True,
-            validation=stage in ("validated", "exploitable"),
-            exploitation=stage == "exploitable",
+            validation=stage in ("validated", "exploitable", "verified"),
+            exploitation=stage in ("exploitable", "verified"),
         )
 
     # Derive evidence strength and FPR from score if not provided
