@@ -58,18 +58,31 @@ def reset_seen_findings() -> None:
         _seen_findings = set()
 
 
+SENSITIVE_HEADER_NAMES = {"authorization", "cookie", "x-api-key", "x-auth-token"}
+
+# Module-level default; main.py flips via set_mask_sensitive_default()
+_MASK_SENSITIVE_DEFAULT: bool = True
+
+def set_mask_sensitive_default(enabled: bool) -> None:
+    global _MASK_SENSITIVE_DEFAULT
+    _MASK_SENSITIVE_DEFAULT = enabled
+
 def _build_curl(
     method: str,
     url: str,
     headers: Optional[Dict[str, str]] = None,
     data: Any = None,
     cookies: Optional[Dict[str, str]] = None,
+    mask_sensitive: Optional[bool] = None,
 ) -> str:
+    if mask_sensitive is None:
+        mask_sensitive = _MASK_SENSITIVE_DEFAULT
     """Build a curl command string for reproduction of a request."""
     parts = ["curl", "-X", method.upper()]
     if headers:
         for k, v in headers.items():
-            parts.append(f"-H '{k}: {v}'")
+            display_v = "<REDACTED>" if (mask_sensitive and k.lower() in SENSITIVE_HEADER_NAMES) else v
+            parts.append(f"-H '{k}: {display_v}'")
     if cookies:
         for k, v in cookies.items():
             parts.append(f"-b '{k}={v}'")

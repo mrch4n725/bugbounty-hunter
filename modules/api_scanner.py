@@ -16,7 +16,7 @@ import yaml
 
 from modules.scanner import VulnScanner
 from modules.utils import (
-    safe_get, safe_post, finding, log, Colors,
+    safe_get, safe_post, finding, log, Colors, _build_curl,
 )
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -275,7 +275,7 @@ class ApiScanner(VulnScanner):
                     "GraphQL introspection is enabled and exposes the full schema.",
                     f"Schema exposes {query_count} types with fields",
                     confidence="confirmed",
-                    request=f"POST {url}",
+                    request=_build_curl("POST", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                     response_excerpt=resp.text[:500],
                     steps_to_reproduce=[
                         f"Send POST request to {url} with GraphQL introspection query",
@@ -480,7 +480,7 @@ class ApiScanner(VulnScanner):
                             url, "high", details,
                             f"HTTP {resp.status_code} on {method}",
                             confidence="probable",
-                            request=f"{method.upper()} {url}",
+                            request=_build_curl(method, url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                             response_excerpt=resp.text[:500],
                             steps_to_reproduce=[
                                 f"Send {method.upper()} request to {url}",
@@ -551,7 +551,7 @@ class ApiScanner(VulnScanner):
                             details,
                             f"Field '{field}' reflected in response: {body_text[:120]}",
                             confidence="probable",
-                            request=f"{method.upper()} {url}",
+                            request=_build_curl(method, url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                             response_excerpt=resp.text[:500],
                             steps_to_reproduce=[
                                 f"Send {method.upper()} request to {url} with extra field '{field}'",

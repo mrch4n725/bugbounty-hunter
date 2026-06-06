@@ -9,6 +9,7 @@ import json
 import sys
 import os
 import threading
+import time
 import yaml
 from datetime import datetime
 from typing import Any
@@ -19,7 +20,7 @@ from modules.api_scanner import ApiScanner
 from modules.idor import IdorScanner
 from modules.reporter import Reporter
 from modules.js_intelligence import JSIntelligence
-from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score, prioritize_findings, reset_seen_findings
+from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score, prioritize_findings, reset_seen_findings, _build_curl, set_mask_sensitive_default
 
 
 def parse_args():
@@ -30,7 +31,7 @@ def parse_args():
     parser.add_argument("--config", "-C", help="Path to YAML configuration file")
     parser.add_argument("--target", "-t", help="Target URL (e.g. https://example.com)")
     parser.add_argument("--modules", "-m", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "all"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "all"],
         default=["all"])
     parser.add_argument("--output", "-o", default="reports")
     parser.add_argument("--format", "-f", choices=["json", "html", "txt", "markdown-report", "hackerone", "bugcrowd"], default="html")
@@ -53,7 +54,7 @@ def parse_args():
         help="Out-of-band callback host for SSRF and SQLi OOB verification (e.g. Burp Collaborator or interactsh URL)")
     parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
     parser.add_argument("--disable-modules", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi"],
         default=[], help="Disable specific modules when scanning all or default modules")
     parser.add_argument("--module-param", action="append", default=[],
         help="Override module settings using module.key=value")
@@ -83,6 +84,8 @@ def parse_args():
         help="Disable Rich terminal output (plain text, good for CI/pipe)")
     parser.add_argument("--max-js-files", type=int, default=50,
         help="Maximum number of JS files to scan for secrets/endpoints (default: 50)")
+    parser.add_argument("--no-mask-curl", action="store_true",
+        help="Disable sensitive header masking in curl commands within reports (shows Authorization, Cookie, etc.)")
     return parser.parse_args()
 
 
@@ -261,6 +264,7 @@ def build_config(args):
         "headless": getattr(args, "headless", False),
         "verify_only": getattr(args, "verify_only", None),
         "resume": getattr(args, "resume", False),
+        "no_mask_curl": getattr(args, "no_mask_curl", False),
         "rps": args.rps,
         "stealth": args.stealth,
         "max_js_files": args.max_js_files,
@@ -321,8 +325,19 @@ def _start_autosave(config, recon_data, all_findings, all_findings_lock, js_data
     if interval <= 0:
         return stop_event, None
 
+    _live_last = [time.time()]  # mutable box for closure
+
     def worker():
         while not stop_event.wait(interval):
+            # Live counter every 30s
+            elapsed = time.time() - _live_last[0]
+            if elapsed >= 30:
+                with all_findings_lock:
+                    findings_copy = list(all_findings)
+                confirmed = sum(1 for f in findings_copy if f.get("confirmed"))
+                log(f"  [Live] {len(findings_copy)} findings ({confirmed} confirmed)", Colors.CYAN)
+                _live_last[0] = time.time()
+
             with all_findings_lock:
                 snapshot = list(all_findings)
             try:
@@ -338,13 +353,14 @@ def _start_autosave(config, recon_data, all_findings, all_findings_lock, js_data
 
 
 def _collect_module_findings(modules, config, run_all, disabled_modules, all_findings, lock):
-    for mod_name, mod_fn in modules.items():
+    total = len(modules)
+    for i, (mod_name, mod_fn) in enumerate(modules.items(), 1):
         if mod_name in disabled_modules:
             log(f"[-] Skipping disabled module {mod_name.upper()}", Colors.CYAN)
             continue
         if not (run_all or mod_name in config["modules"]):
             continue
-        log(f"[*] Running {mod_name.upper()} scan...", Colors.YELLOW)
+        log(f"[{i}/{total}] Running {mod_name.upper()}...", Colors.CYAN)
         findings = mod_fn()
         if findings:
             log(f"[!] {len(findings)} finding(s) from {mod_name.upper()}", Colors.RED)
@@ -358,7 +374,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     # ── TARGET_LEVEL: modules that run once per target, not per URL ──
     TARGET_LEVEL: set[str] = {
         "headers", "dirb", "exposed_files", "clickjacking",
-        "subdomain_takeover", "graphql", "blind_xss", "js_secrets", "api",
+        "subdomain_takeover", "graphql", "blind_xss", "js_secrets", "api", "openapi",
     }
 
     if config["passive"]:
@@ -390,6 +406,8 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         "subdomain_takeover": scanner.scan_subdomain_takeover,
         "graphql": scanner.scan_graphql,
         "rate_limiting": scanner.scan_rate_limiting,
+        "js_secrets": scanner.scan_js_secrets,
+        "openapi": scanner.scan_openapi,
     }
     _api_scanner = ApiScanner(scanner.config, scanner.recon)
     module_map["api"] = _api_scanner.run_all
@@ -555,6 +573,7 @@ def main():
         sys.exit(1)
 
     config = build_config(args)
+    set_mask_sensitive_default(not config.get("no_mask_curl", False))
     verify_path = config.get("verify_only")
     if verify_path:
         log(f"[*] Verify-only mode: re-checking findings from {verify_path}", Colors.CYAN)
@@ -630,12 +649,20 @@ def main():
             sev = entry.get("severity", "high")
             if entry.get("validated"):
                 sev = "critical"
+            source_url = entry.get("source_url", "")
             f = finding(
                 vuln_type=f"Exposed JS Secret ({entry['type']})",
-                url=entry.get("source_url", ""),
+                url=source_url,
                 severity=sev,
                 details=f"Secret type '{entry['type']}' found in JS file",
-                evidence=f"Match: {entry['value'][:40]}... Source: {entry.get('source_url', '')}",
+                evidence=f"Match: {entry['value'][:40]}... Source: {source_url}",
+                request=_build_curl("GET", source_url, dict(js_session.headers), cookies=dict(js_session.cookies)),
+                response_excerpt=resp.text[:1000] if resp is not None else "",
+                steps_to_reproduce=[
+                    f"Fetch the JS file at {source_url}",
+                    f"Search the response for '{entry['type']}' patterns",
+                    "Observe the exposed secret value",
+                ],
             )
             if f:
                 js_findings.append(f)

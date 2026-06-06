@@ -14,7 +14,7 @@ from urllib.parse import urlparse, parse_qs
 
 from modules.scanner import VulnScanner
 from modules.utils import (
-    make_session, safe_get, safe_post, finding, log, Colors,
+    make_session, safe_get, safe_post, finding, log, Colors, _build_curl,
 )
 
 # ── ID parameter patterns ──────────────────────────────────────────────────────
@@ -247,7 +247,7 @@ class IdorScanner(VulnScanner):
                     f"for second user with differing content.",
                     f"Second user accessed: {resp_alt.text[:120]}",
                     confidence="confirmed",
-                    request=f"GET {url}",
+                    request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                     response_excerpt=resp_alt.text[:500],
                     steps_to_reproduce=[
                         f"Authenticate as second user and send GET request to {url}",

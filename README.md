@@ -365,6 +365,43 @@ The old `--triage-assist` flag (OpenAI prompt-based narrative generation) has be
 
 ---
 
+## Using AI Agents to Write Submission Reports
+
+BugBounty Hunter generates structured findings with curl commands, response excerpts, CVSS scores, impact narratives, and reproduction steps — all of which can be fed directly into an AI agent (Claude, GPT, etc.) to produce polished bug-bounty submission reports.
+
+**Workflow:**
+
+1. Run the scan: `python3 main.py --target https://example.com --format html`
+2. Open the generated HTML report and copy the finding details (or use the JSON report directly).
+3. Paste the finding data into an AI agent with a prompt like:
+
+> "Write a professional bug bounty submission report based on this finding. Include: vulnerability description, impact assessment, steps to reproduce (with the curl command), CVSS score, affected endpoint, remediation recommendation. Format it for HackerOne/Bugcrowd."
+
+**What the AI gets from each finding:**
+- **Curl command** — exact reproduction request (with sensitive headers redacted by default)
+- **Response excerpt** — the server's response that confirms the vulnerability
+- **Steps to reproduce** — numbered, developer-friendly steps
+- **Impact narrative** — business-impact-focused description
+- **CVSS vector & score** — for severity justification
+- **Remediation** — actionable fix recommendation
+
+**Example prompt for best results:**
+
+> "I have a vulnerability finding from a security scan. Here's the data:
+>
+> **Type:** Reflected XSS  
+> **URL:** https://example.com/search?q=  
+> **Parameter:** q  
+> **Curl:** curl -X GET 'https://example.com/search?q=<script>alert(1)</script>' -H 'User-Agent: ...'  
+> **Evidence:** Response contains `alert(1)` unescaped  
+> **CVSS:** 6.1 (Medium) AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N  
+>
+> Write a concise, professional HackerOne submission. Include a clear impact statement and CVSS justification. Use markdown formatting."
+
+The interactive curl button (copy to clipboard) in the HTML report makes it easy to grab reproduction commands for pasting into AI chats.
+
+---
+
 ## Disclaimer
 
 This software is for **education and authorized security testing** only. Obtain written permission before scanning any system. Authors and contributors are not liable for misuse or damages.

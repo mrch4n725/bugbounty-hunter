@@ -733,7 +733,12 @@ class Reporter:
         return cards
 
     def _build_curl_command(self, finding: Dict[str, Any]) -> str:
-        """Build a curl command from finding request metadata."""
+        """Build a curl command from finding request metadata.
+        Prefer the stored request field (may already be a full curl string).
+        """
+        req = finding.get("request", "")
+        if req.startswith("curl"):
+            return req
         url = finding.get("url", "")
         return f"curl -X GET '{url}'"
 

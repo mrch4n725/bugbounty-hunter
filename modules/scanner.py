@@ -25,7 +25,7 @@ from modules.utils import (
     EvidenceStrength, ConfidenceLevel, calculate_confidence,
     evidence_strength_from_score, false_positive_risk_from_score,
     prioritize_findings, compute_priority_score,
-    TechnologyFingerprinter, reset_seen_findings,
+    TechnologyFingerprinter, reset_seen_findings, _build_curl,
 )
 
 try:
@@ -888,7 +888,10 @@ class VulnScanner:
                 parsed = urlparse(url)
                 params = list(parse_qs(parsed.query).keys())
                 for param in params:
-                    result = self._ssti_test_parameter(url, param)
+                    resp = safe_get(self.session, url, self.timeout)
+                    result = self._ssti_test_parameter(url, param,
+                        request_str=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                        response_excerpt_str=resp.text[:500] if resp else "")
                     if result:
                         findings.append(result)
             except Exception as e:
@@ -898,7 +901,8 @@ class VulnScanner:
             self._add(f)
         return findings
 
-    def _ssti_test_parameter(self, url: str, param: str) -> Optional[dict]:
+    def _ssti_test_parameter(self, url: str, param: str,
+                             request_str: str = "", response_excerpt_str: str = "") -> Optional[dict]:
         ssti_payloads = self._load_payloads("ssti")
         # Stage 1: Arithmetic reflection detection
         arithmetic_results = []
@@ -998,6 +1002,8 @@ class VulnScanner:
             severity=severity,
             details=f"Parameter '{param}': {title.lower()} detected",
             evidence=evidence,
+            request=request_str or _build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+            response_excerpt=response_excerpt_str,
             verification_stage=stage,
             validation_steps=vsteps,
         )
@@ -1033,7 +1039,10 @@ class VulnScanner:
                     original_value = values[0] if values else "1"
                     signals = self._sqli_test_parameter(url, param, original_value, payloads, oob_host)
                     if signals:
-                        f = self._sqli_build_finding(url, param, signals, original_value=original_value)
+                        resp = safe_get(self.session, url, self.timeout)
+                        f = self._sqli_build_finding(url, param, signals, original_value=original_value,
+                            request_str=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                            response_excerpt_str=resp.text[:500] if resp else "")
                         if f:
                             self._add(f)
             except Exception as e:
@@ -1159,7 +1168,8 @@ class VulnScanner:
         return signals
 
     def _sqli_build_finding(self, url: str, param: str, signals: dict,
-                            original_value: str = "1") -> Optional[dict]:
+                            original_value: str = "1",
+                            request_str: str = "", response_excerpt_str: str = "") -> Optional[dict]:
         signal_count = sum(1 for v in signals.values() if v)
         evidence_parts = []
         for k, v in signals.items():
@@ -1192,6 +1202,8 @@ class VulnScanner:
             severity=severity,
             details=f"Parameter '{param}': {signal_count} signal(s) detected ({', '.join(evidence_parts)})",
             evidence=" | ".join(evidence_parts),
+            request=request_str or _build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+            response_excerpt=response_excerpt_str,
             verification_stage=stage,
             validation_steps=[f"Signal: {s}" for s in evidence_parts],
         )
@@ -1219,7 +1231,9 @@ class VulnScanner:
                 new_errors = {e for e in SQLI_ERRORS if e in resp.text.lower()} - baseline_errors
                 if new_errors:
                     signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
-                    f = self._sqli_build_finding(url, "POST JSON body", signals)
+                    f = self._sqli_build_finding(url, "POST JSON body", signals,
+                        request_str=_build_curl("POST", url, dict(self.session.headers), data=payload, cookies=dict(self.session.cookies)),
+                        response_excerpt_str=resp.text[:500] if resp else "")
                     if f:
                         self._add(f)
                 break
@@ -1231,7 +1245,9 @@ class VulnScanner:
                 new_errors = {e for e in SQLI_ERRORS if e in resp.text.lower()} - baseline_errors
                 if new_errors:
                     signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
-                    f = self._sqli_build_finding(url, "POST XML body", signals)
+                    f = self._sqli_build_finding(url, "POST XML body", signals,
+                        request_str=_build_curl("POST", url, dict(self.session.headers), data=payload, cookies=dict(self.session.cookies)),
+                        response_excerpt_str=resp.text[:500] if resp else "")
                     if f:
                         self._add(f)
                 break
@@ -1257,7 +1273,9 @@ class VulnScanner:
                     new_errors = {e for e in SQLI_ERRORS if e in resp.text.lower()} - baseline_errors
                     if new_errors:
                         signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
-                        f = self._sqli_build_finding(url, f"POST form body ({field_name})", signals)
+                        f = self._sqli_build_finding(url, f"POST form body ({field_name})", signals,
+                        request_str=_build_curl("POST", url, dict(self.session.headers), data=post_data, cookies=dict(self.session.cookies)),
+                        response_excerpt_str=resp.text[:500] if resp else "")
                         if f:
                             self._add(f)
                         break
@@ -1276,7 +1294,9 @@ class VulnScanner:
                     time.sleep(1)
                     if self.oob.poll():
                         signals = {"error": False, "boolean": False, "time": False, "union": False, "oob": True}
-                        f = self._sqli_build_finding(url, "POST JSON body (OOB)", signals)
+                        f = self._sqli_build_finding(url, "POST JSON body (OOB)", signals,
+                            request_str=_build_curl("POST", url, dict(self.session.headers), data=json.dumps({"id": formatted}), cookies=dict(self.session.cookies)),
+                            response_excerpt_str=resp.text[:500] if resp else "")
                         if f:
                             self._add(f)
                         break
@@ -1313,7 +1333,7 @@ class VulnScanner:
                         severity="high",
                         details=f"Stored payload reflected in {base_url}",
                         evidence=f"Payload: {payload} | Submitted via param: {entry['param']}",
-                        request=f"GET {base_url}",
+                        request=_build_curl("GET", base_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=resp.text[:500],
                         steps_to_reproduce=[f"Send request to {base_url}", f"Observe payload reflection: {payload[:80]}"],
                         verification_stage=VerificationStage.VALIDATED.value,
@@ -1416,7 +1436,7 @@ class VulnScanner:
                         severity="critical",
                         details=f"Vulnerable parameters ({len(vulnerable_params)}): {', '.join(vulnerable_params[:10])}",
                         evidence=f"Signatures: {', '.join(list(all_matched_sigs)[:5])}",
-                        request=f"GET {url}",
+                        request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=resp.text[:500],
                         steps_to_reproduce=[f"Send request to {url}", f"Observe cloud metadata signature in response"],
                         verification_stage=VerificationStage.VALIDATED.value,
@@ -1497,7 +1517,7 @@ class VulnScanner:
                                 url=url, severity="critical",
                                 details="In-band XXE: file content returned in response via XML entity",
                                 evidence=f"Signature: {sig!r}",
-                                request=f"POST {url}",
+                                request=_build_curl("POST", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                                 response_excerpt=resp.text[:500],
                                 steps_to_reproduce=[f"Send POST request to {url} with XXE payload", f"Observe: {sig}"],
                                 verification_stage=VerificationStage.VALIDATED.value,
@@ -1530,7 +1550,7 @@ class VulnScanner:
                                     url=url, severity="critical",
                                     details="Error-based XXE: file content leaked via parser error message",
                                     evidence=f"Signature: {sig!r}",
-                                    request=f"POST {url}",
+                                    request=_build_curl("POST", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                                     response_excerpt=resp.text[:500],
                                     steps_to_reproduce=[f"Send POST request to {url} with XXE payload", f"Observe: {sig}"],
                                     verification_stage=VerificationStage.VALIDATED.value,
@@ -1604,7 +1624,10 @@ class VulnScanner:
                 for param in params:
                     signals = self._cmd_injection_test_parameter(url, param, oob_host)
                     if signals and any(signals.values()):
-                        f = self._cmd_injection_build_finding(url, param, signals)
+                        resp = safe_get(self.session, url, self.timeout)
+                        f = self._cmd_injection_build_finding(url, param, signals,
+                            request_str=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                            response_excerpt_str=resp.text[:500] if resp else "")
                         if f and self._add(f):
                             findings.append(f)
             except Exception as e:
@@ -1706,7 +1729,8 @@ class VulnScanner:
         return signals
 
     def _cmd_injection_build_finding(self, url: str, param: str,
-                                     signals: Dict[str, bool]) -> Optional[dict]:
+                                     signals: Dict[str, bool],
+                                     request_str: str = "", response_excerpt_str: str = "") -> Optional[dict]:
         signal_count = sum(1 for v in signals.values() if v)
         evidence_parts = [k for k, v in signals.items() if v]
 
@@ -1731,6 +1755,8 @@ class VulnScanner:
             severity=severity,
             details=f"Parameter '{param}': {signal_count} signal(s) ({', '.join(evidence_parts)})",
             evidence=" | ".join(evidence_parts),
+            request=request_str or _build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+            response_excerpt=response_excerpt_str,
             verification_stage=stage,
             validation_steps=[f"Signal: {s}" for s in evidence_parts],
         )
@@ -1872,7 +1898,7 @@ class VulnScanner:
                         severity="critical",
                         details=f"Parameter '{param}' — XSS execution verified via Playwright ({context} context)",
                         evidence=f"Payload: {ctx_payload} | Alert: {exec_result.get('alert_fired')} | DOM: {exec_result.get('dom_mutation')}",
-                        request=f"GET {ctx_url}",
+                        request=_build_curl("GET", ctx_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=ctx_resp.text[:500],
                         steps_to_reproduce=[f"Send request to {ctx_url}", f"Observe XSS execution: {ctx_payload[:80]}"],
                         verification_stage=VerificationStage.EXPLOITABLE.value,
@@ -1891,7 +1917,7 @@ class VulnScanner:
                         severity="high",
                         details=f"Parameter '{param}' reflects payload in {context} context (unverified execution)",
                         evidence=f"Payload: {ctx_payload}",
-                        request=f"GET {ctx_url}",
+                        request=_build_curl("GET", ctx_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=ctx_resp.text[:500],
                         steps_to_reproduce=[f"Send request to {ctx_url}", f"Observe payload reflection: {ctx_payload[:80]}"],
                         verification_stage=VerificationStage.DETECTED.value,
@@ -1952,7 +1978,7 @@ class VulnScanner:
                         severity="critical",
                         details=f"Form field '{field_name}' — XSS execution verified ({context} context)",
                         evidence=f"Payload: {ctx_payload}",
-                        request=f"{method} {confirm_url}",
+                        request=_build_curl(method, confirm_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=r.text[:500],
                         steps_to_reproduce=[f"Send {method} request to {confirm_url}", f"Observe XSS execution: {ctx_payload[:80]}"],
                         verification_stage=VerificationStage.EXPLOITABLE.value,
@@ -1968,7 +1994,7 @@ class VulnScanner:
                         severity="high",
                         details=f"Form field '{field_name}' reflects in {context} context",
                         evidence=f"Payload: {ctx_payload}",
-                        request=f"{method} {confirm_url}",
+                        request=_build_curl(method, confirm_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=r.text[:500],
                         steps_to_reproduce=[f"Send {method} request to {confirm_url}", f"Observe payload reflection: {ctx_payload[:80]}"],
                         verification_stage=VerificationStage.DETECTED.value,
@@ -2056,6 +2082,8 @@ class VulnScanner:
                 severity="critical",
                 details="Blind XSS confirmed via OOB callback — payload executed by victim browser",
                 evidence=f"Callback: {entry.get('payload', '')[:200]}",
+                request=_build_curl("POST", entry.get("url", ""), dict(self.session.headers), data={"field": entry.get("payload", "")}),
+                response_excerpt="(confirmed via OOB callback — payload executed in victim browser)",
                 verification_stage=VerificationStage.EXPLOITABLE.value,
                 validation_steps=[
                     "Payload injected into form field or URL parameter",
@@ -2100,7 +2128,7 @@ class VulnScanner:
                                             severity="critical",
                                             details=f"Parameter '{param}' includes local file (signature: {sig!r})",
                                             evidence=f"Payload: {payload}",
-                                            request=f"GET {test_url}",
+                                            request=_build_curl("GET", test_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                                             response_excerpt=resp.text[:500],
                                             steps_to_reproduce=[f"Send request to {test_url}", f"Observe: {sig}"],
                                             verification_stage=VerificationStage.VALIDATED.value,
@@ -2146,7 +2174,7 @@ class VulnScanner:
                                     severity="medium",
                                     details=f"Parameter '{param}' redirects to external domain",
                                     evidence=f"Location: {loc[:100]}",
-                                    request=f"GET {test_url}",
+                                    request=_build_curl("GET", test_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                                     response_excerpt=resp.text[:500],
                                     steps_to_reproduce=[f"Send request to {test_url}", f"Observe redirect to {loc[:80]}"],
                                     verification_stage=VerificationStage.VALIDATED.value,
@@ -2192,7 +2220,17 @@ class VulnScanner:
                         url=form_action,
                         severity="medium",
                         details="POST form does not contain a known anti-CSRF token field",
-                        evidence=f"Form action: {form_action}",
+                        evidence=f"Form fields: {[fld.get('name') for fld in form.get('fields', [])]}",
+                        request=_build_curl("POST", form_action, {}, data={
+                            fld.get("name", "field"): fld.get("value", "test")
+                            for fld in form.get("fields", [])[:5]
+                        }),
+                        response_excerpt="(no request made — vulnerability detected from form structure)",
+                        steps_to_reproduce=[
+                            f"Navigate to the page containing the form at {form_action}",
+                            "Submit the POST form without a CSRF token",
+                            "Observe that the server accepts the request without token validation",
+                        ],
                         verification_stage=VerificationStage.DETECTED.value,
                     )
                     if f and self._add(f):
@@ -2249,7 +2287,7 @@ class VulnScanner:
                         severity="medium",
                         details=details,
                         evidence=f"HTTP {resp.status_code}",
-                        request=f"GET {target_url}",
+                        request=_build_curl("GET", target_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=resp.text[:500],
                         steps_to_reproduce=[f"Send request to {target_url}", "Observe HTTP 200 response"],
                         verification_stage=VerificationStage.DETECTED.value,
@@ -2264,7 +2302,7 @@ class VulnScanner:
                         severity="info",
                         details=f"Path exists but is access-controlled (HTTP 403): {target_url}",
                         evidence=f"HTTP 403",
-                        request=f"GET {target_url}",
+                        request=_build_curl("GET", target_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=resp.text[:500],
                         steps_to_reproduce=[f"Send request to {target_url}", "Observe HTTP 403 response"],
                         verification_stage=VerificationStage.DETECTED.value,
@@ -2279,7 +2317,7 @@ class VulnScanner:
                         severity="info",
                         details=f"Path requires authentication (HTTP 401): {target_url}",
                         evidence=f"HTTP 401",
-                        request=f"GET {target_url}",
+                        request=_build_curl("GET", target_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=resp.text[:500],
                         steps_to_reproduce=[f"Send request to {target_url}", "Observe HTTP 401 response"],
                         verification_stage=VerificationStage.DETECTED.value,
@@ -2333,7 +2371,7 @@ class VulnScanner:
                     severity=severity,
                     details=details,
                     evidence=f"HTTP {resp.status_code} — {len(resp.text)} bytes",
-                    request=f"GET {file_url}",
+                    request=_build_curl("GET", file_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                     response_excerpt=resp.text[:500],
                     steps_to_reproduce=[f"Send request to {file_url}", f"Observe: {details[:100]}"],
                     verification_stage=VerificationStage.VALIDATED.value,
@@ -2421,7 +2459,7 @@ class VulnScanner:
                             severity=severity,
                             details=f"Potential sensitive value detected in page content: {label}",
                             evidence=" | ".join(evidence_parts),
-                            request=f"GET {url}",
+                            request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                             response_excerpt=resp.text[:500],
                             steps_to_reproduce=[f"Send request to {url}", f"Observe {label} in response"],
                             verification_stage=VerificationStage.VALIDATED.value if (validation_result and validation_result.get("valid") is True) else VerificationStage.DETECTED.value,
@@ -2484,7 +2522,7 @@ class VulnScanner:
                 severity=severity,
                 details=f"Response is missing the '{header}' header",
                 evidence=f"Headers present: {', '.join(list(resp.headers.keys())[:5])}",
-                request=f"GET {target}",
+                request=_build_curl("GET", target, dict(self.session.headers), cookies=dict(self.session.cookies)),
                 response_excerpt=resp.text[:500],
                 steps_to_reproduce=[f"Send GET request to {target}", f"Observe missing header: {header}"],
                 verification_stage=VerificationStage.DETECTED.value,
@@ -2501,7 +2539,7 @@ class VulnScanner:
                 severity="low",
                 details=f"Server header reveals version: {server!r}",
                 evidence="",
-                request=f"GET {target}",
+                request=_build_curl("GET", target, dict(self.session.headers), cookies=dict(self.session.cookies)),
                 response_excerpt=resp.text[:500],
                 steps_to_reproduce=[f"Send GET request to {target}", f"Observe server header: {server!r}"],
                 verification_stage=VerificationStage.DETECTED.value,
@@ -2520,7 +2558,7 @@ class VulnScanner:
                     severity="low",
                     details=f"{header} reveals tech stack: {value!r}",
                     evidence="",
-                    request=f"GET {target}",
+                    request=_build_curl("GET", target, dict(self.session.headers), cookies=dict(self.session.cookies)),
                     response_excerpt=resp.text[:500],
                     steps_to_reproduce=[f"Send GET request to {target}", f"Observe {header} header: {value!r}"],
                     verification_stage=VerificationStage.DETECTED.value,
@@ -2537,7 +2575,7 @@ class VulnScanner:
                 severity="medium",
                 details="CSP contains potentially unsafe directives (unsafe-inline, unsafe-eval, or data:).",
                 evidence=f"CSP: {csp[:200]}",
-                request=f"GET {target}",
+                request=_build_curl("GET", target, dict(self.session.headers), cookies=dict(self.session.cookies)),
                 response_excerpt=resp.text[:500],
                 steps_to_reproduce=[f"Send GET request to {target}", "Observe CSP with unsafe directives"],
                 verification_stage=VerificationStage.DETECTED.value,
@@ -2553,7 +2591,7 @@ class VulnScanner:
                 severity="high",
                 details="Access-Control-Allow-Origin is '*' while credentials are allowed.",
                 evidence=f"Access-Control-Allow-Origin: {acao}, Access-Control-Allow-Credentials: {acc}",
-                request=f"GET {target}",
+                request=_build_curl("GET", target, dict(self.session.headers), cookies=dict(self.session.cookies)),
                 response_excerpt=resp.text[:500],
                 steps_to_reproduce=[f"Send GET request to {target}", f"Observe CORS: {acao} with {acc}"],
                 verification_stage=VerificationStage.DETECTED.value,
@@ -2567,7 +2605,7 @@ class VulnScanner:
                 severity="low",
                 details="Access-Control-Allow-Origin is set to '*'.",
                 evidence=f"Access-Control-Allow-Origin: {acao}",
-                request=f"GET {target}",
+                request=_build_curl("GET", target, dict(self.session.headers), cookies=dict(self.session.cookies)),
                 response_excerpt=resp.text[:500],
                 steps_to_reproduce=[f"Send GET request to {target}", f"Observe CORS: {acao}"],
                 verification_stage=VerificationStage.DETECTED.value,
@@ -2590,7 +2628,7 @@ class VulnScanner:
                         severity="critical",
                         details="Access-Control-Allow-Origin reflects Origin header verbatim with credentials allowed — full account access risk",
                         evidence=f"Origin: {evil_origin} -> ACAO: {reflected_acao}, ACC: {reflected_acc}",
-                        request=f"GET {target}",
+                        request=_build_curl("GET", target, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=probe_resp.text[:500],
                         steps_to_reproduce=[f"Send GET request to {target} with Origin: {evil_origin}", "Observe reflected ACAO header"],
                         verification_stage=VerificationStage.VALIDATED.value,
@@ -2622,7 +2660,7 @@ class VulnScanner:
                     severity="medium",
                     details=f"Set-Cookie missing {', '.join(missing)} flags.",
                     evidence=f"Set-Cookie: {cookie[:120]}",
-                    request=f"GET {target}",
+                    request=_build_curl("GET", target, dict(self.session.headers), cookies=dict(self.session.cookies)),
                     response_excerpt=resp.text[:500],
                     steps_to_reproduce=[f"Send GET request to {target}", f"Observe insecure cookie flags: {', '.join(missing)}"],
                     verification_stage=VerificationStage.DETECTED.value,
@@ -2654,7 +2692,7 @@ class VulnScanner:
                     severity="medium",
                     details="The application does not enforce frame protection headers.",
                     evidence=f"X-Frame-Options: {x_frame or 'missing'}, CSP: {csp or 'missing'}",
-                    request=f"GET {target}",
+                    request=_build_curl("GET", target, dict(self.session.headers), cookies=dict(self.session.cookies)),
                     response_excerpt=resp.text[:500],
                     steps_to_reproduce=[f"Send GET request to {target}", "Observe missing X-Frame-Options header"],
                     verification_stage=VerificationStage.DETECTED.value,
@@ -2692,7 +2730,7 @@ class VulnScanner:
                         severity="medium",
                         details="The server supports non-safe HTTP methods.",
                         evidence=f"Allowed methods: {', '.join(sorted(methods))}",
-                        request=f"OPTIONS {target}",
+                        request=_build_curl("OPTIONS", target, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=resp.text[:500],
                         steps_to_reproduce=[f"Send OPTIONS request to {target}", f"Observe dangerous methods: {', '.join(exposed)}"],
                         verification_stage=VerificationStage.DETECTED.value,
@@ -2731,6 +2769,16 @@ class VulnScanner:
                         severity="high",
                         details="A POST form submits data over an insecure HTTP connection.",
                         evidence="Form action uses http:// scheme",
+                        request=_build_curl("POST", action, {}, data={
+                            field.get("name", "field"): field.get("value", "test")
+                            for field in form.get("fields", [])[:5]
+                        }),
+                        response_excerpt="(no request made — vulnerability detected from form structure)",
+                        steps_to_reproduce=[
+                            f"Navigate to page with form action {action}",
+                            "Submit the form over HTTP",
+                            "Observe credentials submitted in cleartext",
+                        ],
                         verification_stage=VerificationStage.DETECTED.value,
                     )
                     if f and self._add(f):
@@ -2745,6 +2793,16 @@ class VulnScanner:
                             severity="high",
                             details="A password field submits to a different origin.",
                             evidence=f"Action host: {parsed.netloc}",
+                            request=_build_curl("POST", action, {}, data={
+                                field.get("name", "field"): field.get("value", "test")
+                                for field in form.get("fields", [])[:5]
+                            }),
+                            response_excerpt="(no request made — vulnerability detected from form structure)",
+                            steps_to_reproduce=[
+                                f"Navigate to page with form action {action}",
+                                "Submit the form to cross-origin endpoint",
+                                "Observe credentials submitted cross-origin",
+                            ],
                             verification_stage=VerificationStage.DETECTED.value,
                         )
                         if f and self._add(f):
@@ -2778,7 +2836,7 @@ class VulnScanner:
                                 severity="high",
                                 details="A known takeover fingerprint was detected on the subdomain.",
                                 evidence=f"Signature: {signature}",
-                                request=f"GET {target_url}",
+                                request=_build_curl("GET", target_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                                 response_excerpt=resp.text[:500],
                                 steps_to_reproduce=[f"Send GET request to {target_url}", f"Observe takeover signature: {signature}"],
                                 verification_stage=VerificationStage.DETECTED.value,
@@ -2937,6 +2995,8 @@ class VulnScanner:
                     severity=severity,
                     details=f"Endpoint accepted {PROBE_COUNT} POST requests in {elapsed:.1f}s without rate limiting",
                     evidence=evidence,
+                    request=_build_curl("POST", test_url, dict(self.session.headers), data=probe_data),
+                    response_excerpt=f"Sample response (req 1 of {PROBE_COUNT}): {results[0][1][:300]}" if results else "",
                     verification_stage=VerificationStage.VALIDATED.value,
                     validation_steps=[
                         f"Sent {PROBE_COUNT} burst POST requests to {test_url} (5 workers)",
@@ -3056,7 +3116,7 @@ class VulnScanner:
                         severity="medium",
                         details="Full schema is exposed via introspection.",
                         evidence="__schema",
-                        request=f"POST {url}",
+                        request=_build_curl("POST", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=r.text[:500],
                         steps_to_reproduce=[f"Send POST request to {url} with introspection query", "Observe __schema in response"],
                         verification_stage=VerificationStage.VALIDATED.value,
@@ -3077,7 +3137,7 @@ class VulnScanner:
                         severity="medium",
                         details="Server accepts batched GraphQL arrays with no apparent limit. (50 queries in one request)",
                         evidence="__typename",
-                        request=f"POST {url}",
+                        request=_build_curl("POST", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=r.text[:500],
                         steps_to_reproduce=[f"Send POST request to {url} with batch query", "Observe multiple results"],
                         verification_stage=VerificationStage.VALIDATED.value,
@@ -3099,7 +3159,7 @@ class VulnScanner:
                         severity="low",
                         details="Error messages contain suggested field names, aiding attacker recon.",
                         evidence="suggestions",
-                        request=f"POST {url}",
+                        request=_build_curl("POST", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=r.text[:500],
                         steps_to_reproduce=[f"Send POST request to {url} with malformed query", "Observe suggestions in error"],
                         verification_stage=VerificationStage.VALIDATED.value,
@@ -3122,7 +3182,7 @@ class VulnScanner:
                         severity="low",
                         details="Server accepts 200+ aliases in a single query, allowing resource exhaustion.",
                         evidence="200 aliases accepted",
-                        request=f"POST {url}",
+                        request=_build_curl("POST", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=r.text[:500],
                         steps_to_reproduce=[f"Send POST request to {url} with 200 aliases", "Observe 200 OK response"],
                         verification_stage=VerificationStage.DETECTED.value,
@@ -3145,7 +3205,7 @@ class VulnScanner:
                         severity="low",
                         details="Server allows 7+ levels of nested queries, enabling recursive DoS.",
                         evidence="7+ levels accepted without error",
-                        request=f"POST {url}",
+                        request=_build_curl("POST", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=r.text[:500],
                         steps_to_reproduce=[f"Send POST request to {url} with deeply nested query", "Observe 200 OK without errors"],
                         verification_stage=VerificationStage.DETECTED.value,
@@ -3200,7 +3260,7 @@ class VulnScanner:
                             severity="critical",
                             details=f"Parameter '{c['param']}' changed from {original_val} to {test_val} and returned non-identical content.",
                             evidence=r.text[:120],
-                            request=f"GET {test_url}",
+                            request=_build_curl("GET", test_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                             response_excerpt=r.text[:500],
                             steps_to_reproduce=[f"Send GET request to {test_url}", "Observe accessible data without authorization"],
                             verification_stage=VerificationStage.DETECTED.value,
