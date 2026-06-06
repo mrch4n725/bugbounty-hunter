@@ -4,7 +4,13 @@ lxml>=4.9.0
 urllib3>=2.0.0
 PyYAML>=6.0
 rich>=13.0.0
-playwright>=1.40.0
 
-# Optional: install for AST-based JS parsing (better accuracy)
+# Optional — uncomment to enable headless browser features:
+#   pip install playwright && python -m playwright install chromium
+# playwright>=1.40.0
+
+# Optional — uncomment to enable AI-assisted triage (--triage-assist):
+# openai>=1.30.0
+
+# Optional — uncomment for AST-based JS parsing (better accuracy):
 # esprima>=4.0.1

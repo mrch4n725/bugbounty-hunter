@@ -513,7 +513,8 @@ class VulnScanner:
             if "sqli" in vuln_type.lower():
                 # Try time-based if error-based was used
                 payloads = self._load_payloads("sqli")
-                signals = self._sqli_test_parameter(url, param or "id", "1", payloads, self.config.get("oob_host"))
+                original_val = f.get("original_value", "1")
+                signals = self._sqli_test_parameter(url, param or "id", original_val, payloads, self.config.get("oob_host"))
                 if signals.get("time") or signals.get("union") or signals.get("oob"):
                     f["verification_stage"] = VerificationStage.VALIDATED.value
                     log(f"  [Re-verify] SQLi at {url} promoted to VALIDATED via alternative signal", Colors.GREEN, verbose_only=True, verbose=self.verbose)
@@ -614,7 +615,11 @@ class VulnScanner:
                 chains_found.append(chain_finding)
                 break
 
-        findings.extend(chains_found)
+        existing_titles = {f.get("title", "") for f in findings}
+        for cf in chains_found:
+            if cf.get("title", "") not in existing_titles:
+                findings.append(cf)
+                existing_titles.add(cf.get("title", ""))
         return findings
 
     # ── Self-Halting Conditions ───────────────────────────────────────
@@ -1021,7 +1026,7 @@ class VulnScanner:
                     original_value = values[0] if values else "1"
                     signals = self._sqli_test_parameter(url, param, original_value, payloads, oob_host)
                     if signals:
-                        f = self._sqli_build_finding(url, param, signals)
+                        f = self._sqli_build_finding(url, param, signals, original_value=original_value)
                         if f:
                             self._add(f)
             except Exception as e:
@@ -1146,7 +1151,8 @@ class VulnScanner:
 
         return signals
 
-    def _sqli_build_finding(self, url: str, param: str, signals: dict) -> Optional[dict]:
+    def _sqli_build_finding(self, url: str, param: str, signals: dict,
+                            original_value: str = "1") -> Optional[dict]:
         signal_count = sum(1 for v in signals.values() if v)
         evidence_parts = []
         for k, v in signals.items():
@@ -1173,7 +1179,7 @@ class VulnScanner:
         else:
             return None
 
-        return finding(
+        f = finding(
             vuln_type=title,
             url=url,
             severity=severity,
@@ -1182,6 +1188,9 @@ class VulnScanner:
             verification_stage=stage,
             validation_steps=[f"Signal: {s}" for s in evidence_parts],
         )
+        if f:
+            f["original_value"] = original_value
+        return f
 
     def _sqli_test_post_body(self, url: str, payloads: dict, oob_host: Optional[str]) -> None:
         """Test POST endpoints with SQLi payloads in JSON, XML, and form bodies."""
@@ -2949,7 +2958,9 @@ class VulnScanner:
                         if f:
                             self._add(f)
 
-        return self._get_findings()
+        for f in findings:
+            self._add(f)
+        return findings
 
     # ═════════════════════════════════════════════════════════════════════
     # Verify-only mode

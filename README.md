@@ -80,8 +80,9 @@ If `python` is not found, try `python3` or `py` (Windows). On permission errors:
 |---------|-------------|---------|
 | **esprima** | AST-based JavaScript analysis — more accurate secret/endpoint extraction from minified bundles (regex fallback used when absent) | `pip install esprima` |
 | **openai** | AI-assisted triage narratives in Markdown reports via `--triage-assist` (requires `OPENAI_API_KEY` env var) | `pip install openai` |
+| **playwright** | Headless browser for JS-rendered crawling + XSS execution verification (`--headless` flag) | `pip install -r requirements-headless.txt` |
 
-Both packages are fully optional — the tool works without them using built-in fallbacks.
+All three packages are fully optional — the tool works without them using built-in fallbacks.
 
 ## Usage examples
 
@@ -188,6 +189,8 @@ Use `--modules all` (default) or list modules explicitly. Disable with `--disabl
 | `--module-param` | — | `module.key=value` overrides |
 | `--retries` | `3` | HTTP retry count |
 | `--autosave-interval` | `0` | Autosave partial report every N seconds |
+| `--no-rich` | off | Disable Rich terminal output (plain text, good for CI/pipe) |
+| `--max-js-files` | `50` | Max JS files to scan for secrets/endpoints |
 | `--passive` | off | No active fuzzing |
 | `--verbose` / `-v` | off | Per-request / per-finding logs |
 
@@ -288,6 +291,7 @@ bugbounty-hunter/
 ├── IMPLEMENTATION_SUMMARY.md        # Implementation walkthrough & change log
 ├── IMPROVEMENTS.md                  # Detailed false-positive fixes & improvements
 ├── requirements.txt
+├── requirements-headless.txt        # Playwright (optional, for --headless mode)
 ├── download.py                      # Payload download helper
 ├── Alternate_requirements_installer.py
 ├── payloads/
@@ -327,7 +331,7 @@ Respect `url_in_scope()` in every URL loop and use `self._record_confirmed(...)`
 ## Dependencies
 
 | Package | Role |
-|---------|------|
+|---------|-------|
 | `requests` | HTTP client |
 | `beautifulsoup4` | HTML parsing |
 | `lxml` | Parser backend |
@@ -335,8 +339,8 @@ Respect `url_in_scope()` in every URL loop and use `self._record_confirmed(...)`
 | `rich` | Terminal UI (progress, tables, colored logs) |
 | `urllib3` | Retries and connection pooling |
 | `tqdm` | Progress bars |
-| `playwright` | Headless browser for JS-rendered crawling + XSS execution verification |
-| `openai` | LLM-assisted triage (markdown reports) |
+| `playwright` | (optional) Headless browser for JS-rendered crawling + XSS execution verification (`requirements-headless.txt`) |
+| `openai` | (optional) LLM-assisted triage (markdown reports) |
 | `esprima` | (optional) JavaScript AST parsing for enhanced JS intelligence |
 | `boto3` | (optional) Live AWS key validation via STS |
 

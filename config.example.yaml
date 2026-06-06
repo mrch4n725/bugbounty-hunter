@@ -4,6 +4,19 @@
 # using command-line arguments. CLI flags override config file values.
 #
 # Usage: python main.py --config config.yaml
+#
+# ── NOTE ON BOOLEAN FLAGS ──────────────────────────────────────────────
+# Boolean flags like verbose, passive, headless, stealth, triage_assist,
+# verify_only default to False.  Setting them to true in this file works
+# ONLY when the corresponding CLI flag is NOT passed on the command line.
+# If you run:  python main.py --config config.yaml
+# and your config.yaml has:  verbose: true
+# then verbose WILL be enabled.
+#
+# But if you run:  python main.py --config config.yaml --verbose
+# then the CLI --verbose takes precedence (because it is explicitly set).
+# This is the correct design — CLI overrides config.
+# ────────────────────────────────────────────────────────────────────────
 
 # Target to scan
 target: https://example.com

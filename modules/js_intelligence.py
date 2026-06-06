@@ -24,6 +24,25 @@ except ImportError:
     ESPRIMA_AVAILABLE = False
 
 
+SECRET_SEVERITY = {
+    "AWS Access Key": "critical", "AWS Secret Key": "critical",
+    "Private Key (RSA)": "critical", "Private Key (EC)": "critical",
+    "Private Key (OpenSSH)": "critical", "Private Key (SSH)": "critical",
+    "Stripe Live Secret Key": "critical", "Stripe Restricted Key": "critical",
+    "GitHub Token (classic)": "high", "GitHub Token (fine-grained)": "high",
+    "GitHub OAuth": "high", "Twilio Account SID": "high",
+    "Twilio Auth Token": "high", "Slack Bot Token": "high",
+    "Slack App Token": "high", "Slack User Token": "high",
+    "Slack Webhook": "high", "Discord Webhook": "high",
+    "Heroku API Key": "high", "npm Auth Token": "high",
+    "SendGrid API Key": "high", "Stripe Test Secret Key": "medium",
+    "Stripe Live Publishable Key": "medium", "Stripe Test Publishable Key": "medium",
+    "Google API Key": "medium", "Google OAuth Token": "medium",
+    "Firebase API Key": "medium", "Firebase URL": "medium",
+    "Bearer Token": "medium", "Basic Auth": "medium",
+    "Generic API Key": "medium", "JWT Token": "medium",
+}
+
 SECRET_PATTERNS_JS = [
     ("AWS Access Key", re.compile(r"AKIA[0-9A-Z]{16}")),
     ("AWS Secret Key", re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9])")),
@@ -206,12 +225,14 @@ class JSIntelligence:
                 if self._is_duplicate(label, value):
                     continue
 
+                sev = SECRET_SEVERITY.get(label, "medium")
                 secret_entry = {
                     "type": label,
                     "value": value,
                     "match": match.group(0)[:80],
                     "source_url": source_url,
                     "confidence": "medium",
+                    "severity": sev,
                     "validated": None,
                     "validation_details": "",
                 }

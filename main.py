@@ -5,6 +5,7 @@ Usage: python main.py --target https://example.com [options]
 """
 
 import argparse
+import json
 import sys
 import os
 import threading
@@ -18,7 +19,7 @@ from modules.api_scanner import ApiScanner
 from modules.idor import IdorScanner
 from modules.reporter import Reporter
 from modules.js_intelligence import JSIntelligence
-from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score
+from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score, prioritize_findings
 
 
 def parse_args():
@@ -78,6 +79,10 @@ def parse_args():
         help="Regex patterns for URL exclusions (e.g. '/admin' '/logout')")
     parser.add_argument("--include-paths", nargs="*", default=[],
         help="Regex patterns for URL inclusion (e.g. '/api' '/graphql'). All others excluded.")
+    parser.add_argument("--no-rich", action="store_true",
+        help="Disable Rich terminal output (plain text, good for CI/pipe)")
+    parser.add_argument("--max-js-files", type=int, default=50,
+        help="Maximum number of JS files to scan for secrets/endpoints (default: 50)")
     return parser.parse_args()
 
 
@@ -124,16 +129,23 @@ def _apply_scalar_config(cli_args, config_file: dict) -> None:
         'exclude_patterns': 'exclude_patterns',
         'include_paths': 'include_paths',
         'autosave_interval': 'autosave_interval',
+        'max_js_files': 'max_js_files',
     }
     arg_defaults = {
         'threads': 10, 'timeout': 10, 'retries': 3,
         'crawl_depth': 2, 'autosave_interval': 0, 'rps': 5.0,
     }
+    BOOL_FLAGS = {'verbose', 'passive', 'headless', 'stealth', 'triage_assist', 'verify_only'}
     for yaml_key, arg_key in yaml_to_arg.items():
         if yaml_key not in config_file:
             continue
         cli_value = getattr(cli_args, arg_key, None)
-        is_default = cli_value is None or cli_value == arg_defaults.get(arg_key)
+        is_bool_flag = arg_key in BOOL_FLAGS
+        is_default = (
+            cli_value is None
+            or (is_bool_flag and cli_value is False)
+            or (not is_bool_flag and cli_value == arg_defaults.get(arg_key))
+        )
         if is_default:
             setattr(cli_args, arg_key, config_file[yaml_key])
 
@@ -251,6 +263,7 @@ def build_config(args):
         "triage_assist": getattr(args, "triage_assist", False),
         "rps": args.rps,
         "stealth": args.stealth,
+        "max_js_files": args.max_js_files,
         "scope": args.scope or "",
         "scope_enforcer": ScopeEnforcer(args.scope, args.output) if args.scope else None,
         "exclude_patterns": args.exclude_patterns or [],
@@ -309,11 +322,11 @@ def _start_autosave(config, recon_data, all_findings, all_findings_lock, js_data
         return stop_event, None
 
     def worker():
-        reporter = Reporter(config, [], recon_data, js_data=_js_data)
         while not stop_event.wait(interval):
             with all_findings_lock:
-                reporter.findings = list(all_findings)
+                snapshot = list(all_findings)
             try:
+                reporter = Reporter(config, snapshot, recon_data, js_data=_js_data)
                 reporter.generate(suffix="partial")
                 log(f"[✓] Interim report autosaved", Colors.GREEN)
             except Exception as e:
@@ -346,7 +359,6 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     TARGET_LEVEL: set[str] = {
         "headers", "dirb", "exposed_files", "clickjacking",
         "subdomain_takeover", "graphql", "blind_xss", "js_secrets", "api",
-        "ssti",
     }
 
     if config["passive"]:
@@ -361,7 +373,6 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
 
     # ── Step 1: Build module map (same keys as original _active_module_map) ──
     module_map: dict[str, Any] = {
-        "openapi": scanner.scan_openapi,
         "xss": scanner.scan_xss, "sqli": scanner.scan_sqli,
         "lfi": scanner.scan_lfi, "ssrf": scanner.scan_ssrf,
         "xxe": scanner.scan_xxe,
@@ -378,7 +389,6 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         "insecure_forms": scanner.scan_insecure_forms,
         "subdomain_takeover": scanner.scan_subdomain_takeover,
         "graphql": scanner.scan_graphql,
-        "idor": scanner.scan_idor,
         "rate_limiting": scanner.scan_rate_limiting,
     }
     _api_scanner = ApiScanner(scanner.config, scanner.recon)
@@ -447,7 +457,6 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     log("[*] Checking self-halting conditions...", Colors.CYAN)
     updated = VulnScanner.check_self_halt(updated)
 
-    from modules.utils import prioritize_findings
     updated = prioritize_findings(updated)
 
     # Merge TARGET_LEVEL findings (ApiScanner/IdorScanner don't use self._add())
@@ -505,6 +514,9 @@ def _write_report_and_summary(config, all_findings, recon_data, js_data=None) ->
 def main():
     banner()
     args = parse_args()
+    if getattr(args, "no_rich", False):
+        from modules.utils import set_rich_enabled
+        set_rich_enabled(False)
     if args.config:
         log(f"Loading configuration from {args.config}", Colors.CYAN)
         args = merge_configs(args, load_config_file(args.config))
@@ -515,14 +527,12 @@ def main():
     config = build_config(args)
     verify_path = config.get("verify_only")
     if verify_path:
-        from modules.scanner import VulnScanner
         log(f"[*] Verify-only mode: re-checking findings from {verify_path}", Colors.CYAN)
         verified = VulnScanner.verify_report(verify_path, config)
         if not verified:
             log("[!] No findings to verify; exiting.", Colors.YELLOW)
             return 0
         out_path = verify_path.replace(".json", "_verified.json")
-        import json
         with open(out_path, "w") as f:
             json.dump({"findings": verified, "verification": {
                 "total": len(verified),
@@ -556,10 +566,10 @@ def main():
         log("[*] Running JS Intelligence scan...", Colors.YELLOW)
         js_intel = JSIntelligence(base_url=config["target"], config=config)
         js_session = make_session(config)
-        max_js = 50
+        max_js = config.get("max_js_files", 50)
         urls_to_scan = js_urls[:max_js]
         if len(js_urls) > max_js:
-            log(f"[!] {len(js_urls)} JS bundles found, scanning first {max_js} (--max-urls to increase)",
+            log(f"[!] {len(js_urls)} JS bundles found, scanning first {max_js} (--max-js-files to increase)",
                 Colors.YELLOW)
 
         for url in urls_to_scan:
@@ -586,10 +596,13 @@ def main():
         for entry in js_data.get("secrets", []):
             if entry.get("confidence") == "none":
                 continue
+            sev = entry.get("severity", "high")
+            if entry.get("validated"):
+                sev = "critical"
             f = finding(
                 vuln_type=f"Exposed JS Secret ({entry['type']})",
                 url=entry.get("source_url", ""),
-                severity="critical" if entry.get("validated") else "high",
+                severity=sev,
                 details=f"Secret type '{entry['type']}' found in JS file",
                 evidence=f"Match: {entry['value'][:40]}... Source: {entry.get('source_url', '')}",
             )

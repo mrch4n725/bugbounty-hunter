@@ -8,6 +8,7 @@ and standardized data structures used throughout the application.
 import enum
 import hashlib
 import json
+import sys
 import os
 import random
 import re
@@ -1557,12 +1558,16 @@ class ScopeEnforcer:
             self._load(scope_file)
 
     def _load(self, path: str) -> None:
-        with open(path, "r") as f:
-            for line in f:
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                self._allowed.add(stripped.lower())
+        try:
+            with open(path, "r") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    self._allowed.add(stripped.lower())
+        except FileNotFoundError:
+            log(f"[!] Scope file not found: {path}", Colors.RED)
+            sys.exit(1)
 
     def check_url(self, url: str) -> bool:
         if not self._allowed:
