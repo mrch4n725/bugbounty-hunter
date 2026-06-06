@@ -63,6 +63,57 @@ SENSITIVE_HEADER_NAMES = {"authorization", "cookie", "x-api-key", "x-auth-token"
 # Module-level default; main.py flips via set_mask_sensitive_default()
 _MASK_SENSITIVE_DEFAULT: bool = True
 
+class ScanProgress:
+    """Rich-based scan progress bar with ETA, findings count, and module tracking.
+
+    Falls back to no-op when Rich is unavailable or --no-rich is set.
+    Usage:
+        with ScanProgress(total_urls, config) as prog:
+            for url in urls:
+                prog.advance(url, findings_count)
+    """
+
+    def __init__(self, total: int, config: dict, desc: str = "Scanning"):
+        self._total = total
+        self._config = config
+        self._desc = desc
+        self._progress: Optional["Progress"] = None
+        self._task_id = None
+        self._findings_count = 0
+
+    def __enter__(self):
+        no_rich = self._config.get("no_rich", False) or not RICH_AVAILABLE
+        if no_rich:
+            return self
+        self._progress = Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeRemainingColumn(),
+            TextColumn("[bold]{task.fields[findings]} findings"),
+        )
+        self._progress.start()
+        self._task_id = self._progress.add_task(
+            self._desc, total=self._total, findings=0
+        )
+        return self
+
+    def __exit__(self, *args):
+        if self._progress:
+            self._progress.stop()
+
+    def advance(self, url: str = "", findings_count: int = 0):
+        if self._progress and self._task_id is not None:
+            self._progress.update(self._task_id, advance=1, findings=findings_count)
+            if url:
+                self._progress.update(self._task_id, description=f"{self._desc} | {url[:80]}")
+
+    def update_findings(self, count: int):
+        self._findings_count = count
+        if self._progress and self._task_id is not None:
+            self._progress.update(self._task_id, findings=count)
+
+
 def set_mask_sensitive_default(enabled: bool) -> None:
     global _MASK_SENSITIVE_DEFAULT
     _MASK_SENSITIVE_DEFAULT = enabled

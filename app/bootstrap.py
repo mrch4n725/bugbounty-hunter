@@ -30,6 +30,10 @@ def auto_upgrade_config(
 
     if capabilities.has("oob_validation"):
         config.setdefault("enable_oob_validation", True)
+        if not config.get("oob_host"):
+            auto_host = getattr(capabilities, "_oob_auto_host", None)
+            if auto_host:
+                config["oob_host"] = auto_host
 
     if not capabilities.browser_validation:
         config.setdefault("xss_confidence_floor", "medium")

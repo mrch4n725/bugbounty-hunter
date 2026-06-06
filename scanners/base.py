@@ -61,6 +61,8 @@ class ScannerBase:
     # Scanner metadata — override in subclasses
     SCANNER_NAME = "base"
     SCANNER_MATURITY = 1  # 1-5: Detection only → Verified
+    SCANNER_ORDER = 100   # Lower = runs earlier (target-level: 10, per-url: 100)
+    TARGET_LEVEL = False  # True = runs once per target, not per URL
 
     def __init__(self, config: dict, recon: dict, container=None):
         self.config = config

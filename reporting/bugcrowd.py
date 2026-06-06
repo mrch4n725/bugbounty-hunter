@@ -36,18 +36,58 @@ class BugcrowdReporter(ReporterBase):
                 steps = "\n".join(f"{j+1}. {s}" for j, s in enumerate(steps))
             remed = f.get("remediation") or f.get("recommendation", "")
             remed = remed or self._build_remediation(f)
-            evidence = f.get("proof") or f.get("evidence", "")
+            evidence = (
+                getattr(f, 'evidence', None)
+                if not isinstance(f, dict)
+                else f.get("evidence", "")
+            )
+            if not evidence:
+                evidence = f.get("proof") or f.get("request_response", "")
             if isinstance(evidence, dict):
                 evidence = json.dumps(evidence, indent=2)
             elif isinstance(evidence, list):
                 evidence_parts = []
                 for j, ev in enumerate(evidence):
-                    if hasattr(ev, 'to_dict'):
-                        ev_text = json.dumps(ev.to_dict(), indent=2)
-                    else:
-                        ev_text = str(ev)
+                    ev_type = ev.__class__.__name__ if hasattr(ev, '__class__') else ""
                     desc = getattr(ev, 'description', f'Evidence #{j+1}') if hasattr(ev, 'description') else f'Evidence #{j+1}'
-                    evidence_parts.append(f"> **{desc}**\n```\n{ev_text}\n```")
+                    if ev_type == "HttpRequestEvidence":
+                        curl = getattr(ev, 'curl_command', '') or getattr(ev, 'method', '') + ' ' + getattr(ev, 'url', '')
+                        evidence_parts.append(f"> **{desc}**\n```\n{curl}\n```")
+                    elif ev_type == "BrowserExecutionEvidence":
+                        scr = getattr(ev, 'screenshot_path', '')
+                        ctx = getattr(ev, 'execution_context', '')
+                        alert = getattr(ev, 'alert_fired', False)
+                        dom = getattr(ev, 'dom_mutation', False)
+                        status = "✅ Executed" if alert or dom else "❌ Not executed"
+                        scr_line = f"\n![Screenshot]({scr})" if scr else ""
+                        evidence_parts.append(f"> **{desc}** — {status}\n> Context: {ctx}{scr_line}")
+                    elif ev_type == "AuthorizationComparisonEvidence":
+                        orig_user = getattr(ev, 'original_user', '')
+                        tgt_user = getattr(ev, 'target_user', '')
+                        violated = getattr(ev, 'ownership_violated', False)
+                        evidence_parts.append(
+                            f"> **{desc}** — {'⚠️ Ownership Violation' if violated else 'No violation'}\n"
+                            f"> Original user `{orig_user}` → Target user `{tgt_user}`"
+                        )
+                    elif ev_type == "TimingEvidence":
+                        delta = getattr(ev, 'time_delta', getattr(ev, 'elapsed_ms', 0))
+                        baseline = getattr(ev, 'baseline_ms', 0)
+                        evidence_parts.append(f"> **{desc}**\n> Baseline: {baseline:.1f}ms | Actual: {delta:.1f}ms | Diff: {delta-baseline:.1f}ms")
+                    elif ev_type == "OOBCallbackEvidence":
+                        cb_type = getattr(ev, 'callback_type', getattr(ev, 'type', 'unknown'))
+                        cb_data = getattr(ev, 'data', '')
+                        evidence_parts.append(f"> **{desc}** ({cb_type})\n```\n{str(cb_data)[:500]}\n```")
+                    elif ev_type == "GraphQLSchemaEvidence":
+                        schema = getattr(ev, 'schema_preview', '')
+                        q_count = getattr(ev, 'query_count', 0)
+                        m_count = getattr(ev, 'mutation_count', 0)
+                        evidence_parts.append(f"> **{desc}** ({q_count} queries, {m_count} mutations)\n```\n{str(schema)[:800]}\n```")
+                    else:
+                        if hasattr(ev, 'to_dict'):
+                            ev_text = json.dumps(ev.to_dict(), indent=2)
+                        else:
+                            ev_text = str(ev)
+                        evidence_parts.append(f"> **{desc}**\n```\n{ev_text}\n```")
                 evidence = "\n".join(evidence_parts) if evidence_parts else ""
 
             confidence = f.get("confidence_score")

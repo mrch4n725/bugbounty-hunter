@@ -17,6 +17,7 @@ from modules.utils import (
     make_session, safe_get, safe_post, finding, log, Colors, _build_curl,
     build_role_sessions, get_role_session,
 )
+from models.evidence import AuthorizationComparisonEvidence, EvidenceStatus
 
 # ── ID parameter patterns ──────────────────────────────────────────────────────
 
@@ -245,7 +246,7 @@ class IdorScanner(VulnScanner):
                 continue
 
             if resp_alt.text != resp_self.text:
-                self._append_finding(findings, finding(
+                f_dict = finding(
                     "IDOR - Horizontal Privilege Escalation",
                     url, "critical",
                     f"Parameter '{c['param']}' ({c['type']}) returned HTTP 200 "
@@ -256,10 +257,34 @@ class IdorScanner(VulnScanner):
                     request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                     response_excerpt=resp_alt.text[:500],
                     steps_to_reproduce=[
-                        f"Authenticate as second user and send GET request to {url}",
-                        "Observe that the response content differs from the first user's response, indicating horizontal privilege escalation",
+                        f"Authenticate as primary user and send GET request to {url}",
+                        f"Note the response length ({len(resp_self.text)} chars) and status ({resp_self.status_code})",
+                        f"Replace session with second user's credentials",
+                        f"Send GET request to the same URL {url}",
+                        f"Observe that HTTP {resp_alt.status_code} is returned with {len(resp_alt.text)} chars — content differs from primary user",
+                        "This confirms horizontal privilege escalation: the endpoint returns different users' data without ownership verification",
                     ],
-                ))
+                )
+                if f_dict:
+                    ev = AuthorizationComparisonEvidence(
+                        original_user="primary",
+                        target_user="secondary",
+                        original_status=resp_self.status_code,
+                        target_status=resp_alt.status_code,
+                        content_different=True,
+                        ownership_violated=True,
+                        original_body_excerpt=resp_self.text[:300],
+                        target_body_excerpt=resp_alt.text[:300],
+                        description=f"Horizontal privilege escalation: secondary user accessed {url}",
+                        status=EvidenceStatus.VERIFIED,
+                    )
+                    legacy_ev = f_dict.get("evidence", "")
+                    f_dict["evidence"] = [legacy_ev] if legacy_ev else []
+                    f_dict["evidence"].append(ev)
+                    if hasattr(self, '_container') and self._container and self._container.evidence_engine:
+                        self._container.evidence_engine.store(ev)
+                        self._container.evidence_engine.link_to_finding(ev, f_dict.get("fingerprint", ""))
+                    self._append_finding(findings, f_dict)
                 log(f"  [IDOR Horiz] {url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
 
     # ── Sequential ID enumeration ─────────────────────────────────────────
@@ -501,7 +526,19 @@ class IdorScanner(VulnScanner):
                 continue
 
             if resp_b.text != resp_a.text and len(resp_b.text) > 300:
-                self._append_finding(findings, finding(
+                auth_evidence = AuthorizationComparisonEvidence(
+                    original_user=default_role,
+                    target_user=alt_role,
+                    original_status=resp_a.status_code,
+                    target_status=resp_b.status_code,
+                    content_different=True,
+                    ownership_violated=True,
+                    original_body_excerpt=resp_a.text[:300],
+                    target_body_excerpt=resp_b.text[:300],
+                    description=f"Authorization check: {default_role} vs {alt_role} @ {test_url} — violation",
+                    status=EvidenceStatus.VERIFIED,
+                )
+                f_dict = finding(
                     "IDOR - Ownership Verification",
                     test_url, "critical",
                     f"Parameter '{param}' accessible by both '{default_role}' and "
@@ -518,7 +555,25 @@ class IdorScanner(VulnScanner):
                         "Observe that the endpoint returns another user's private data",
                         f"Compare with '{default_role}' response — content differs, confirming IDOR",
                     ],
-                ))
+                )
+                if f_dict:
+                    # Convert string evidence to list and append typed evidence
+                    legacy_ev = f_dict.get("evidence", "")
+                    f_dict["evidence"] = [legacy_ev] if legacy_ev else []
+                    f_dict["evidence"].append(auth_evidence)
+                    # Update reproduction steps for submission readiness
+                    f_dict["steps_to_reproduce"] = [
+                        f"Authenticate as '{default_role}' (provide session token or cookie)",
+                        f"Send GET request to {test_url} as '{default_role}' and note the response (HTTP {resp_a.status_code}, {len(resp_a.text)} chars)",
+                        f"Replace the session token with '{alt_role}'s token",
+                        f"Send GET request to the same URL {test_url} as '{alt_role}'",
+                        f"Observe that the endpoint returns HTTP {resp_b.status_code} with {len(resp_b.text)} chars — different from '{default_role}'s response",
+                        "This confirms an ownership violation — the server returns different users' data based on authentication context rather than resource ownership",
+                    ]
+                    if hasattr(self, '_container') and self._container and self._container.evidence_engine:
+                        fp = self._container.evidence_engine.store(auth_evidence)
+                        self._container.evidence_engine.link_to_finding(auth_evidence, f_dict.get("fingerprint", ""))
+                    self._append_finding(findings, f_dict)
                 log(f"  [IDOR Owner] {test_url[:80]} — {default_role} vs {alt_role}",
                     Colors.RED, verbose_only=True, verbose=self.verbose)
 

@@ -221,7 +221,7 @@ expected_methods = [
     "scan_open_redirect", "scan_headers", "scan_csrf", "scan_directory_fuzz",
     "scan_sensitive_data", "scan_exposed_files", "scan_clickjacking",
     "scan_http_methods", "scan_insecure_forms", "scan_subdomain_takeover",
-    "scan_graphql", "scan_idor", "scan_rate_limiting", "scan_openapi",
+    "scan_graphql", "scan_rate_limiting", "scan_openapi",
     "chain_analysis",
 ]
 for m in expected_methods:

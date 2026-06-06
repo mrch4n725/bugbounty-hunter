@@ -110,6 +110,32 @@ class HTMLReporter(ReporterBase):
         sev_json = json.dumps(severity_counts)
         ver_json = json.dumps(verification_breakdown)
 
+        # ── JSON-LD structured data for LLM parsing ─────────────────────
+        jsonld_data = {
+            "@context": "https://schema.org",
+            "@type": "Report",
+            "name": f"Bug Bounty Report - {self.target}",
+            "target": self.target,
+            "dateCreated": datetime.now().isoformat(),
+            "severity_counts": severity_counts,
+            "verification_breakdown": verification_breakdown,
+            "findings": [
+                {
+                    "title": f.get("title", ""),
+                    "vuln_type": f.get("vuln_type", f.get("type", "")),
+                    "severity": f.get("severity", "info"),
+                    "url": f.get("url", ""),
+                    "parameter": f.get("parameter", ""),
+                    "verification_stage": f.get("verification_stage", "detected"),
+                    "confidence_score": f.get("confidence_score", 0),
+                    "false_positive_risk": f.get("false_positive_risk", ""),
+                    "cvss_score": self._get_cvss_score(f),
+                }
+                for f in sorted_findings
+            ],
+        }
+        jsonld_html = json.dumps(jsonld_data, indent=2)
+
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -118,6 +144,9 @@ class HTMLReporter(ReporterBase):
     <title>Bug Bounty Report - {self.target}</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>{REPORT_CSS}</style>
+    <script type="application/ld+json">
+{jsonld_html}
+    </script>
 </head>
 <body>
     <div class="container">
@@ -180,23 +209,121 @@ class HTMLReporter(ReporterBase):
         return cards
 
     def _get_evidence_html(self, f: Any) -> str:
-        """Render evidence from Finding (list) or legacy (string) format."""
-        evidence = f.get("evidence", "")
-        if not evidence and isinstance(evidence, list) and not evidence:
-            return ""
+        """Render evidence from Finding (list) or legacy (string) format.
+        
+        Uses type-specific rendering for known evidence subclasses:
+        - HttpRequestEvidence: collapsible request detail
+        - BrowserExecutionEvidence: screenshot + execution context
+        - ScreenshotEvidence: inline image
+        - TimingEvidence: timing delta display
+        - OOBCallbackEvidence: callback detail
+        - AuthorizationComparisonEvidence: side-by-side comparison
+        - GraphQLSchemaEvidence: schema preview
+        """
+        # Access f.evidence directly for Finding instances (f.get("evidence")
+        # returns a string due to the dict-compat shim). For plain dicts,
+        # fall back to f.get("evidence", [])
+        evidence = (
+            getattr(f, 'evidence', None)
+            if not isinstance(f, dict)
+            else f.get("evidence", "")
+        )
+        if evidence is None:
+            evidence = ""
         if isinstance(evidence, list):
             parts = []
             for i, ev in enumerate(evidence):
-                if hasattr(ev, 'to_dict'):
-                    ev_text = json.dumps(ev.to_dict(), indent=2)
-                else:
-                    ev_text = str(ev)
-                e_text = html.escape(ev_text)
+                ev_type = ev.__class__.__name__ if hasattr(ev, '__class__') else ""
                 desc = getattr(ev, 'description', f'Evidence #{i+1}') if hasattr(ev, 'description') else f'Evidence #{i+1}'
-                parts.append(
-                    f'<details><summary>{html.escape(desc)} ({len(ev_text)} chars)</summary>'
-                    f'<div class="evidence">{e_text}</div></details>'
-                )
+                e_desc = html.escape(desc)
+
+                if ev_type == "HttpRequestEvidence":
+                    curl = getattr(ev, 'curl_command', '') or getattr(ev, 'method', '') + ' ' + getattr(ev, 'url', '')
+                    e_curl = html.escape(curl)
+                    parts.append(
+                        f'<details><summary>{e_desc}</summary>'
+                        f'<pre class="evidence">{e_curl}</pre></details>'
+                    )
+                elif ev_type == "BrowserExecutionEvidence":
+                    scr_path = getattr(ev, 'screenshot_path', '')
+                    ctx = getattr(ev, 'execution_context', '')
+                    alert = getattr(ev, 'alert_fired', False)
+                    dom = getattr(ev, 'dom_mutation', False)
+                    status = "✓ Executed" if alert or dom else "✗ Not executed"
+                    e_ctx = html.escape(ctx)
+                    scr_html = ""
+                    if scr_path:
+                        scr_html = f'<br><a href="{html.escape(scr_path)}" target="_blank"><img src="{html.escape(scr_path)}" alt="Browser screenshot" style="max-width:100%;max-height:300px;border:1px solid var(--border);border-radius:4px"></a>'
+                    parts.append(
+                        f'<details open><summary>{e_desc} — <strong>{status}</strong></summary>'
+                        f'<div class="evidence">{e_ctx}{scr_html}</div></details>'
+                    )
+                elif ev_type == "ScreenshotEvidence":
+                    scr_path = getattr(ev, 'file_path', '')
+                    if scr_path:
+                        parts.append(
+                            f'<details open><summary>{e_desc}</summary>'
+                            f'<a href="{html.escape(scr_path)}" target="_blank"><img src="{html.escape(scr_path)}" alt="Screenshot" style="max-width:100%;max-height:300px;border:1px solid var(--border);border-radius:4px"></a></details>'
+                        )
+                    else:
+                        parts.append(f'<details><summary>{e_desc}</summary><div class="evidence">Screenshot data embedded</div></details>')
+                elif ev_type == "TimingEvidence":
+                    delta = getattr(ev, 'time_delta', getattr(ev, 'elapsed_ms', 0))
+                    baseline = getattr(ev, 'baseline_ms', 0)
+                    parts.append(
+                        f'<details><summary>{e_desc}</summary>'
+                        f'<div class="evidence">Baseline: {baseline:.1f}ms | Actual: {delta:.1f}ms | Diff: {delta - baseline:.1f}ms</div></details>'
+                    )
+                elif ev_type == "OOBCallbackEvidence":
+                    cb_type = getattr(ev, 'callback_type', getattr(ev, 'type', 'unknown'))
+                    cb_data = getattr(ev, 'data', '')
+                    e_cb_data = html.escape(str(cb_data)[:500])
+                    parts.append(
+                        f'<details><summary>{e_desc} ({cb_type})</summary>'
+                        f'<pre class="evidence">{e_cb_data}</pre></details>'
+                    )
+                elif ev_type == "AuthorizationComparisonEvidence":
+                    orig_user = getattr(ev, 'original_user', '')
+                    tgt_user = getattr(ev, 'target_user', '')
+                    orig_status = getattr(ev, 'original_status', 0)
+                    tgt_status = getattr(ev, 'target_status', 0)
+                    content_diff = getattr(ev, 'content_different', False)
+                    violated = getattr(ev, 'ownership_violated', False)
+                    orig_body = getattr(ev, 'original_body_excerpt', '')
+                    tgt_body = getattr(ev, 'target_body_excerpt', '')
+                    e_orig = html.escape(orig_body[:300])
+                    e_tgt = html.escape(tgt_body[:300])
+                    parts.append(
+                        f'<details open><summary>{e_desc} {"✓ Violation" if violated else "No violation"}</summary>'
+                        f'<div class="evidence">'
+                        f'<p><strong>User:</strong> {html.escape(orig_user)} → HTTP {orig_status}</p>'
+                        f'<p><strong>User:</strong> {html.escape(tgt_user)} → HTTP {tgt_status}</p>'
+                        f'<p><strong>Content different:</strong> {content_diff}</p>'
+                        f'<details><summary>Original response excerpt</summary><pre>{e_orig}</pre></details>'
+                        f'<details><summary>Target response excerpt</summary><pre>{e_tgt}</pre></details>'
+                        f'</div></details>'
+                    )
+                elif ev_type == "GraphQLSchemaEvidence":
+                    schema = getattr(ev, 'schema_preview', '')
+                    q_count = getattr(ev, 'query_count', 0)
+                    m_count = getattr(ev, 'mutation_count', 0)
+                    e_schema = html.escape(str(schema)[:1000])
+                    parts.append(
+                        f'<details><summary>{e_desc} ({q_count} queries, {m_count} mutations)</summary>'
+                        f'<pre class="evidence">{e_schema}</pre></details>'
+                    )
+                else:
+                    if hasattr(ev, 'to_dict'):
+                        ev_text = json.dumps(ev.to_dict(), indent=2)
+                    else:
+                        ev_text = str(ev)
+                    e_text = html.escape(ev_text)
+                    parts.append(
+                        f'<details><summary>{e_desc} ({len(ev_text)} chars)</summary>'
+                        f'<div class="evidence">{e_text}</div></details>'
+                    )
+            if not parts:
+                return ""
             return f'<div class="row"><strong>Evidence:</strong>{"".join(parts)}</div>'
         e_evidence = html.escape(evidence)
         return f'<div class="row"><strong>Evidence:</strong><details><summary>View evidence ({len(evidence)} chars)</summary><div class="evidence">{e_evidence}</div></details></div>'

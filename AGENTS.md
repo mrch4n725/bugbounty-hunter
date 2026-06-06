@@ -19,14 +19,36 @@ Each finding carries a confidence score (0–100), evidence strength (Weak/Moder
 ### Entry point
 
 ```
-main.py                     — CLI arg parsing, orchestration, autosave, --dry-run
+main.py                     — CLI arg parsing, orchestration, autosave, --dry-run, --new-scanners
 modules/
-  scanner.py                — Core VulnScanner with all 23 scan_* methods
+  scanner.py                — Core VulnScanner with scan_* methods, feature-flag dispatchers
   utils.py                  — Finding engine, dedup, OOB, BrowserValidator, helpers
   reporter.py               — Reporter class (HTML, JSON, TXT, HackerOne, Bugcrowd)
   api_scanner.py            — ApiScanner (subclass of VulnScanner), API-specific checks
   idor.py                   — IdorScanner (subclass of VulnScanner), param-based IDOR
   recon.py                  — Reconnaissance, crawling, subdomain discovery, JS analysis
+scanners/
+  __init__.py               — Exports: ScannerBase, XSSScanner, HeadersScanner, SQLiScanner, SSRFScanner
+  base.py                   — ScannerBase with 5-phase lifecycle (init → prepare → scan → finalize → findings)
+  xss.py                    — XSSScanner(ScannerBase): reflected, stored, DOM, form XSS
+  headers.py                — HeadersScanner(ScannerBase): security header audit
+  sqli.py                   — SQLiScanner(ScannerBase): error-based, boolean, time-based, OOB
+  ssrf.py                   — SSRFScanner(ScannerBase): cloud metadata + OOB callback confirmation
+models/
+  config.py                 — ScanConfig dataclass with use_new_scanners: bool
+  finding.py                — Finding class with dict-compat shim, strict __getitem__, content-fingerprinted to_dict()
+  evidence.py               — EvidenceBase + 10 subclasses (HttpRequest, BrowserExecution, Screenshot, Timing,
+                               OOBCallback, AuthorizationComparison, GraphQLSchema, CommandExecution, ResponseDiff, Composite)
+engines/
+  evidence_engine.py        — EvidenceEngine: SHA-256 content-based dedup store(), get_evidence() by finding_id
+reporting/
+  base.py                   — ReporterBase, assess_finding_impact, group_by_root_cause
+  html.py                   — HTMLReporter: type-specific evidence rendering (collapsible, thumbnails, side-by-side)
+  json_report.py            — JSONReporter
+  txt.py                    — TXTReporter
+  markdown.py               — MarkdownReporter
+  hackerone.py              — HackerOneReporter: type-specific evidence blocks
+  bugcrowd.py               — BugcrowdReporter: type-specific evidence blocks
 ```
 
 ---
@@ -50,8 +72,20 @@ f = finding("XSS Reflected", "https://example.com/xss?q=1", "critical",
 
 The `module_map` and `TARGET_LEVEL` sets live in `main.py`'s `run()` function, **not** on `VulnScanner`. There are two tiers:
 
-- **TARGET_LEVEL modules** (run once per target, not per URL): `headers`, `dirb`, `exposed_files`, `clickjacking`, `subdomain_takeover`, `graphql`, `blind_xss`, `js_secrets`, `api`, `openapi`, `idor_path`
+- **TARGET_LEVEL modules** (run once per target, not per URL): `headers`, `dirb`, `exposed_files`, `clickjacking`, `subdomain_takeover`, `graphql`, `blind_xss`, `js_secrets`, `api`, `openapi`
 - **Per-URL modules** (run for each discovered URL): `xss`, `sqli`, `lfi`, `ssrf`, `xxe`, `ssti`, `cmd_injection`, `open_redirect`, `csrf`, `http_methods`, `insecure_forms`, `idor`, `rate_limiting`
+
+### 2j. New scanner lifecycle (opt-in via --new-scanners)
+
+Use `--new-scanners` to route certain modules through `scanners/` `ScannerBase` subclasses instead of `modules/scanner.py` inline methods. Currently XSS and Headers have ScannerBase implementations. Each implements a 5-phase lifecycle:
+
+1. **init** — receives config, recon data, container
+2. **prepare** — load payloads, init state
+3. **scan** — run detection logic
+4. **finalize** — post-scan cleanup
+5. **findings** — return discovered findings list
+
+`VulnScanner` detects `self._use_new_scanners` and dispatches to lazy-loaded scanner instances. Findings from the ScannerBase path go through the same `_add()` / dedup pipeline as legacy findings.
 
 ### 2c. Intelligence-led per-URL module selection
 
@@ -106,21 +140,30 @@ HTML reports use `html.escape()` on every user-provided field at render time. Co
 
 | File | Responsibility | Key classes/functions |
 |---|---|---|
-| `main.py` | CLI parsing, orchestration, module_map, TARGET_LEVEL, autosave, `--dry-run`, `--resume` | `parse_args()`, `run()`, `main()` |
-| `modules/scanner.py` | All scan methods, `VulnScanner` class, chain analysis, `_add()` | `VulnScanner` (23 scan methods), `chain_analysis()` |
+| `main.py` | CLI parsing, orchestration, module_map, TARGET_LEVEL, autosave, `--dry-run`, `--resume`, `--new-scanners` | `parse_args()`, `run()`, `main()` |
+| `modules/scanner.py` | All scan methods, `VulnScanner` class, chain analysis, `_add()`, feature-flag dispatchers | `VulnScanner` (scan methods), `chain_analysis()` |
 | `modules/utils.py` | Shared utilities, finding engine, dedup, OOB, BrowserValidator, curl builder, classify, safe HTTP | `finding()`, `_build_curl()`, `BrowserValidator`, `OOBDetectionFramework`, `RateLimiter`, `DeduplicationEngine`, `SecretValidator`, `safe_get()`, `safe_post()` |
-| `modules/reporter.py` | Legacy wrapper — delegates to `reporting/` package | `Reporter` class |
+| `modules/reporter.py` | Legacy wrapper — delegates to `reporting/` package, passes container via `**kwargs` | `Reporter` class |
 | `reporting/__init__.py` | Reporter package exports | Package init |
-| `reporting/base.py` | Shared reporter utilities, impact analysis, root-cause grouping | `ReporterBase`, `assess_finding_impact()`, `group_by_root_cause()` |
-| `reporting/html.py` | HTML report generation | `HTMLReporter(ReporterBase)` |
+| `reporting/base.py` | Shared reporter utilities, impact analysis, root-cause grouping, evidence enrichment | `ReporterBase`, `assess_finding_impact()`, `group_by_root_cause()`, `_enrich_finding_evidence()` |
+| `reporting/html.py` | HTML report generation with type-specific evidence rendering | `HTMLReporter(ReporterBase)`, `_get_evidence_html()` |
 | `reporting/json_report.py` | JSON report generation | `JSONReporter(ReporterBase)` |
 | `reporting/txt.py` | Plain-text report generation | `TXTReporter(ReporterBase)` |
 | `reporting/markdown.py` | Per-finding Markdown files | `MarkdownReporter(ReporterBase)` |
-| `reporting/hackerone.py` | HackerOne submission format | `HackerOneReporter(ReporterBase)` |
-| `reporting/bugcrowd.py` | Bugcrowd submission format | `BugcrowdReporter(ReporterBase)` |
+| `reporting/hackerone.py` | HackerOne submission format with type-specific evidence | `HackerOneReporter(ReporterBase)`, `_vuln_section()` |
+| `reporting/bugcrowd.py` | Bugcrowd submission format with type-specific evidence | `BugcrowdReporter(ReporterBase)` |
 | `modules/api_scanner.py` | API-specific vulnerability scanning | `ApiScanner(VulnScanner)` with role-based sessions, GraphQL auth bypass, query depth |
-| `modules/idor.py` | Parameter-based IDOR detection | `IdorScanner(VulnScanner)` with ownership validation (`verify_ownership()`), role sessions |
+| `modules/idor.py` | Parameter-based IDOR detection with AuthorizationComparisonEvidence | `IdorScanner(VulnScanner)` with ownership validation (`verify_ownership()`), role sessions |
 | `modules/recon.py` | Crawling, subdomain discovery, JS analysis | Recon class |
+| `scanners/base.py` | ScannerBase 5-phase lifecycle | `ScannerBase` (init → prepare → scan → finalize → findings) |
+| `scanners/xss.py` | XSS detection via ScannerBase | `XSSScanner(ScannerBase)`: reflected, stored, DOM, form |
+| `scanners/headers.py` | Security header audit via ScannerBase | `HeadersScanner(ScannerBase)` |
+| `scanners/sqli.py` | SQLi detection via ScannerBase | `SQLiScanner(ScannerBase)`: error, boolean, time, OOB |
+| `scanners/ssrf.py` | SSRF detection via ScannerBase | `SSRFScanner(ScannerBase)`: cloud metadata + OOB |
+| `models/config.py` | ScanConfig dataclass | `ScanConfig` with `use_new_scanners: bool = False` |
+| `models/finding.py` | Finding class with dict-compat shim | `Finding` with strict `__getitem__`, content-fingerprinted `to_dict()` |
+| `models/evidence.py` | Evidence type hierarchy (10 subclasses) | `EvidenceBase`, `HttpRequestEvidence`, `BrowserExecutionEvidence`, `ScreenshotEvidence`, `TimingEvidence`, `OOBCallbackEvidence`, `AuthorizationComparisonEvidence`, `GraphQLSchemaEvidence`, `CommandExecutionEvidence`, `ResponseDiffEvidence`, `CompositeEvidence` |
+| `engines/evidence_engine.py` | Evidence storage with SHA-256 content-based dedup | `EvidenceEngine`, `store()`, `get_evidence()` |
 
 ---
 
@@ -201,10 +244,55 @@ log("message", Colors.RED, verbose_only=True, verbose=self.verbose)
 
 ---
 
-## 7. Important Gotchas
+## 7. UI/UX Features
+
+### 7a. `--auto` flag
+
+Single-command convenience flag. Overrides:
+- `rps=3` (was 5)
+- `threads=5` (was 10)
+- `autosave_interval=60` (was 0)
+- `format=chatgpt` (was html)
+
+Applied in `main()` after config-file merge but before `build_config()`. Explicit user flags (e.g., `--rps 10`) are overridden — use without `--auto` if you need specific values.
+
+```bash
+python3 main.py --target https://example.com --auto
+```
+
+### 7b. Rich progress bar (`ScanProgress`)
+
+`ScanProgress` in `modules/utils.py` wraps Rich `Progress` with `TimeRemainingColumn` and findings counter. Used in `_run_scans()` via context manager:
+
+```python
+with ScanProgress(total_urls, config, "Scanning URLs") as prog:
+    for url in urls:
+        prog.advance(url, findings_count)
+```
+
+Falls back to no-op when Rich is unavailable or `--no-rich` is set.
+
+### 7c. `--format chatgpt` (ChatGPTReporter)
+
+Single-file markdown report optimized for ChatGPT ingestion. Located in `reporting/chatgpt.py`. Features:
+- YAML frontmatter with structured summary
+- Consistent per-finding sections with `## N. Title` headers
+- Collon-delimited key-value fields for easy LLM parsing
+- Raw JSON data block at end for structured ingestion
+- All findings in one file — single copy-paste into ChatGPT
+
+Auto-selected when `--auto` is used.
+
+### 7d. JSON-LD in HTML reports
+
+Every HTML report includes a `<script type="application/ld+json">` block with all findings data. This structured data enables LLMs (ChatGPT, Claude) to parse findings without text extraction. Fields: target URL, timestamp, severity counts, verification breakdown, and per-finding details (title, vuln_type, severity, url, parameter, verification_stage, confidence_score, false_positive_risk, cvss_score).
+
+---
+
+## 8. Important Gotchas
 
 | Gotcha | Detail |
-|---|---|
+|---|---|---|
 | BrowserValidator constructor | Takes `config: Dict[str, Any]` (not just timeout). Uses `_ensure_browser()` lazily. |
 | Dedup key | `(vuln_type, url, parameter or "")` — findings without parameter dedup by `(url, type)` |
 | POST form XSS | Browser validation passes `r.text` via `set_content()`, not `goto()` |
@@ -220,10 +308,23 @@ log("message", Colors.RED, verbose_only=True, verbose=self.verbose)
 | OOBDetectionFramework init | Requires `config: Dict[str, Any]` with optional `oob_host` key |
 | Classify function signatures | `classify_endpoint(url, forms, recon_data)` and `compute_endpoint_score(url, forms, recon_data)` — both need lists/dicts for second/third args |
 | DeduplicationEngine.add_legacy() | Returns dict on first add (truthy), None on duplicate (falsy) |
+| BrowserValidator constructor | Takes `config: Dict[str, Any]` (not just timeout). Uses `_ensure_browser()` lazily. |
+| EvidenceEngine store() | Uses SHA-256 of `evidence.to_dict()` minus timestamp/id. Returns fingerprint (str) on store. |
+| EvidenceEngine link_to_finding / get_evidence | Evidence is linked by **fingerprint** (not Finding.id UUID). When adding typed evidence to a finding, always call `link_to_finding(evidence, finding_fingerprint)`. Reporters look up by fingerprint first, then fall back to Finding.id. See `ReporterBase._enrich_finding_evidence()`. |
+| Finding.__getitem__ | Returns actual evidence list for `f["evidence"]` (not a string). Legacy code expecting a string should use `f.evidence` attribute or convert. `get()` returns default only when value is `None` or `""` (not for empty lists). |
+| Reporter evidence access | Reporters prefer `getattr(f, 'evidence', None)` for Finding instances (returns the list). Falls back to `f.get("evidence", "")` for plain dicts. Finding.__getitem__ returns the raw list for "evidence" key. |
+| Adding typed evidence to dict findings | The `finding()` function sets `evidence` as a string. To add typed evidence, CONVERT the string to a list first: `f["evidence"] = [f.get("evidence", "")] + [typed_ev]`. Never use `f.setdefault("evidence", []).append(ev)` — this crashes because the key already exists as a string. |
+| ScannerBase dispatchers | Lazy-loaded in `VulnScanner` via `discover_scanner_classes()`. Created only when `self._use_new_scanners` is True. All receive `container=self._container`. |
+| Reporter evidence enrichment | `ReporterBase._enrich_finding_evidence()` merges linked evidence from `evidence_engine.get_evidence(f.fingerprint)` (then falls back to `f.id`). |
+| container passthrough | Reporter constructors receive `container=` from `modules/reporter.py` via `**kwargs`. Must be passed explicitly to ScannerBase subclasses. |
+| `ScanProgress` fallback | Falls back to no-op when Rich is unavailable. Always instantiate via `with ScanProgress(...) as prog:` — never check `RICH_AVAILABLE` manually. |
+| `--auto` overrides explicit flags | Applied in `main()` after config merge. If the user passes `--rps 10` alongside `--auto`, `--auto` wins and sets `rps=3`. Remove `--auto` if fine-grained control is needed. |
+| `chatgpt` format returns file path | Unlike `markdown-report` (returns directory), `ChatGPTReporter.render()` returns a single file path. The `generate()` method uses the `.md` extension. |
+| JSON-LD in HTML | The JSON-LD block is placed in `<head>` and is always generated. Fields mirror what's in the finding dicts — if a key is missing, it'll be `null` or `""` in the JSON-LD output. |
 
 ---
 
-## 8. Git Workflow
+## 9. Git Workflow
 
 - Branch: `main`
 - Commits use conventional commits: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`

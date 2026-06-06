@@ -28,6 +28,7 @@ from modules.utils import (
     TechnologyFingerprinter, reset_seen_findings, _build_curl,
 )
 from engines import ValidationEngine, EvidenceEngine
+from models.evidence import GraphQLSchemaEvidence, EvidenceStatus
 
 # ── Payloads ──────────────────────────────────────────────────────────────────
 
@@ -476,8 +477,17 @@ class VulnScanner:
 
         # Phase 3: new scanner delegates (scanners/ package)
         self._use_new_scanners = config.get("use_new_scanners", False)
-        self._xss_scanner   = None
-        self._headers_scanner = None
+        self._container = container
+
+        # Phase 4: auto-discovered scanner instances
+        self._scanner_instances: dict[str, Any] = {}
+        if self._use_new_scanners:
+            try:
+                from scanners import discover_scanner_classes
+                for name, cls in discover_scanner_classes().items():
+                    self._scanner_instances[name] = cls(self.config, self.recon, container=self._container)
+            except Exception:
+                pass
 
         self.waf_detected = False
         self.baselines    = BaselineFingerprinter(self.session, self.timeout)
@@ -502,6 +512,25 @@ class VulnScanner:
     def _get_findings(self) -> list[dict]:
         raw = self.dedup.get_findings()
         return prioritize_findings(raw)
+
+    # ── ScannerBase Dispatcher (Phase 4) ──────────────────────────────
+
+    def _dispatch_to_scanner(self, name: str, target_urls: list[str] | None = None) -> list[dict] | None:
+        """Dispatch to a ScannerBase subclass if available.
+
+        Returns findings list if the scanner was found and ran,
+        or None to signal that the caller should fall back to legacy logic.
+        """
+        if not self._use_new_scanners:
+            return None
+        inst = self._scanner_instances.get(name)
+        if inst is None:
+            return None
+        inst.session = self.session
+        results = inst.scan(target_urls)
+        for f in results:
+            self._add(f)
+        return self._get_findings()
 
     # ── Re-verification Loop ──────────────────────────────────────────
 
@@ -546,6 +575,27 @@ class VulnScanner:
                         f["verification_stage"] = VerificationStage.VERIFIED.value
                         log(f"  [Re-verify] XSS at {url} promoted to EXPLOITABLE via Playwright re-check", Colors.GREEN, verbose_only=True, verbose=self.verbose)
                         break
+
+    # ── OOB Promotion ─────────────────────────────────────────────────
+
+    def _promote_finding_by_oob(self, payload: str) -> bool:
+        """Promote a finding to VERIFIED when an OOB callback matches its payload."""
+        for f in self.dedup.get_findings():
+            evidence = f.get("evidence", "")
+            steps = str(f.get("validation_steps", []))
+            payload_in = payload in evidence or payload in steps
+            if not payload_in:
+                for val in f.values():
+                    if isinstance(val, str) and payload in val:
+                        payload_in = True
+                        break
+            if payload_in:
+                f["verification_stage"] = VerificationStage.VERIFIED.value
+                f["confidence_score"] = 100
+                log(f"  [OOB] {f.get('vuln_type', '')} @ {f.get('url', '')} promoted to VERIFIED",
+                    Colors.GREEN)
+                return True
+        return False
 
     # ── Chain Analysis ────────────────────────────────────────────────
 
@@ -1086,6 +1136,9 @@ class VulnScanner:
         Args:
             target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
         """
+        if result := self._dispatch_to_scanner("sqli", target_urls):
+            return result
+
         self._prepare_scan()
         payloads = self._load_payloads("sqli")
         oob_host = self.config.get("oob_host")
@@ -1440,6 +1493,9 @@ class VulnScanner:
         Args:
             target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
         """
+        if result := self._dispatch_to_scanner("ssrf", target_urls):
+            return result
+
         oob_host = self.config.get("oob_host")
         findings: list[dict] = []
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
@@ -1883,16 +1939,10 @@ class VulnScanner:
         self._prepare_scan()
 
         # Phase 3: delegate to XSSScanner when enabled
-        if self._use_new_scanners:
-            from scanners import XSSScanner
-            if self._xss_scanner is None:
-                self._xss_scanner = XSSScanner(self.config, self.recon)
-                self._xss_scanner.session = self.session
-            results = self._xss_scanner.scan(target_urls)
-            for f in results:
-                self._add(f)
-            return self._get_findings()
+        if result := self._dispatch_to_scanner("xss", target_urls):
+            return result
 
+        self._prepare_scan()
         payloads = self._load_payloads("xss")
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
 
@@ -2617,16 +2667,8 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_headers(self) -> list[dict]:
-        # Phase 3: delegate to HeadersScanner when enabled
-        if self._use_new_scanners:
-            from scanners import HeadersScanner
-            if self._headers_scanner is None:
-                self._headers_scanner = HeadersScanner(self.config, self.recon)
-                self._headers_scanner.session = self.session
-            results = self._headers_scanner.scan()
-            for f in results:
-                self._add(f)
-            return self._get_findings()
+        if result := self._dispatch_to_scanner("headers", target_urls):
+            return result
 
         findings: list[dict] = []
         try:
@@ -3268,18 +3310,80 @@ class VulnScanner:
             try:
                 r = self.session.post(url, json=introspection_query, headers=headers, timeout=self.timeout)
                 if r.status_code == 200 and "__schema" in r.text:
+                    query_names: list[str] = []
+                    mutation_names: list[str] = []
+                    schema_preview = ""
+                    try:
+                        data = r.json()
+                        types = data.get("data", {}).get("__schema", {}).get("types", [])
+                        type_names = [t.get("name", "") for t in types if t.get("name") and not t["name"].startswith("__")]
+                        schema_preview = ", ".join(type_names[:30])
+                        # Try deeper introspection for Query/Mutation types
+                        deeper_q = {"query": "{ __schema { queryType { name } mutationType { name } types { name kind fields { name } } } }"}
+                        r2 = self.session.post(url, json=deeper_q, headers=headers, timeout=self.timeout)
+                        if r2.status_code == 200:
+                            d2 = r2.json()
+                            s2 = d2.get("data", {}).get("__schema", {})
+                            for t in s2.get("types", []):
+                                if t.get("kind") == "OBJECT":
+                                    tname = t.get("name", "")
+                                    fields = t.get("fields", [])
+                                    fnames = [f.get("name", "") for f in fields if f.get("name")]
+                                    if tname == "Query" or tname.endswith("Query"):
+                                        query_names.extend(fnames)
+                                    elif tname == "Mutation" or tname.endswith("Mutation"):
+                                        mutation_names.extend(fnames)
+                    except Exception:
+                        pass
+
+                    sev = "high" if mutation_names else "medium"
+                    stage = VerificationStage.VALIDATED.value if query_names or mutation_names else VerificationStage.DETECTED.value
+                    details = f"Full schema is exposed via introspection. Types: {len(type_names)} found."
+                    if mutation_names:
+                        details += f" Mutations ({len(mutation_names)}) present — potential for data modification."
+                    if query_names:
+                        details += f" Queries ({len(query_names)}) exposed."
+
+                    schema_evidence = GraphQLSchemaEvidence(
+                        query_text=str(introspection_query),
+                        schema_preview=schema_preview or r.text[:500],
+                        mutation_count=len(mutation_names),
+                        query_count=len(query_names),
+                        description=f"GraphQL introspection enabled at {url}",
+                        status=EvidenceStatus.VERIFIED,
+                    )
+
                     f = finding(
                         vuln_type="GraphQL Introspection Enabled",
                         url=url,
-                        severity="medium",
-                        details="Full schema is exposed via introspection.",
+                        severity=sev,
+                        details=details,
                         evidence="__schema",
                         request=_build_curl("POST", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=r.text[:500],
-                        steps_to_reproduce=[f"Send POST request to {url} with introspection query", "Observe __schema in response"],
-                        verification_stage=VerificationStage.VALIDATED.value,
+                        steps_to_reproduce=[
+                            f"Send POST request to {url} with introspection query",
+                            "Observe __schema in response confirming introspection is enabled",
+                        ],
+                        verification_stage=stage,
                         validation_steps=["GraphQL introspection response received"],
                     )
+                    if f:
+                        # Promote to HIGH with business impact text when mutations exist
+                        if mutation_names:
+                            f["severity"] = "high"
+                            if "business_impact" not in f:
+                                f["business_impact"] = (
+                                    "Introspection + writable mutations exposed — attacker can enumerate "
+                                    "the full API schema and probe mutation endpoints for authorization flaws"
+                                )
+                        # Convert string evidence to list and append typed evidence
+                        legacy_ev = f.get("evidence", "")
+                        f["evidence"] = [legacy_ev] if legacy_ev else []
+                        f["evidence"].append(schema_evidence)
+                        if self._container and self._container.evidence_engine:
+                            fp = self._container.evidence_engine.store(schema_evidence)
+                            self._container.evidence_engine.link_to_finding(schema_evidence, f.get("fingerprint", ""))
                     if f and self._add(f):
                         findings.append(f)
             except Exception:
@@ -3376,58 +3480,8 @@ class VulnScanner:
 
         return findings
 
-    # ═════════════════════════════════════════════════════════════════════
-    # IDOR (legacy, kept for backward compat in scanner.py)
-    # ═════════════════════════════════════════════════════════════════════
-
-    def scan_idor(self, target_urls: list[str] | None = None) -> list[dict]:
-        findings: list[dict] = []
-        id_patterns = [
-            (re.compile(r"[?&](account|accountId|account_id|user|userId|user_id|org|orgId|org_id|id|guid|uuid|ref)=([0-9a-f\-]{4,36})", re.IGNORECASE), "param"),
-            (re.compile(r"/(accounts|users|orgs|organisations|entities)/([0-9a-f\-]{4,36})", re.IGNORECASE), "path"),
-        ]
-        candidates = []
-        urls = self.recon.get("urls", []) if target_urls is None else target_urls
-
-        for url in urls:
-            for pattern, ref_type in id_patterns:
-                for m in pattern.finditer(url):
-                    candidates.append({"url": url, "param": m.group(1), "value": m.group(2), "type": ref_type})
-
-        seen = set()
-        for c in candidates:
-            key = (c["param"], c["value"])
-            if key in seen:
-                continue
-            seen.add(key)
-            original_val = c["value"]
-            original_url = c["url"]
-            baseline = safe_get(self.session, original_url, self.timeout, raise_for_status=False)
-            if not baseline:
-                continue
-
-            if original_val.isdigit():
-                for delta in [-1, 1, -100, 100]:
-                    test_val = str(int(original_val) + delta)
-                    test_url = original_url.replace(original_val, test_val, 1)
-                    r = safe_get(self.session, test_url, self.timeout, raise_for_status=False)
-                    if r and r.status_code == 200 and len(r.text) > 500 and abs(len(r.text) - len(baseline.text)) < 5000 and r.text != baseline.text:
-                        f = finding(
-                            vuln_type="Potential IDOR",
-                            url=test_url,
-                            severity="critical",
-                            details=f"Parameter '{c['param']}' changed from {original_val} to {test_val} and returned non-identical content.",
-                            evidence=r.text[:120],
-                            request=_build_curl("GET", test_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
-                            response_excerpt=r.text[:500],
-                            parameter=c['param'],
-                            steps_to_reproduce=[f"Send GET request to {test_url}", "Observe accessible data without authorization"],
-                            verification_stage=VerificationStage.DETECTED.value,
-                        )
-                        if f and self._add(f):
-                            findings.append(f)
-
-        return findings
+    # IDOR is handled by IdorScanner in modules/idor.py.
+    # Legacy scan_idor() removed — use --modules idor instead of idor_path.
 
     # ═════════════════════════════════════════════════════════════════════
     # Verify-only mode

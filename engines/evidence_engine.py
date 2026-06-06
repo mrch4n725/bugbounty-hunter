@@ -1,4 +1,5 @@
-import time
+import hashlib
+import json
 import threading
 from typing import Any
 
@@ -22,11 +23,17 @@ class EvidenceEngine:
     def store(self, evidence: EvidenceBase) -> str:
         """Store an evidence object and return its fingerprint.
 
-        Fingerprint is used to deduplicate identical evidence.
+        Fingerprint is a SHA-256 of the evidence's serialized content
+        (minus timestamp), enabling deduplication of identical evidence.
         """
-        fp = evidence.__class__.__name__ + ":" + str(time.time())
+        d = evidence.to_dict()
+        d.pop("timestamp", None)
+        d.pop("id", None)
+        raw = evidence.__class__.__name__ + ":" + json.dumps(d, sort_keys=True, default=str)
+        fp = hashlib.sha256(raw.encode()).hexdigest()
         with self._lock:
-            self._fingerprints[fp] = evidence
+            if fp not in self._fingerprints:
+                self._fingerprints[fp] = evidence
         return fp
 
     def link_to_finding(self, evidence: EvidenceBase, finding_id: str) -> None:

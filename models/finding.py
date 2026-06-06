@@ -159,18 +159,11 @@ class Finding:
         try:
             val = getattr(self, key)
         except AttributeError:
-            # Check for legacy keys stored as dynamic attrs
             if key in self._DICT_LEGACY_KEYS:
                 return ""
-            return ""
+            raise KeyError(key)
         if key == "evidence" and isinstance(val, list):
-            # Legacy: evidence is a string. Return first item's str or empty.
-            if not val:
-                return ""
-            first = val[0]
-            if hasattr(first, "to_dict"):
-                return str(first.to_dict())
-            return str(first)
+            return val
         return val
 
     def __setitem__(self, key: str, value: Any) -> None:
@@ -190,9 +183,7 @@ class Finding:
     def get(self, key: str, default: Any = None) -> Any:
         try:
             val = self[key]
-            if val == "" or val is None:
-                return default
-            if isinstance(val, list) and not val:
+            if val is None or val == "":
                 return default
             return val
         except (AttributeError, KeyError, TypeError):
@@ -298,7 +289,10 @@ class Finding:
             result["remediation"] = self.remediation
         if self.references:
             result["references"] = self.references
-        result["evidence"] = [e.to_dict() if hasattr(e, "to_dict") else str(e) for e in self.evidence]
+        result["evidence"] = [
+            {**e.to_dict(), "evidence_type": e.__class__.__name__} if hasattr(e, "to_dict") else {"raw": str(e), "evidence_type": "raw"}
+            for e in self.evidence
+        ]
         return result
 
     @staticmethod

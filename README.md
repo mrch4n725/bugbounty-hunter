@@ -94,9 +94,12 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python3 main.py --target https://example.com
+
+# One-command scan with sensible defaults
+python3 main.py --target https://example.com --auto
 ```
 
-Reports are written to `reports/` by default (override with `--output`).
+`--auto` sets safe defaults (`rps=3`, `threads=5`, `autosave=60s`) and outputs a ChatGPT-optimized markdown report. Reports are written to `reports/` by default (override with `--output`).
 
 ---
 
@@ -177,6 +180,9 @@ python3 main.py --target https://example.com --threads 20 --rps 10
 
 # Stealth mode (slow, randomized)
 python3 main.py --target https://example.com --stealth
+
+# Use new ScannerBase architecture (opt-in, experimental)
+python3 main.py --target https://example.com --new-scanners
 ```
 
 ### Authenticated Scanning
@@ -287,7 +293,7 @@ module_params:
 | `--modules`, `-m` | `all` | Modules to run (space-separated list) |
 | `--disable-modules` | — | Modules to skip when running `all` |
 | `--output`, `-o` | `reports` | Report output directory |
-| `--format`, `-f` | `html` | Output format: `html`, `json`, `txt`, `markdown-report`, `hackerone`, `bugcrowd` |
+| `--format`, `-f` | `html` | Output format: `html`, `json`, `txt`, `markdown-report`, `hackerone`, `bugcrowd`, `chatgpt` |
 | `--threads` | `10` | Number of concurrent worker threads |
 | `--timeout` | `10` | HTTP request timeout in seconds |
 | `--crawl-depth` | `2` | Recon crawl depth (0 = target only) |
@@ -317,8 +323,10 @@ module_params:
 | `--no-mask-curl` | off | Show sensitive headers (Authorization, Cookie, etc.) in curl commands |
 | `--dry-run` | off | Recon + attack surface summary only; skip all active fuzzing |
 | `--passive` | off | No active fuzzing (headers, recon, and passive checks only) |
+| `--new-scanners` | off | Use new ScannerBase-based scanners (opt-in, experimental). Enables typed evidence, EvidenceEngine, and 5-phase lifecycle for supported modules (XSS, Headers). Currently an opt-in migration target — legacy modules/scanner.py remains the default. |
 | `--role` | — | Current user role name for authorization testing (e.g. `user_a`, `admin`) |
 | `--auth-header` | — | Auth header for a role in format `role_name:Header:Value` (repeatable). E.g. `--auth-header user_b:'Authorization:Bearer tok_b'` |
+| `--auto` | off | Auto mode: sensible defaults for a quick scan (`rps=3`, `threads=5`, `autosave=60s`, `format=chatgpt`). Single-command convenience — just `python main.py --target https://x.com --auto`. |
 | `--verbose`, `-v` | off | Per-request and per-finding diagnostic output |
 
 ---
@@ -411,6 +419,24 @@ python3 -m playwright install chromium
 
 Browser validation is optional — the scanner runs fine without it, reporting XSS as **Detected** instead of **Verified**.
 
+### New Scanner Architecture (--new-scanners)
+
+The optional `--new-scanners` flag enables the `ScannerBase`-based architecture with typed
+evidence, lifecycle phases, and EvidenceEngine integration. Currently supports XSS and
+Headers modules. When enabled:
+
+1. **5-phase lifecycle** — Each scanner implements `detect → validate → collect_evidence → generate_reproduction → calculate_confidence`
+2. **Typed evidence** — `HttpRequestEvidence`, `BrowserExecutionEvidence`, `TimingEvidence`, `OOBCallbackEvidence`, etc. render as structured blocks in reports (HackerOne, Bugcrowd, HTML)
+3. **EvidenceEngine integration** — Evidence is content-fingerprinted (SHA-256), deduplicated, and linked to findings. Reporters automatically enrich findings with linked evidence
+
+Usage:
+
+```bash
+python3 main.py --target https://example.com --new-scanners
+```
+
+> **Note:** This is opt-in while migration is in progress. The legacy `modules/scanner.py` path remains the default until all modules are migrated to `ScannerBase`.
+
 ### Live Secret Validation
 
 Discovered credentials are validated against live APIs before reporting:
@@ -436,6 +462,7 @@ Every report format now computes **CVSS score + vector**, **impact narrative**, 
 | **JSON** | Full structured scan result with CVSS, impact, remediation, and tool metadata for programmatic processing |
 | **TXT** | Plain-text CVSS + impact + remediation per finding, with structured evidence blocks |
 | **Markdown** (`markdown-report`) | Per-finding `.md` files with CVSS vector + score + rating, impact narrative, remediation guidance, structured evidence, and curl reproduction commands |
+| **ChatGPT** (`chatgpt`) | Single-file markdown optimized for LLM ingestion — YAML frontmatter, consistent per-finding sections, colon-delimited fields, raw JSON data block for structured parsing. One copy-paste into ChatGPT. Auto-selected by `--auto`. |
 | **HackerOne** (`hackerone`) | Submission-optimized format: evidence blocks → CVSS vector → component → parameter → verification stage → FP risk → summary → affected URLs → evidence → request → response → impact → remediation → reproduction steps |
 | **Bugcrowd** (`bugcrowd`) | CVSS vector in finding summary table plus per-finding detail with evidence, verification stage, impact, and remediation |
 
@@ -447,8 +474,10 @@ Additional report features:
 
 - **One-click curl copy** — each finding card has a copy button for the curl reproduction command
 - **Screenshot embedding** — Playwright-confirmed XSS findings include the full-page screenshot
+- **JSON-LD structured data** — every HTML report includes `<script type="application/ld+json">` block with all finding data for LLM parsing (ChatGPT, Claude)
 - **Interim autosave** — `--autosave-interval N` saves partial reports every N seconds (`.partial` suffix)
 - **Live findings counter** — a background thread reports `[Live] N findings (M confirmed)` every 30 seconds
+- **Rich progress bar** — live ETA, findings counter, and current URL display during scan (falls back to plain text with `--no-rich`)
 - **Real-time output** — `[FOUND] [severity] title @ url` for each new finding as it's discovered
 - **Keyboard interrupt safe** — Ctrl+C saves all findings collected so far with no data loss
 
@@ -550,6 +579,7 @@ bugbounty-hunter/
 │   ├── json_report.py               # JSONReporter — structured output
 │   ├── txt.py                       # TXTReporter — plain-text summary
 │   ├── markdown.py                  # MarkdownReporter — per-finding .md files
+│   ├── chatgpt.py                   # ChatGPTReporter — single-file LLM-optimized report
 │   ├── hackerone.py                 # HackerOneReporter — submission-ready format
 │   └── bugcrowd.py                  # BugcrowdReporter — summary + per-finding detail
 ├── tests/

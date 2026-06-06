@@ -20,7 +20,7 @@ from modules.api_scanner import ApiScanner
 from modules.idor import IdorScanner
 from modules.reporter import Reporter
 from modules.js_intelligence import JSIntelligence
-from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score, prioritize_findings, reset_seen_findings, _build_curl, set_mask_sensitive_default
+from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score, prioritize_findings, reset_seen_findings, _build_curl, set_mask_sensitive_default, ScanProgress
 from models.finding import Finding
 from app.bootstrap import bootstrap, auto_upgrade_config, print_startup_summary
 
@@ -34,10 +34,10 @@ def parse_args():
     parser.add_argument("--config", "-C", help="Path to YAML configuration file")
     parser.add_argument("--target", "-t", help="Target URL (e.g. https://example.com)")
     parser.add_argument("--modules", "-m", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "idor_path", "js_secrets", "api", "rate_limiting", "openapi", "all"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "all"],
         default=["all"])
     parser.add_argument("--output", "-o", default="reports")
-    parser.add_argument("--format", "-f", choices=["json", "html", "txt", "markdown-report", "hackerone", "bugcrowd"], default="html")
+    parser.add_argument("--format", "-f", choices=["json", "html", "txt", "markdown-report", "hackerone", "bugcrowd", "chatgpt"], default="html")
     parser.add_argument("--threads", type=int, default=10)
     parser.add_argument("--timeout", type=int, default=10)
     parser.add_argument("--cookies", "-c", default=None)
@@ -57,7 +57,7 @@ def parse_args():
         help="Out-of-band callback host for SSRF and SQLi OOB verification (e.g. Burp Collaborator or interactsh URL)")
     parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
     parser.add_argument("--disable-modules", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "idor_path", "js_secrets", "api", "rate_limiting", "openapi"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi"],
         default=[], help="Disable specific modules when scanning all or default modules")
     parser.add_argument("--module-param", action="append", default=[],
         help="Override module settings using module.key=value")
@@ -75,6 +75,8 @@ def parse_args():
         help="Resume a previous scan from .scan_state.json (skips completed URLs)")
     parser.add_argument("--rps", type=float, default=5.0,
         help="Requests per second (default: 5). Halved on 429, restored after 20 OK.")
+    parser.add_argument("--new-scanners", action="store_true",
+        help="Use new ScannerBase-based scanners (opt-in, experimental). Enables EvidenceEngine, structured evidence types, and 5-phase lifecycle.")
     parser.add_argument("--stealth", action="store_true",
         help="Stealth mode: rotate 20 User-Agent strings, random 0.5-2s delay, shuffle POST params.")
     parser.add_argument("--scope",
@@ -89,6 +91,8 @@ def parse_args():
         help="Maximum number of JS files to scan for secrets/endpoints (default: 50)")
     parser.add_argument("--no-mask-curl", action="store_true",
         help="Disable sensitive header masking in curl commands within reports (shows Authorization, Cookie, etc.)")
+    parser.add_argument("--auto", action="store_true",
+        help="Auto mode: sensible defaults for a quick scan (rps=3, threads=5, autosave=60s, format=chatgpt)")
     parser.add_argument("--dry-run", action="store_true",
         help="Run recon and JS intelligence only, then print attack-surface summary and exit. Skips all active fuzzing.")
     parser.add_argument("--role", default=None,
@@ -146,12 +150,14 @@ def _apply_scalar_config(cli_args, config_file: dict) -> None:
         'max_js_files': 'max_js_files',
         'role': 'role',
         'auth_header': 'auth_header',
+        'new_scanners': 'new_scanners',
+        'auto': 'auto',
     }
     arg_defaults = {
         'threads': 10, 'timeout': 10, 'retries': 3,
         'crawl_depth': 2, 'autosave_interval': 0, 'rps': 5.0,
     }
-    BOOL_FLAGS = {'verbose', 'passive', 'headless', 'stealth', 'resume', 'verify_only'}
+    BOOL_FLAGS = {'verbose', 'passive', 'headless', 'stealth', 'resume', 'verify_only', 'new_scanners'}
     for yaml_key, arg_key in yaml_to_arg.items():
         if yaml_key not in config_file:
             continue
@@ -252,6 +258,7 @@ def build_config(args):
 
     return {
         "target": args.target.rstrip("/"),
+        "auto": getattr(args, "auto", False),
         "modules": args.modules,
         "disable_modules": args.disable_modules,
         "output_dir": args.output,
@@ -277,6 +284,7 @@ def build_config(args):
         "headless": getattr(args, "headless", False),
         "verify_only": getattr(args, "verify_only", None),
         "resume": getattr(args, "resume", False),
+        "use_new_scanners": getattr(args, "new_scanners", False),
         "dry_run": getattr(args, "dry_run", False),
         "no_mask_curl": getattr(args, "no_mask_curl", False),
         "rps": args.rps,
@@ -307,6 +315,8 @@ def _log_startup(config: dict) -> None:
         mode_parts.append('Headless')
     if config.get('stealth'):
         mode_parts.append('Stealth')
+    if config.get('auto'):
+        mode_parts.append('Auto')
     log(f"Mode        : {' + '.join(mode_parts)}", Colors.CYAN)
     if config.get('scope'):
         log(f"Scope       : {config['scope']}", Colors.CYAN)
@@ -390,7 +400,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     # ── TARGET_LEVEL: modules that run once per target, not per URL ──
     TARGET_LEVEL: set[str] = {
         "headers", "dirb", "exposed_files", "clickjacking",
-        "subdomain_takeover", "graphql", "blind_xss", "api", "openapi", "idor_path",
+        "subdomain_takeover", "graphql", "blind_xss", "api", "openapi",
     }
 
     if config["passive"]:
@@ -402,6 +412,17 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
 
     scanner = VulnScanner(config, recon_data, container=container)
     all_findings_local: list[dict] = []
+
+    # ── OOB Background Poller (Phase 3) ───────────────────────────────
+    oob_poller = None
+    if scanner.oob and scanner.oob.oob_host:
+        from engines.oob_poller import OOBBackgroundPoller
+        oob_poller = OOBBackgroundPoller(
+            scanner.oob,
+            scanner._promote_finding_by_oob,
+        )
+        oob_poller.start()
+        log(f"[*] OOB background poller started (interval={oob_poller.interval}s)", Colors.CYAN)
 
     # ── Step 1: Build module map (same keys as original _active_module_map) ──
     module_map: dict[str, Any] = {
@@ -428,7 +449,6 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     module_map["api"] = _api_scanner.run_all
     _idor_scanner = IdorScanner(scanner.config, scanner.recon, container=container)
     module_map["idor"] = _idor_scanner.run_all
-    module_map["idor_path"] = scanner.scan_idor
 
     # ── Step 2: Run TARGET_LEVEL modules first ───────────────────────────
     target_modules = {k: v for k, v in module_map.items() if k in TARGET_LEVEL}
@@ -468,49 +488,57 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         except (FileNotFoundError, json.JSONDecodeError):
             log("[*] No scan state found, starting fresh", Colors.CYAN)
 
-    for idx, url in enumerate(sorted_urls):
-        if url in completed_urls:
-            continue
-        if idx % 10 == 0:
-            log(f"[*] Progress: {idx}/{len(sorted_urls)} URLs processed", Colors.CYAN)
+    with ScanProgress(len(sorted_urls), config, "Scanning URLs") as prog:
+        for idx, url in enumerate(sorted_urls):
+            if url in completed_urls:
+                prog.advance()
+                continue
 
-        applicable = classify_endpoint(url, forms, recon_data)
-        # Respect --modules filter
-        if not run_all:
-            applicable &= set(config["modules"])
-        # Remove disabled modules
-        applicable -= disabled_modules
-        # Keep only modules available in the per-URL map
-        applicable &= per_url_modules.keys()
+            applicable = classify_endpoint(url, forms, recon_data)
+            # Respect --modules filter
+            if not run_all:
+                applicable &= set(config["modules"])
+            # Remove disabled modules
+            applicable -= disabled_modules
+            # Keep only modules available in the per-URL map
+            applicable &= per_url_modules.keys()
 
-        if not applicable:
+            if not applicable:
+                completed_urls.add(url)
+                prog.advance(url, len(all_findings_local))
+                continue
+
+            if config.get("verbose", False):
+                log(f"[*] {url} → {len(applicable)} modules selected: {sorted(applicable)}", Colors.YELLOW)
+
+            for mod_name in applicable:
+                try:
+                    mod_fn = per_url_modules[mod_name]
+                    mod_fn(target_urls=[url])  # findings written via self._add() to scanner.dedup
+                except Exception as e:
+                    log(f"  [!] {mod_name} error on {url}: {e}", Colors.RED, verbose_only=True, verbose=config.get("verbose", False))
+
             completed_urls.add(url)
-            continue
-
-        if config.get("verbose", False):
-            log(f"[*] {url} → {len(applicable)} modules selected: {sorted(applicable)}", Colors.YELLOW)
-
-        for mod_name in applicable:
+            # Persist scan state after each URL
             try:
-                mod_fn = per_url_modules[mod_name]
-                mod_fn(target_urls=[url])  # findings written via self._add() to scanner.dedup
-            except Exception as e:
-                log(f"  [!] {mod_name} error on {url}: {e}", Colors.RED, verbose_only=True, verbose=config.get("verbose", False))
+                os.makedirs(os.path.dirname(resume_file), exist_ok=True)
+                with open(resume_file, "w") as f:
+                    json.dump({"completed_urls": list(completed_urls), "target": config.get("target")}, f)
+            except Exception:
+                pass
 
-        completed_urls.add(url)
-        # Persist scan state after each URL
-        try:
-            os.makedirs(os.path.dirname(resume_file), exist_ok=True)
-            with open(resume_file, "w") as f:
-                json.dump({"completed_urls": list(completed_urls), "target": config.get("target")}, f)
-        except Exception:
-            pass
+            prog.advance(url, len(all_findings_local))
 
     # ── Step 5: Post-scan triage pipeline ───────────────────────────────
     log("[*] Running re-verification loop...", Colors.CYAN)
     scanner._run_reverification_loop()
 
     updated = scanner._get_findings()
+
+    log("[*] Running verification engine...", Colors.CYAN)
+    from engines.verification_engine import VerificationEngine
+    v_engine = VerificationEngine(config, container=container, capabilities=capabilities)
+    updated = v_engine.verify_all(updated)
 
     log("[*] Running chain analysis...", Colors.CYAN)
     updated = VulnScanner.chain_analysis(updated)
@@ -541,6 +569,10 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     with lock:
         all_findings.clear()
         all_findings.extend(updated)
+
+    if oob_poller:
+        oob_poller.stop()
+        log("[*] OOB background poller stopped", Colors.CYAN)
 
 
 def _findings_to_finding(config, all_findings, recon_data, js_data):
@@ -598,6 +630,14 @@ def main():
     if args.config:
         log(f"Loading configuration from {args.config}", Colors.CYAN)
         args = merge_configs(args, load_config_file(args.config))
+    if getattr(args, 'auto', False):
+        log("[*] Auto mode: applying sensible defaults (rps=3, threads=5, autosave=60s)", Colors.CYAN)
+        args.rps = 3.0
+        args.threads = 5
+        args.autosave_interval = 60
+        if args.format == "html":
+            args.format = "chatgpt"
+
     if not args.target:
         log("[!] Error: --target is required (or specify via --config file)", Colors.RED)
         sys.exit(1)

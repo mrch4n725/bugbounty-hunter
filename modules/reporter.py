@@ -13,6 +13,7 @@ from reporting import (
     ReporterBase, assess_finding_impact,
     HTMLReporter, JSONReporter, TXTReporter,
     MarkdownReporter, HackerOneReporter, BugcrowdReporter,
+    ChatGPTReporter,
     CVSS_BY_SEVERITY, CVSS_VECTORS, IMPACT_MATRIX,
     group_by_root_cause,
 )
@@ -51,18 +52,21 @@ class Reporter:
 
     def _resolve_format(self) -> ReporterBase:
         """Return the format-specific reporter instance."""
+        kwargs = dict(container=self.container)
         if self.report_format == 'html':
-            return HTMLReporter(self.config, self.findings, self.recon_data, self.js_data)
+            return HTMLReporter(self.config, self.findings, self.recon_data, self.js_data, **kwargs)
         elif self.report_format == 'json':
-            return JSONReporter(self.config, self.findings, self.recon_data, self.js_data)
+            return JSONReporter(self.config, self.findings, self.recon_data, self.js_data, **kwargs)
         elif self.report_format == 'txt':
-            return TXTReporter(self.config, self.findings, self.recon_data, self.js_data)
+            return TXTReporter(self.config, self.findings, self.recon_data, self.js_data, **kwargs)
         elif self.report_format == 'markdown-report':
-            return MarkdownReporter(self.config, self.findings, self.recon_data, self.js_data)
+            return MarkdownReporter(self.config, self.findings, self.recon_data, self.js_data, **kwargs)
         elif self.report_format == 'hackerone':
-            return HackerOneReporter(self.config, self.findings, self.recon_data, self.js_data)
+            return HackerOneReporter(self.config, self.findings, self.recon_data, self.js_data, **kwargs)
         elif self.report_format == 'bugcrowd':
-            return BugcrowdReporter(self.config, self.findings, self.recon_data, self.js_data)
+            return BugcrowdReporter(self.config, self.findings, self.recon_data, self.js_data, **kwargs)
+        elif self.report_format == 'chatgpt':
+            return ChatGPTReporter(self.config, self.findings, self.recon_data, self.js_data, **kwargs)
         else:
             raise ValueError(f"Unsupported report format: {self.report_format}")
 
@@ -88,7 +92,7 @@ class Reporter:
             report_content = reporter.render()
             file_extension = {
                 'html': 'html', 'json': 'json', 'txt': 'txt',
-                'hackerone': 'md', 'bugcrowd': 'md',
+                'hackerone': 'md', 'bugcrowd': 'md', 'chatgpt': 'md',
             }.get(self.report_format)
 
             if self.report_format == 'markdown-report':

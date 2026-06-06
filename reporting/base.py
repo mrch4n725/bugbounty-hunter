@@ -266,8 +266,11 @@ class ReporterBase:
     def __init__(self, config: Dict[str, Any],
                  findings: Union[List[Dict[str, Any]], List[Finding]],
                  recon_data: Dict[str, Any],
-                 js_data: Optional[Dict[str, Any]] = None):
+                 js_data: Optional[Dict[str, Any]] = None,
+                 container=None):
         self.config = config
+        self.container = container
+        self.evidence_engine = container.evidence_engine if container else None
         # Normalize all findings to Finding instances
         normalized: list[Finding] = []
         for f in findings:
@@ -277,14 +280,40 @@ class ReporterBase:
                 normalized.append(Finding.from_dict(f))
             else:
                 normalized.append(Finding.from_dict({"type": "unknown", "url": str(f)}))
+        # Enrich with evidence-engine linked evidence
+        enriched = self._enrich_finding_evidence(normalized)
         # Apply impact assessment (mutates finding in-place for dict-compat fields)
-        self.findings: list[Finding] = [assess_finding_impact(f) for f in normalized]
+        self.findings: list[Finding] = [assess_finding_impact(f) for f in enriched]
         self.recon_data = recon_data or {}
         self.js_data = js_data or {}
         self.target = config.get('target', 'target')
         self.timestamp = config.get('timestamp', datetime.now().strftime('%Y%m%d_%H%M%S'))
         self.output_dir = config.get('output_dir', './reports')
         self.report_format = config.get('report_format', 'html').lower()
+
+    def _enrich_finding_evidence(self, findings: list[Finding]) -> list[Finding]:
+        """Enrich each finding with evidence linked via EvidenceEngine.
+
+        Looks up evidence by fingerprint first (what scanners use to link),
+        then falls back to Finding.id.
+        """
+        if not self.evidence_engine:
+            return findings
+        for f in findings:
+            # Try fingerprint first (scanners link evidence by fingerprint),
+            # then by Finding.id (uuid7)
+            linked = (
+                self.evidence_engine.get_evidence(f.fingerprint)
+                or self.evidence_engine.get_evidence(f.id)
+            )
+            if linked:
+                if isinstance(f.evidence, str):
+                    f.evidence = [f.evidence] if f.evidence else []
+                existing_ids = {id(e) for e in f.evidence}
+                for ev in linked:
+                    if id(ev) not in existing_ids:
+                        f.evidence.append(ev)
+        return findings
 
     def _sanitize_target(self) -> str:
         safe = self.target.replace('https://', '').replace('http://', '').replace('/', '_')

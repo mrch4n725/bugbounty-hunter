@@ -17,6 +17,7 @@ class ScanConfig:
     stealth: bool = False
     no_rich: bool = False
     no_mask_curl: bool = False
+    use_new_scanners: bool = False
 
     cookies: str = ""
     cookies_alt: str = ""

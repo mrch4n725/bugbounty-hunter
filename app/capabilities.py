@@ -225,7 +225,64 @@ class CapabilityRegistry:
         host = self.config.get("oob_host", "") or ""
         if host:
             return True, host
+        available = self._detect_oob_services()
+        if available:
+            host = available[0]
+            self._oob_auto_host = host
+            self.config["oob_host"] = host
+            return True, f"auto:{host}"
         return False, "configure --oob-host"
+
+    def _detect_oob_services(self) -> list[str]:
+        """Try to auto-detect available OOB callback services."""
+        available = []
+        for service, check_fn in [
+            ("interactsh", self._check_interactsh),
+            ("dnslog", self._check_dnslog),
+        ]:
+            try:
+                result = check_fn()
+                if result:
+                    available.append(result)
+            except Exception:
+                continue
+        return available
+
+    @staticmethod
+    def _check_interactsh() -> str | None:
+        """Check if interactsh is reachable. Returns oob host domain if so."""
+        import urllib.request
+        import json
+        try:
+            req = urllib.request.Request("https://oast.fun", method="HEAD")
+            resp = urllib.request.urlopen(req, timeout=5)
+            if resp.status < 400:
+                return "oast.fun"
+        except Exception:
+            pass
+        try:
+            req = urllib.request.Request("https://oast.pro", method="HEAD")
+            resp = urllib.request.urlopen(req, timeout=5)
+            if resp.status < 400:
+                return "oast.pro"
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _check_dnslog() -> str | None:
+        """Check if dnslog.cn is reachable. Returns oob host domain if so."""
+        import urllib.request
+        try:
+            req = urllib.request.Request("http://dnslog.cn/getdomain.php", method="GET")
+            resp = urllib.request.urlopen(req, timeout=5)
+            if resp.status == 200:
+                domain = resp.read().decode().strip()
+                if domain:
+                    return domain
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def _detect_screenshots() -> tuple[bool, str]:
