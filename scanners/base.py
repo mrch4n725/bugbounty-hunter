@@ -242,7 +242,9 @@ class ScannerBase:
             sev = f.get("severity", "info").upper()
             title = f.get("title", "Finding")[:60]
             url = f.get("url", "")[:60]
-            log(f"  [FOUND] [{sev}] {title} @ {url}",
+            stage = f.get("verification_stage", "detected").title()
+            score = f.get("confidence_score", 0)
+            log(f"  [FOUND] [{sev}] {title} @ {url} [{stage}, {score:.0f}/100]",
                 Colors.RED if sev in ("CRITICAL", "HIGH") else Colors.YELLOW)
             return True
 

@@ -16,6 +16,7 @@ import time
 from typing import Any, Optional
 from urllib.parse import urlparse, parse_qs
 
+from models.evidence import TimingEvidence
 from modules.utils import (
     finding, log, Colors, _build_curl, safe_get, safe_post,
     VerificationStage,
@@ -115,12 +116,18 @@ class SQLiScanner(ScannerBase):
                 query = parse_qs(parsed.query, keep_blank_values=True)
                 for param, values in query.items():
                     original_value = values[0] if values else "1"
-                    signals, trigger_resp = self._test_parameter(url, param, original_value, payloads, oob_host)
+                    signals, trigger_resp, timing_ev = self._test_parameter(url, param, original_value, payloads, oob_host)
                     if any(signals.values()):
                         f = self._build_finding(url, param, signals,
                             request_str=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                             response_excerpt_str=trigger_resp or "")
                         if f:
+                            if timing_ev and self.evidence_engine:
+                                self.evidence_engine.store(timing_ev)
+                                self.evidence_engine.link_to_finding(timing_ev, f.get("fingerprint", ""))
+                                legacy_ev = f.get("evidence", "")
+                                f["evidence"] = [legacy_ev] if legacy_ev else []
+                                f["evidence"].append(timing_ev)
                             self._add_finding(f)
             except Exception as e:
                 log(f"  [SQLi] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
@@ -136,8 +143,9 @@ class SQLiScanner(ScannerBase):
         return self._get_findings()
 
     def _test_parameter(self, url: str, param: str, original_value: str,
-                        payloads: dict, oob_host: Optional[str]) -> tuple[dict, Optional[str]]:
+                        payloads: dict, oob_host: Optional[str]) -> tuple[dict, Optional[str], Optional[TimingEvidence]]:
         signals = {"error": False, "boolean": False, "time": False, "union": False, "oob": False}
+        timing_evidence: Optional[TimingEvidence] = None
         evidence_parts: list[str] = []
         triggering_response: Optional[str] = None
 
@@ -182,6 +190,7 @@ class SQLiScanner(ScannerBase):
         baseline_start = time.time()
         safe_get(self.session, url, 15, raise_for_status=False)
         baseline_delay = time.time() - baseline_start
+        baseline_ms = baseline_delay * 1000
         for payload in payloads.get("time_based", []):
             test_url = self._inject_param(url, param, payload)
             delays = []
@@ -193,6 +202,13 @@ class SQLiScanner(ScannerBase):
             min_delay = min(delays)
             if min_delay > baseline_delay + 4 and all(d > baseline_delay + 3 for d in delays):
                 signals["time"] = True
+                triggered_ms = min_delay * 1000
+                timing_evidence = TimingEvidence(
+                    baseline_time_ms=baseline_ms,
+                    triggered_time_ms=triggered_ms,
+                    total_attempts=len(delays),
+                    description=f"Time-based SQLi on param '{param}': {triggered_ms:.0f}ms vs baseline {baseline_ms:.0f}ms",
+                )
                 evidence_parts.append(f"time:delays={delays}, baseline={baseline_delay:.2f}s")
                 if time_resp:
                     triggering_response = time_resp.text[:500]
@@ -232,7 +248,7 @@ class SQLiScanner(ScannerBase):
                         evidence_parts.append(f"oob:callback received from {oob_host}")
                     break
 
-        return signals, triggering_response
+        return signals, triggering_response, timing_evidence
 
     def _test_post_body(self, url: str, payloads: dict, oob_host: Optional[str]) -> None:
         baseline_errors: set[str] = set()

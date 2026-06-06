@@ -65,18 +65,35 @@ class BugcrowdReporter(ReporterBase):
                         orig_user = getattr(ev, 'original_user', '')
                         tgt_user = getattr(ev, 'target_user', '')
                         violated = getattr(ev, 'ownership_violated', False)
-                        evidence_parts.append(
-                            f"> **{desc}** — {'⚠️ Ownership Violation' if violated else 'No violation'}\n"
-                            f"> Original user `{orig_user}` → Target user `{tgt_user}`"
-                        )
+                        orig_status = getattr(ev, 'original_status', 0)
+                        tgt_status = getattr(ev, 'target_status', 0)
+                        body_diff = getattr(ev, 'content_different', False)
+                        orig_body = getattr(ev, 'original_body_excerpt', '')
+                        tgt_body = getattr(ev, 'target_body_excerpt', '')
+                        lines = [
+                            f"> **{desc}** — {'⚠️ Ownership Violation' if violated else 'No violation'}",
+                            f"> HTTP {orig_status} ({orig_user})  →  HTTP {tgt_status} ({tgt_user})",
+                        ]
+                        if body_diff:
+                            lines.append(f"> Body differs: {body_diff}")
+                        if orig_body:
+                            lines.append(f"> Original excerpt: `{orig_body[:200]}`")
+                        if tgt_body:
+                            lines.append(f"> Target excerpt: `{tgt_body[:200]}`")
+                        evidence_parts.append("\n".join(lines))
                     elif ev_type == "TimingEvidence":
-                        delta = getattr(ev, 'time_delta', getattr(ev, 'elapsed_ms', 0))
-                        baseline = getattr(ev, 'baseline_ms', 0)
-                        evidence_parts.append(f"> **{desc}**\n> Baseline: {baseline:.1f}ms | Actual: {delta:.1f}ms | Diff: {delta-baseline:.1f}ms")
+                        triggered = getattr(ev, 'triggered_time_ms', 0.0)
+                        baseline = getattr(ev, 'baseline_time_ms', 0.0)
+                        evidence_parts.append(f"> **{desc}**\n> Baseline: {baseline:.1f}ms | Actual: {triggered:.1f}ms | Diff: {triggered-baseline:.1f}ms")
                     elif ev_type == "OOBCallbackEvidence":
-                        cb_type = getattr(ev, 'callback_type', getattr(ev, 'type', 'unknown'))
-                        cb_data = getattr(ev, 'data', '')
-                        evidence_parts.append(f"> **{desc}** ({cb_type})\n```\n{str(cb_data)[:500]}\n```")
+                        cb_type = getattr(ev, 'callback_type', 'unknown')
+                        cb_host = getattr(ev, 'callback_host', '')
+                        cb_token = getattr(ev, 'callback_token', '')
+                        cb_time = getattr(ev, 'interaction_time', '')
+                        cb_raw = getattr(ev, 'raw_data', '')
+                        meta = f" | Host: {cb_host} | Token: {cb_token}" if cb_host else ""
+                        time_line = f" | Time: {cb_time}" if cb_time else ""
+                        evidence_parts.append(f"> **{desc}** ({cb_type}{meta}{time_line})\n```\n{str(cb_raw)[:500]}\n```")
                     elif ev_type == "GraphQLSchemaEvidence":
                         schema = getattr(ev, 'schema_preview', '')
                         q_count = getattr(ev, 'query_count', 0)

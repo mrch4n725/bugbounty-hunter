@@ -321,6 +321,14 @@ Every HTML report includes a `<script type="application/ld+json">` block with al
 | `--auto` overrides explicit flags | Applied in `main()` after config merge. If the user passes `--rps 10` alongside `--auto`, `--auto` wins and sets `rps=3`. Remove `--auto` if fine-grained control is needed. |
 | `chatgpt` format returns file path | Unlike `markdown-report` (returns directory), `ChatGPTReporter.render()` returns a single file path. The `generate()` method uses the `.md` extension. |
 | JSON-LD in HTML | The JSON-LD block is placed in `<head>` and is always generated. Fields mirror what's in the finding dicts — if a key is missing, it'll be `null` or `""` in the JSON-LD output. |
+| TimingEvidence reporter fields | Use `triggered_time_ms` / `baseline_time_ms` (NOT `time_delta` / `elapsed_ms` / `baseline_ms`). All three reporters (html.py, hackerone.py, bugcrowd.py) now use the correct field names. |
+| OOBCallbackEvidence reporter fields | Use `raw_data` / `callback_host` / `interaction_time` / `callback_token` (NOT `data` / `callback_type` alone). All three reporters render host + token + interaction time alongside raw data. |
+| ScannerBase _prepare_scan state | ScannerBase instances inherit `waf_detected` and `_prepared=True` from parent VulnScanner in `_dispatch_to_scanner()` when `self._prepared` is True. This avoids redundant WAF/baseline HTTP probes. |
+| `_run_reverification_loop` deprecated | Kept only for `use_new_scanners=False` backward compat. `VerificationEngine` in `engines/verification_engine.py` is the sole verification path. The call was removed from `main.py` Step 5. |
+| Terminal [FOUND] output | Now includes verification stage and confidence score: `[FOUND] [HIGH] SQLi @ https://x.com [Validated, 60/100]`. Both `VulnScanner._add()` and `ScannerBase._add_finding()` include this. |
+| SQLiScanner TimingEvidence | `_test_parameter()` creates a `TimingEvidence` object when time signal detected (`triggered_time_ms`, `baseline_time_ms`). The scan() method stores and links it via `evidence_engine`. |
+| ChatGPTReporter evidence rendering | Uses per-evidence-type markdown rendering (`_evidence_to_markdown()`). Supports TimingEvidence, OOBCallbackEvidence, BrowserExecutionEvidence, ScreenshotEvidence, AuthorizationComparisonEvidence, GraphQLSchemaEvidence. Falls back to `str()` for unknown types. |
+| HackerOne/Bugcrowd authZ body diff | `AuthorizationComparisonEvidence` now renders HTTP status codes, body-diff flag, and up-to-200-char body excerpts for both original and target responses. |
 
 ---
 

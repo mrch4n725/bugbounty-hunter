@@ -506,7 +506,10 @@ class VulnScanner:
             sev = f.get("severity", "info").upper()
             title = f.get("title", "Finding")[:60]
             url = f.get("url", "")[:60]
-            log(f"  [FOUND] [{sev}] {title} @ {url}", Colors.RED if sev in ("CRITICAL", "HIGH") else Colors.YELLOW)
+            stage = f.get("verification_stage", "detected").title()
+            score = f.get("confidence_score", 0)
+            log(f"  [FOUND] [{sev}] {title} @ {url} [{stage}, {score:.0f}/100]",
+                Colors.RED if sev in ("CRITICAL", "HIGH") else Colors.YELLOW)
             return True
 
     def _get_findings(self) -> list[dict]:
@@ -527,15 +530,21 @@ class VulnScanner:
         if inst is None:
             return None
         inst.session = self.session
+        # Inherit parent's scan-prep state so ScannerBase skips redundant WAF/baseline probes
+        if self._prepared:
+            inst.waf_detected = self.waf_detected
+            inst._prepared = True
         results = inst.scan(target_urls)
         for f in results:
             self._add(f)
         return self._get_findings()
 
-    # ── Re-verification Loop ──────────────────────────────────────────
+    # ── Re-verification Loop (DEPRECATED) ─────────────────────────────
 
     def _run_reverification_loop(self) -> None:
-        """Re-attempt STAGE 1 (detected, 1 signal) findings with alternative signal types."""
+        """DEPRECATED: VerificationEngine in engines/verification_engine.py now handles
+        all verification paths. This method is kept only for backward compatibility
+        with use_new_scanners=False code paths."""
         all_findings = self.dedup.get_findings()
         attempt_count: dict[str, int] = {}
         for f in all_findings:

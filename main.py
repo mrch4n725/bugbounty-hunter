@@ -530,9 +530,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
             prog.advance(url, len(all_findings_local))
 
     # ── Step 5: Post-scan triage pipeline ───────────────────────────────
-    log("[*] Running re-verification loop...", Colors.CYAN)
-    scanner._run_reverification_loop()
-
+    # NOTE: _run_reverification_loop() is deprecated — VerificationEngine handles all verification.
     updated = scanner._get_findings()
 
     log("[*] Running verification engine...", Colors.CYAN)

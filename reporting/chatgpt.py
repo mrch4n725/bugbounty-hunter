@@ -1,7 +1,16 @@
 import json
 import os
-from typing import Any
+from typing import Any, List, Union
 
+from models.evidence import (
+    EvidenceBase,
+    TimingEvidence,
+    OOBCallbackEvidence,
+    BrowserExecutionEvidence,
+    ScreenshotEvidence,
+    AuthorizationComparisonEvidence,
+    GraphQLSchemaEvidence,
+)
 from reporting.base import ReporterBase
 
 
@@ -15,6 +24,71 @@ class ChatGPTReporter(ReporterBase):
     - JSON block for raw finding data
     - All findings in one file for single copy-paste
     """
+
+    def _evidence_to_markdown(self, evidence_raw: Any) -> str:
+        """Render a single evidence item to a markdown string."""
+        if isinstance(evidence_raw, TimingEvidence):
+            triggered = evidence_raw.triggered_time_ms
+            baseline = evidence_raw.baseline_time_ms
+            return (
+                f"> **{evidence_raw.description}**\n"
+                f"> Baseline: {baseline:.1f}ms | Actual: {triggered:.1f}ms "
+                f"| Diff: {triggered - baseline:.1f}ms"
+            )
+        if isinstance(evidence_raw, OOBCallbackEvidence):
+            cb_type = evidence_raw.callback_type
+            cb_host = evidence_raw.callback_host
+            cb_token = evidence_raw.callback_token
+            cb_time = evidence_raw.interaction_time
+            cb_raw = evidence_raw.raw_data
+            meta = f" | Host: {cb_host} | Token: {cb_token}" if cb_host else ""
+            time_line = f" | Time: {cb_time}" if cb_time else ""
+            return (
+                f"> **{evidence_raw.description}** ({cb_type}{meta}{time_line})\n"
+                f"```\n{str(cb_raw)[:500]}\n```"
+            )
+        if isinstance(evidence_raw, BrowserExecutionEvidence):
+            alert = evidence_raw.alert_fired
+            dom = evidence_raw.dom_mutation
+            ctx = evidence_raw.execution_context
+            status = "✅ Executed" if alert or dom else "❌ Not executed"
+            return f"> **{evidence_raw.description}** — {status}\n> Context: {ctx}"
+        if isinstance(evidence_raw, ScreenshotEvidence):
+            fp = evidence_raw.file_path
+            return f"> **{evidence_raw.description}**\n> Screenshot: {fp}" if fp else ""
+        if isinstance(evidence_raw, AuthorizationComparisonEvidence):
+            orig_user = evidence_raw.original_user
+            tgt_user = evidence_raw.target_user
+            violated = evidence_raw.ownership_violated
+            orig_status = evidence_raw.original_status
+            tgt_status = evidence_raw.target_status
+            body_diff = evidence_raw.content_different
+            orig_body = getattr(evidence_raw, 'original_body_excerpt', '')
+            tgt_body = getattr(evidence_raw, 'target_body_excerpt', '')
+            lines = [
+                f"> **{evidence_raw.description}** — {'⚠️ Ownership Violation' if violated else 'No violation'}",
+                f"> Original: `{orig_user}` (HTTP {orig_status}) → Target: `{tgt_user}` (HTTP {tgt_status})",
+            ]
+            if body_diff:
+                lines.append(f"> Body differs: {body_diff}")
+            if orig_body:
+                lines.append(f"> Original excerpt: `{orig_body[:200]}`")
+            if tgt_body:
+                lines.append(f"> Target excerpt: `{tgt_body[:200]}`")
+            return "\n".join(lines)
+        if isinstance(evidence_raw, GraphQLSchemaEvidence):
+            schema = evidence_raw.schema_preview
+            q_count = evidence_raw.query_count
+            m_count = evidence_raw.mutation_count
+            return (
+                f"> **{evidence_raw.description}** ({q_count} queries, {m_count} mutations)\n"
+                f"```\n{str(schema)[:800]}\n```"
+            )
+        if isinstance(evidence_raw, EvidenceBase):
+            if hasattr(evidence_raw, 'to_dict'):
+                return f"> **{evidence_raw.description}**\n```json\n{json.dumps(evidence_raw.to_dict(), indent=2)}\n```"
+            return f"> **{evidence_raw.description}**\n```\n{str(evidence_raw)}\n```"
+        return str(evidence_raw)
 
     def render(self) -> str:
         sorted_findings = self._sort_findings()
@@ -71,8 +145,11 @@ class ChatGPTReporter(ReporterBase):
 
             if evidence_raw:
                 content += "### Evidence\n\n"
-                evidence_str = str(evidence_raw)
-                content += f"```\n{evidence_str[:2000]}\n```\n\n"
+                if isinstance(evidence_raw, list):
+                    for ev in evidence_raw:
+                        content += self._evidence_to_markdown(ev) + "\n\n"
+                else:
+                    content += f"```\n{str(evidence_raw)[:2000]}\n```\n\n"
 
             if request:
                 content += "### Request\n\n"

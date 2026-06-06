@@ -268,19 +268,25 @@ class HTMLReporter(ReporterBase):
                     else:
                         parts.append(f'<details><summary>{e_desc}</summary><div class="evidence">Screenshot data embedded</div></details>')
                 elif ev_type == "TimingEvidence":
-                    delta = getattr(ev, 'time_delta', getattr(ev, 'elapsed_ms', 0))
-                    baseline = getattr(ev, 'baseline_ms', 0)
+                    triggered = getattr(ev, 'triggered_time_ms', 0.0)
+                    baseline = getattr(ev, 'baseline_time_ms', 0.0)
                     parts.append(
                         f'<details><summary>{e_desc}</summary>'
-                        f'<div class="evidence">Baseline: {baseline:.1f}ms | Actual: {delta:.1f}ms | Diff: {delta - baseline:.1f}ms</div></details>'
+                        f'<div class="evidence">Baseline: {baseline:.1f}ms | Actual: {triggered:.1f}ms | Diff: {triggered - baseline:.1f}ms</div></details>'
                     )
                 elif ev_type == "OOBCallbackEvidence":
-                    cb_type = getattr(ev, 'callback_type', getattr(ev, 'type', 'unknown'))
-                    cb_data = getattr(ev, 'data', '')
-                    e_cb_data = html.escape(str(cb_data)[:500])
+                    cb_type = getattr(ev, 'callback_type', 'unknown')
+                    cb_host = getattr(ev, 'callback_host', '')
+                    cb_token = getattr(ev, 'callback_token', '')
+                    cb_time = getattr(ev, 'interaction_time', '')
+                    cb_raw = getattr(ev, 'raw_data', '')
+                    e_cb_raw = html.escape(str(cb_raw)[:500])
+                    meta = f"Host: {cb_host} | Token: {cb_token}" if cb_host else ""
+                    time_line = f" | Time: {cb_time}" if cb_time else ""
                     parts.append(
                         f'<details><summary>{e_desc} ({cb_type})</summary>'
-                        f'<pre class="evidence">{e_cb_data}</pre></details>'
+                        f'<div class="evidence"><code>{meta}{time_line}</code></div>'
+                        f'<pre class="evidence">{e_cb_raw}</pre></details>'
                     )
                 elif ev_type == "AuthorizationComparisonEvidence":
                     orig_user = getattr(ev, 'original_user', '')
