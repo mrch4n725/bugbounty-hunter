@@ -136,6 +136,8 @@ class HTMLReporter(ReporterBase):
         }
         jsonld_html = json.dumps(jsonld_data, indent=2)
 
+        ai_summary_section = self._create_ai_summary_section_html(sorted_findings, severity_counts, verification_breakdown)
+
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -156,6 +158,7 @@ class HTMLReporter(ReporterBase):
         </header>
         <div class="top-bar">
             <button class="theme-btn" onclick="toggleTheme()">Toggle Theme</button>
+            <button class="theme-btn" id="copyAllAI">Copy All for AI</button>
         </div>
         <section class="summary">{cards_html}</section>
         <div class="chart-row">
@@ -163,6 +166,7 @@ class HTMLReporter(ReporterBase):
             <div class="chart-box"><canvas id="verChart"></canvas></div>
         </div>
         {config_section}
+        {ai_summary_section}
         <section>
             <h2>Findings <span style="font-size:.6em;color:var(--text2)">({sum(severity_counts.values())})</span></h2>
             <div class="filters" id="filters">
@@ -195,6 +199,15 @@ class HTMLReporter(ReporterBase):
         function toggleTheme(){{document.body.classList.toggle('light');}}
         function copyUrl(url){{navigator.clipboard.writeText(url).then(()=>{{var btn=event.target;var orig=btn.textContent;btn.textContent='Copied!';setTimeout(()=>btn.textContent=orig,1200);}});}}
         function copyCurl(cmd){{navigator.clipboard.writeText(cmd).then(()=>{{var btn=event.target;var orig=btn.textContent;btn.textContent='Copied!';setTimeout(()=>btn.textContent=orig,1200);}});}}
+        document.getElementById('copyAllAI').addEventListener('click', function() {{
+            var all = Array.from(document.querySelectorAll('.ai-copy-data'))
+                .map(function(el) {{ return el.textContent; }})
+                .join('\\n\\n' + '='.repeat(60) + '\\n\\n');
+            navigator.clipboard.writeText(all).catch(function(){{}});
+            var btn = this;
+            btn.textContent = 'Copied!';
+            setTimeout(function(){{ btn.textContent = 'Copy All for AI'; }}, 1500);
+        }});
     </script>
 </body>
 </html>"""
@@ -271,7 +284,7 @@ class HTMLReporter(ReporterBase):
                     triggered = getattr(ev, 'triggered_time_ms', 0.0)
                     baseline = getattr(ev, 'baseline_time_ms', 0.0)
                     parts.append(
-                        f'<details><summary>{e_desc}</summary>'
+                        f'<details open><summary>{e_desc}</summary>'
                         f'<div class="evidence">Baseline: {baseline:.1f}ms | Actual: {triggered:.1f}ms | Diff: {triggered - baseline:.1f}ms</div></details>'
                     )
                 elif ev_type == "OOBCallbackEvidence":
@@ -284,7 +297,7 @@ class HTMLReporter(ReporterBase):
                     meta = f"Host: {cb_host} | Token: {cb_token}" if cb_host else ""
                     time_line = f" | Time: {cb_time}" if cb_time else ""
                     parts.append(
-                        f'<details><summary>{e_desc} ({cb_type})</summary>'
+                        f'<details open><summary>{e_desc} ({cb_type})</summary>'
                         f'<div class="evidence"><code>{meta}{time_line}</code></div>'
                         f'<pre class="evidence">{e_cb_raw}</pre></details>'
                     )
@@ -351,6 +364,8 @@ class HTMLReporter(ReporterBase):
             response_excerpt = f.get("response_excerpt", "")
             screenshot_path = f.get("screenshot_path", "")
             steps_to_reproduce = f.get("steps_to_reproduce", [])
+            param = f.get("parameter", "")
+            title = f.get("title", "Finding")
 
             sev_class = {"critical":"critical","high":"high","medium":"medium","low":"low","info":"info"}.get(sev,"info")
             conf_class = "high" if score >= 61 else ("mid" if score >= 31 else "low")
@@ -361,7 +376,7 @@ class HTMLReporter(ReporterBase):
             e_request = html.escape(request)
             e_response = html.escape(response_excerpt)
             e_fpr = html.escape(str(fpr).title() if fpr else "—")
-            e_title = html.escape(f.get("title","Finding"))
+            e_title = html.escape(title)
 
             steps_html = ""
             if steps:
@@ -372,7 +387,7 @@ class HTMLReporter(ReporterBase):
 
             request_html = ""
             if request:
-                request_html = f'<div class="row"><strong>Request:</strong><details><summary>View request</summary><pre class="evidence">{e_request}</pre></details></div>'
+                request_html = f'<div class="row"><strong>Request:</strong><pre class="evidence">{e_request}</pre></div>'
 
             response_html = ""
             if response_excerpt:
@@ -399,6 +414,54 @@ class HTMLReporter(ReporterBase):
             remediation = self._build_remediation(f)
             e_remediation = html.escape(remediation)
 
+            # ── Build "Copy for AI" plain-text block ────────────────
+            ai_lines = []
+            ai_lines.append(f"FINDING: {title}")
+            ai_lines.append(f"Severity: {sev.upper()}")
+            ai_lines.append(f"URL: {vuln_url}")
+            ai_lines.append(f"Parameter: {param or 'N/A'}")
+            ai_lines.append(f"Stage: {stage_label}")
+            ai_lines.append(f"Confidence: {score:.0f}/100")
+            ai_lines.append(f"False Positive Risk: {fpr or 'N/A'}")
+            ai_lines.append(f"CVSS: {cvss_score:.1f}")
+            ai_lines.append("")
+            ai_lines.append("Description:")
+            ai_lines.append(details)
+            ai_lines.append("")
+            if steps_to_reproduce:
+                ai_lines.append("Steps to Reproduce:")
+                for i, s in enumerate(steps_to_reproduce[:10], 1):
+                    ai_lines.append(f"{i}. {s}")
+                ai_lines.append("")
+            evidence_raw = f.get("evidence", "")
+            ai_evidence = ""
+            if isinstance(evidence_raw, list):
+                ev_parts = []
+                for ev in evidence_raw:
+                    if hasattr(ev, 'to_dict'):
+                        ev_parts.append(str(ev.to_dict()))
+                    else:
+                        ev_parts.append(str(ev))
+                ai_evidence = "\n".join(ev_parts)
+            else:
+                ai_evidence = str(evidence_raw) if evidence_raw else ""
+            ai_lines.append("Evidence:")
+            ai_lines.append(ai_evidence or "N/A")
+            ai_lines.append("")
+            ai_lines.append("Request:")
+            ai_lines.append(request or "N/A")
+            ai_lines.append("")
+            ai_lines.append("Response Excerpt:")
+            ai_lines.append((response_excerpt or "N/A")[:1000])
+            ai_lines.append("")
+            ai_lines.append("Impact:")
+            ai_lines.append(impact_narrative)
+            ai_lines.append("")
+            ai_lines.append("Remediation:")
+            ai_lines.append(remediation)
+            ai_text = "\n".join(ai_lines)
+            e_ai_text = html.escape(ai_text)
+
             html_out += f'''<div class="finding-card {sev_class}" data-severity="{sev}" data-stage="{stage}">
                 <div class="finding-header">
                     <div class="finding-title">{e_title}</div>
@@ -409,27 +472,92 @@ class HTMLReporter(ReporterBase):
                     </div>
                 </div>
                 <div class="finding-body">
-                    <div class="row"><strong>URL:</strong> <span class="url">{e_vuln_url}</span> <button class="copy-btn" data-copy="{html.escape(vuln_url, quote=True)}">Copy URL</button> <button class="copy-btn copy-curl" data-copy="{html.escape(curl_cmd, quote=True)}">Copy Curl</button></div>
+                    <div class="row"><strong>URL:</strong> <span class="url">{e_vuln_url}</span> <button class="copy-btn" data-copy="{html.escape(vuln_url, quote=True)}">Copy URL</button> <button class="copy-btn copy-curl" data-copy="{html.escape(curl_cmd, quote=True)}">Copy Curl</button> <button class="copy-btn copy-ai">Copy for AI</button></div>
+                    {steps_to_reproduce_html}
                     <div class="row"><strong>Details:</strong> {e_details}</div>
                     {evidence_html}
                     {request_html}
                     {response_html}
                     {screenshot_html}
                     {steps_html}
-                    {steps_to_reproduce_html}
                     <div class="row"><strong>FP Risk:</strong> {e_fpr} | {cvss_html}</div>
                     <div class="row"><strong>Impact:</strong> {e_impact}</div>
                     <div class="row"><strong>Remediation:</strong> {e_remediation}</div>
+                    <span class="ai-copy-data" style="display:none">{e_ai_text}</span>
                 </div>
             </div>'''
 
         html_out += '''<script>
 document.addEventListener('click', function(e) {
     var btn = e.target.closest('.copy-btn');
-    if (btn) { navigator.clipboard.writeText(btn.getAttribute('data-copy')).catch(function(){}); }
+    if (btn) {
+        if (btn.classList.contains('copy-ai')) {
+            var card = btn.closest('.finding-card');
+            var txt = card.querySelector('.ai-copy-data').textContent;
+            navigator.clipboard.writeText(txt).catch(function(){});
+        } else {
+            navigator.clipboard.writeText(btn.getAttribute('data-copy')).catch(function(){});
+        }
+    }
 });
 </script>'''
         return html_out
+
+    def _create_ai_summary_section_html(self, findings: List[Dict[str, Any]],
+                                         sev_counts: Dict[str, int],
+                                         ver_breakdown: Dict[str, int]) -> str:
+        crit = sev_counts.get("critical", 0)
+        high = sev_counts.get("high", 0)
+        med = sev_counts.get("medium", 0)
+        low = sev_counts.get("low", 0)
+        info = sev_counts.get("info", 0)
+        exploitable = ver_breakdown.get("exploitable", 0)
+        validated = ver_breakdown.get("validated", 0)
+        detected = ver_breakdown.get("detected", 0)
+
+        top_lines = []
+        for f in findings:
+            sev = f.get("severity", "info").lower()
+            if sev not in ("critical", "high"):
+                if len(top_lines) >= 5:
+                    break
+                continue
+            title = f.get("title", "Finding")
+            url = f.get("url", "")
+            score = f.get("confidence_score", 0)
+            stage = f.get("verification_stage", "detected").title()
+            top_lines.append(f"- [{sev.upper()}] {title} @ {url} (Confidence: {score:.0f}/100, Stage: {stage})")
+            if len(top_lines) >= 5:
+                break
+
+        top_findings_text = "\n".join(top_lines) if top_lines else "  None"
+
+        summary_text = (
+            f"Target: {self.target}\n"
+            f"Scan date: {self.timestamp}\n"
+            f"Total findings: {len(findings)}\n"
+            f"Critical: {crit} | High: {high} | Medium: {med} | Low: {low} | Info: {info}\n"
+            f"Exploitable: {exploitable} | Validated: {validated} | Detected: {detected}\n\n"
+            f"Top findings:\n{top_findings_text}\n\n"
+            f"Please assess these findings, identify false positives, and draft\n"
+            f"HackerOne submission text for the exploitable and validated findings."
+        )
+        e_summary = html.escape(summary_text)
+
+        return f'''<section>
+      <h2>AI Summary <button class="theme-btn" style="font-size:.75em"
+          onclick="document.getElementById('ai-summary-text').select();
+                   navigator.clipboard.writeText(
+                     document.getElementById('ai-summary-text').value)
+                   .catch(function(){{}});">
+        Copy Summary
+      </button></h2>
+      <textarea id="ai-summary-text" readonly
+                style="width:100%;height:160px;background:var(--bg);
+                       color:var(--text);border:1px solid var(--border);
+                       border-radius:4px;padding:10px;font-family:monospace;
+                       font-size:.82em;resize:vertical">{e_summary}</textarea>
+    </section>'''
 
     def _create_subdomains_section_html(self, subdomains: List[str]) -> str:
         if not subdomains:

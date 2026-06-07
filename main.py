@@ -5,6 +5,7 @@ Usage: python main.py --target https://example.com [options]
 """
 
 import argparse
+import glob
 import json
 import sys
 import os
@@ -595,6 +596,29 @@ def _write_report_and_summary(config, all_findings, recon_data, js_data=None, co
     except Exception as e:
         log(f"\n[✗] Failed to save report: {e}", Colors.RED)
         return 1
+
+    # Print output file paths clearly
+    log("", Colors.WHITE)
+    log("=" * 60, Colors.CYAN)
+    log(f"  SCAN COMPLETE — {len(all_findings)} finding(s)", Colors.CYAN)
+    log("=" * 60, Colors.CYAN)
+    log(f"  Report:   {report_path}", Colors.WHITE)
+    json_files = sorted(glob.glob(
+        os.path.join(config["output_dir"], "*_findings.json")
+    ))
+    if json_files:
+        log(f"  JSON:     {json_files[-1]}", Colors.WHITE)
+    log(f"  Folder:   {os.path.abspath(config['output_dir'])}", Colors.WHITE)
+    log("", Colors.WHITE)
+    if config.get("report_format") == "chatgpt":
+        log(f"  ChatGPT:  {report_path} — paste this file directly into ChatGPT",
+            Colors.WHITE)
+    log("  To summarise with AI, open the report or run:", Colors.CYAN)
+    log(f"    cat {json_files[-1] if json_files else '<findings.json>'} | pbcopy",
+        Colors.WHITE)
+    log("  Then paste into ChatGPT, Claude, or your preferred AI tool.", Colors.WHITE)
+    log("=" * 60, Colors.CYAN)
+
     critical = [f for f in all_findings if f.get("severity") == "critical"]
     high = [f for f in all_findings if f.get("severity") == "high"]
     medium = [f for f in all_findings if f.get("severity") == "medium"]

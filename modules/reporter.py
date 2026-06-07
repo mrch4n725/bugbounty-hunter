@@ -5,6 +5,8 @@ Maintains full backward compatibility with existing code that imports
 from modules.reporter import Reporter.
 """
 
+import json
+import os
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 
@@ -104,6 +106,60 @@ class Reporter:
 
             log(f"  [Report] {self.report_format.upper()} report written to {file_path}",
                 Colors.GREEN)
+
+            # Always write a machine-readable findings.json alongside the report
+            findings_path = os.path.join(
+                self.output_dir,
+                f"{reporter._sanitize_target()}_{self.timestamp}_findings.json"
+            )
+            try:
+                findings_export = []
+                for f in reporter.findings:
+                    evidence_raw = f.get("evidence", "")
+                    if isinstance(evidence_raw, list):
+                        evidence_serialised = [
+                            (ev.to_dict() if hasattr(ev, 'to_dict') else str(ev))
+                            for ev in evidence_raw
+                        ]
+                    else:
+                        evidence_serialised = str(evidence_raw) if evidence_raw else ""
+
+                    steps = f.get("steps_to_reproduce", [])
+                    if not isinstance(steps, list):
+                        steps = [str(steps)] if steps else []
+
+                    findings_export.append({
+                        "title":              f.get("title", ""),
+                        "vuln_type":          f.get("vuln_type", ""),
+                        "severity":           f.get("severity", "info"),
+                        "url":                f.get("url", ""),
+                        "parameter":          f.get("parameter", ""),
+                        "verification_stage": f.get("verification_stage", "detected"),
+                        "confidence_score":   f.get("confidence_score", 0),
+                        "false_positive_risk": f.get("false_positive_risk", ""),
+                        "fingerprint":        f.get("fingerprint", ""),
+                        "details":            f.get("details", ""),
+                        "steps_to_reproduce": steps,
+                        "evidence":           evidence_serialised,
+                        "request":            f.get("request", "")[:3000],
+                        "response_excerpt":   f.get("response_excerpt", "")[:2000],
+                        "screenshot_path":    f.get("screenshot_path", ""),
+                        "cvss_score":         reporter._get_cvss_score(f),
+                        "cvss_vector":        reporter._get_cvss_vector(f),
+                        "impact":             reporter._build_impact_narrative(f),
+                        "remediation":        reporter._build_remediation(f),
+                    })
+                with open(findings_path, 'w', encoding='utf-8') as jf:
+                    json.dump({
+                        "target": self.target,
+                        "generated": self.timestamp,
+                        "total": len(findings_export),
+                        "findings": findings_export,
+                    }, jf, indent=2, ensure_ascii=False)
+                log(f"  [Findings] JSON data saved: {findings_path}", Colors.CYAN)
+            except Exception as e:
+                log(f"  [!] Could not write findings.json: {e}", Colors.YELLOW)
+
             return file_path
 
         except Exception as e:

@@ -31,7 +31,7 @@ class BugcrowdReporter(ReporterBase):
             sev = f.get("severity", "info").upper()
             what = f.get("what_is_it") or f.get("details", "")
             impact_narrative = self._build_impact_narrative(f)
-            steps = f.get("validation_steps") or f.get("steps_to_reproduce", "")
+            steps = f.get("steps_to_reproduce") or f.get("validation_steps") or []
             if isinstance(steps, list):
                 steps = "\n".join(f"{j+1}. {s}" for j, s in enumerate(steps))
             remed = f.get("remediation") or f.get("recommendation", "")

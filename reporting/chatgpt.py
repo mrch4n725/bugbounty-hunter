@@ -112,6 +112,25 @@ class ChatGPTReporter(ReporterBase):
 
         content = "\n".join(frontmatter_lines)
 
+        # AI prompt instructions
+        content += "## How to use this report\n\n"
+        content += (
+            "You are a bug bounty triage assistant. Below is a full vulnerability scan "
+            "report. For each finding:\n\n"
+            "1. Assess whether the finding is a real vulnerability or a false positive "
+            "based on the evidence, confidence score, and false-positive risk.\n"
+            "2. If real, draft a HackerOne or Bugcrowd submission: title, severity, "
+            "one-paragraph description, numbered steps to reproduce, impact, and "
+            "suggested CVSS score.\n"
+            "3. If it is likely a false positive, explain why and suggest what manual "
+            "verification step would confirm or rule it out.\n"
+            "4. Prioritise findings in this order: Exploitable > Validated > Detected, "
+            "then Critical > High > Medium > Low within each stage.\n\n"
+            "Start with a one-paragraph executive summary covering the target, total "
+            "finding count, severity breakdown, and the single most critical issue.\n\n"
+            "---\n\n"
+        )
+
         for i, f in enumerate(sorted_findings, 1):
             title = f.get("title", f.get("vuln_type", "Finding"))
             sev_val = f.get("severity", "info").upper()
@@ -170,16 +189,37 @@ class ChatGPTReporter(ReporterBase):
         content += "## Raw Finding Data\n\n```json\n"
         raw_data = []
         for f in sorted_findings:
+            evidence_raw = f.get("evidence", "")
+            if isinstance(evidence_raw, list):
+                evidence_serialised = [
+                    (ev.to_dict() if hasattr(ev, 'to_dict') else str(ev))
+                    for ev in evidence_raw
+                ]
+            else:
+                evidence_serialised = str(evidence_raw) if evidence_raw else ""
+
+            steps = f.get("steps_to_reproduce", [])
+            if not isinstance(steps, list):
+                steps = [str(steps)] if steps else []
+
             entry = {
-                "title": f.get("title", ""),
-                "vuln_type": f.get("vuln_type", ""),
-                "severity": f.get("severity", "info"),
-                "url": f.get("url", ""),
-                "parameter": f.get("parameter", ""),
+                "title":              f.get("title", ""),
+                "vuln_type":          f.get("vuln_type", ""),
+                "severity":           f.get("severity", "info"),
+                "url":                f.get("url", ""),
+                "parameter":          f.get("parameter", ""),
                 "verification_stage": f.get("verification_stage", "detected"),
-                "confidence_score": f.get("confidence_score", 0),
+                "confidence_score":   f.get("confidence_score", 0),
                 "false_positive_risk": f.get("false_positive_risk", ""),
-                "cvss_score": self._get_cvss_score(f),
+                "cvss_score":         self._get_cvss_score(f),
+                "cvss_vector":        self._get_cvss_vector(f),
+                "details":            f.get("details", ""),
+                "steps_to_reproduce": steps,
+                "evidence":           evidence_serialised,
+                "request":            f.get("request", "")[:3000],
+                "response_excerpt":   f.get("response_excerpt", "")[:2000],
+                "impact":             self._build_impact_narrative(f),
+                "remediation":        self._build_remediation(f),
             }
             raw_data.append(entry)
         content += json.dumps({"findings": raw_data}, indent=2)

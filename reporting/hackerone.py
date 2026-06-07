@@ -49,7 +49,7 @@ Please verify each finding before submitting.
         component = f.get("component") or f.get("url", self.target)
         what = f.get("what_is_it") or f.get("details", "")
         impact_narrative = self._build_impact_narrative(f)
-        steps = f.get("validation_steps") or f.get("steps_to_reproduce", "")
+        steps = f.get("steps_to_reproduce") or f.get("validation_steps") or []
         if isinstance(steps, list):
             steps = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
         evidence = (
