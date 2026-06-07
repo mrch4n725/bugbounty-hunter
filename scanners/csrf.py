@@ -26,6 +26,7 @@ CSRF_TOKEN_NAMES = {
 
 class CSRFScanner(ScannerBase):
     SCANNER_NAME = "csrf"
+    SCANNER_MATURITY = 1
     TARGET_LEVEL = False
 
     def scan(self, target_urls: list[str] | None = None) -> list[dict]:

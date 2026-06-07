@@ -19,6 +19,7 @@ from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
 
 class HttpMethodsScanner(ScannerBase):
     SCANNER_NAME = "http_methods"
+    SCANNER_MATURITY = 1
     TARGET_LEVEL = True
     SCANNER_ORDER = 10
 

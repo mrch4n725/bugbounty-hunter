@@ -536,11 +536,12 @@ class VulnScanner:
             inst._prepared = True
         results = inst.scan(target_urls)
         extra   = inst.finalize()
-        for f in results + extra:
+        new_findings = results + extra
+        for f in new_findings:
             if f:
                 with self._lock:
                     self.dedup.add_legacy(f)
-        return self._get_findings()
+        return new_findings
 
     # ── Re-verification Loop (DEPRECATED) ─────────────────────────────
 
@@ -3270,6 +3271,8 @@ class VulnScanner:
         specs, and inject all extracted endpoints back into the URL pool for
         downstream scanners.
         """
+        if result := self._dispatch_to_scanner("openapi"):
+            return result
         spec_paths = [
             "/swagger.json", "/api/swagger.json",
             "/swagger/v1/swagger.json", "/swagger/v2/swagger.json",
@@ -3524,8 +3527,13 @@ class VulnScanner:
 
         return findings
 
-    # IDOR is handled by IdorScanner in modules/idor.py.
-    # Legacy scan_idor() removed — use --modules idor instead of idor_path.
+    def scan_idor(self, target_urls: list[str] | None = None) -> list[dict]:
+        """Dispatch to IdorScannerAdapter (ScannerBase) or fall back to legacy modules.idor.IdorScanner."""
+        if result := self._dispatch_to_scanner("idor", target_urls):
+            return result
+        from modules.idor import IdorScanner
+        idor = IdorScanner(self.config, self.recon, container=self._container)
+        return idor.run_all()
 
     # ═════════════════════════════════════════════════════════════════════
     # Verify-only mode

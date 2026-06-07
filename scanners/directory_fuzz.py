@@ -27,6 +27,7 @@ COMMON_DIRFUZZ_PATHS = [
 
 class DirectoryFuzzScanner(ScannerBase):
     SCANNER_NAME = "dirb"
+    SCANNER_MATURITY = 1
     TARGET_LEVEL = True
     SCANNER_ORDER = 20
 

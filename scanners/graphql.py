@@ -20,6 +20,7 @@ from models.evidence import GraphQLSchemaEvidence, EvidenceStatus
 
 class GraphQLScanner(ScannerBase):
     SCANNER_NAME = "graphql"
+    SCANNER_MATURITY = 2
     TARGET_LEVEL = True
     SCANNER_ORDER = 10
 

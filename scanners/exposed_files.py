@@ -30,6 +30,7 @@ EXPOSED_FILES = [
 
 class ExposedFilesScanner(ScannerBase):
     SCANNER_NAME = "exposed_files"
+    SCANNER_MATURITY = 2
     TARGET_LEVEL = True
     SCANNER_ORDER = 20
 

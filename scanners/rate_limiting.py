@@ -37,6 +37,7 @@ PROBE_COUNT = 50
 
 class RateLimitingScanner(ScannerBase):
     SCANNER_NAME = "rate_limiting"
+    SCANNER_MATURITY = 1
     TARGET_LEVEL = False
 
     def _build_candidates(self, target_urls: list[str] | None = None) -> list[dict]:

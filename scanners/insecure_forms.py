@@ -20,6 +20,7 @@ from scanners.base import ScannerBase
 
 class InsecureFormsScanner(ScannerBase):
     SCANNER_NAME = "insecure_forms"
+    SCANNER_MATURITY = 1
     TARGET_LEVEL = False
 
     def _same_origin(self, action_url: str) -> bool:

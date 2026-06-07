@@ -26,6 +26,7 @@ TAKEOVER_SIGNATURES = [
 
 class SubdomainTakeoverScanner(ScannerBase):
     SCANNER_NAME = "subdomain_takeover"
+    SCANNER_MATURITY = 1
     TARGET_LEVEL = True
     SCANNER_ORDER = 20
 

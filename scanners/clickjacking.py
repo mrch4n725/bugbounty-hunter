@@ -19,6 +19,7 @@ from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
 
 class ClickjackingScanner(ScannerBase):
     SCANNER_NAME = "clickjacking"
+    SCANNER_MATURITY = 1
     TARGET_LEVEL = True
     SCANNER_ORDER = 10
 

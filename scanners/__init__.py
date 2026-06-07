@@ -20,6 +20,7 @@ from scanners.xxe import XXEScanner
 from scanners.command_injection import CommandInjectionScanner
 from scanners.graphql import GraphQLScanner
 from scanners.idor import IdorScannerAdapter
+from scanners.openapi import OpenAPIScanner
 
 __all__ = [
     "ScannerBase",
@@ -44,6 +45,7 @@ __all__ = [
     "CommandInjectionScanner",
     "GraphQLScanner",
     "IdorScannerAdapter",
+    "OpenAPIScanner",
 ]
 
 

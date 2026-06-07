@@ -22,6 +22,7 @@ from scanners.base import ScannerBase
 
 class BlindXSSScanner(ScannerBase):
     SCANNER_NAME = "blind_xss"
+    SCANNER_MATURITY = 4
     TARGET_LEVEL = True
 
     def __init__(self, config: dict, recon: dict, container=None):

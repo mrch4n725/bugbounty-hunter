@@ -18,7 +18,6 @@ from typing import Any
 from modules.recon import Recon
 from modules.scanner import VulnScanner
 from modules.api_scanner import ApiScanner
-from modules.idor import IdorScanner
 from modules.reporter import Reporter
 from modules.js_intelligence import JSIntelligence
 from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score, prioritize_findings, reset_seen_findings, _build_curl, set_mask_sensitive_default, ScanProgress
@@ -449,8 +448,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     }
     _api_scanner = ApiScanner(scanner.config, scanner.recon, container=container)
     module_map["api"] = _api_scanner.run_all
-    _idor_scanner = IdorScanner(scanner.config, scanner.recon, container=container)
-    module_map["idor"] = _idor_scanner.run_all
+    module_map["idor"] = scanner.scan_idor
 
     # ── Step 2: Run TARGET_LEVEL modules first ───────────────────────────
     target_modules = {k: v for k, v in module_map.items() if k in TARGET_LEVEL}
