@@ -39,7 +39,7 @@ PROBE_COUNT = 50
 
 class RateLimitingScanner(ScannerBase):
     SCANNER_NAME = "rate_limiting"
-    SCANNER_MATURITY = 1
+    SCANNER_MATURITY = 3
     TARGET_LEVEL = False
 
     def _build_candidates(self, target_urls: list[str] | None = None) -> list[dict]:
@@ -164,6 +164,42 @@ class RateLimitingScanner(ScannerBase):
         )
 
     def validate(self, detection: DetectionResult) -> ValidationResult | None:
+        elapsed_ms = 0.0
+        statuses_seen = set()
+        main_sig = ""
+        for sig in detection.evidence_signals:
+            if sig.startswith("elapsed_ms="):
+                try:
+                    elapsed_ms = float(sig.split("=")[1])
+                except (ValueError, IndexError):
+                    pass
+            elif not main_sig:
+                main_sig = sig
+        if main_sig:
+            import re
+            m = re.search(r"Statuses: \{([^}]+)\}", main_sig)
+            if m:
+                try:
+                    statuses_seen = {int(s.strip()) for s in m.group(1).split(",") if s.strip().isdigit()}
+                except ValueError:
+                    pass
+        all_200 = statuses_seen == {200}
+        fast_burst = elapsed_ms < 30_000
+        no_throttling = 429 not in statuses_seen and not any(s >= 500 for s in statuses_seen)
+        if all_200 and fast_burst:
+            return ValidationResult(
+                confirmed=True,
+                signals=[f"all_200", f"burst_{elapsed_ms:.0f}ms"],
+                method="burst_analysis",
+                detail=f"Rate limiting absent: {PROBE_COUNT} POSTs in {elapsed_ms / 1000:.1f}s, all returned 200",
+            )
+        if no_throttling and fast_burst:
+            return ValidationResult(
+                confirmed=False,
+                signals=[f"burst_{elapsed_ms:.0f}ms"],
+                method="burst_analysis",
+                detail=f"No rate limit triggered: statuses {sorted(statuses_seen)}, {elapsed_ms / 1000:.1f}s",
+            )
         return ValidationResult(confirmed=False, method="burst_analysis",
                                 detail=f"No rate limiting detected across {PROBE_COUNT} rapid requests")
 
@@ -230,7 +266,7 @@ class RateLimitingScanner(ScannerBase):
                     request=_build_curl("POST", test_url, dict(self.session.headers), data=probe_data),
                     response_excerpt=response_excerpt,
                     steps_to_reproduce=self.generate_reproduction(detection, validation_result),
-                    verification_stage=VerificationStage.DETECTED.value,
+                    verification_stage=VerificationStage.VALIDATED.value if (validation_result and validation_result.confirmed) else VerificationStage.DETECTED.value,
                 )
                 if f:
                     fingerprint = f.get("fingerprint", "")

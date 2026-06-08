@@ -21,7 +21,7 @@ from modules.utils import (
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 from models.finding import Finding
-from models.evidence import TimingEvidence, HttpRequestEvidence, ResponseExcerptEvidence
+from models.evidence import TimingEvidence, HttpRequestEvidence, ResponseExcerptEvidence, CommandExecutionEvidence
 
 CMD_INJECTION_PAYLOADS = {
     "unix": [
@@ -121,6 +121,22 @@ class CommandInjectionScanner(ScannerBase):
         ev_list = []
         if detection.timing_evidence:
             ev_list.append(detection.timing_evidence)
+        # Add CommandExecutionEvidence when signals detected
+        if any(detection.signals.values()):
+            char_map = {"semicolon": ";", "pipe": "|", "and": "&&", "or": "||", "backtick": "`", "subshell": "$("}
+            detected_chars = [char_map.get(k, k) for k, v in detection.signals.items() if v]
+            timing_ms = 0.0
+            if detection.timing_evidence and hasattr(detection.timing_evidence, "triggered_time_ms"):
+                timing_ms = detection.timing_evidence.triggered_time_ms - detection.timing_evidence.baseline_time_ms
+            ev_list.append(
+                CommandExecutionEvidence(
+                    command=f"injection in {detection.param}",
+                    shell_chars_detected=detected_chars,
+                    output_excerpt=(detection.triggering_response or "")[:300],
+                    timing_delay_ms=max(0, timing_ms),
+                    description=f"Command injection via {', '.join(detected_chars)} in parameter '{detection.param}'",
+                )
+            )
         return ev_list
 
     def generate_reproduction(self, detection: CmdInjectionResult,

@@ -64,7 +64,7 @@ class OpenRedirectScanner(ScannerBase):
         for payload in OPEN_REDIRECT_PAYLOADS:
             try:
                 test_url = self._inject_param(url, parameter, payload)
-                resp = safe_get(self.session, test_url, self.timeout, raise_for_status=False)
+                resp = safe_get(self.session, test_url, self.timeout, raise_for_status=False, allow_redirects=False)
                 if not resp:
                     continue
                 loc = resp.headers.get("Location", "")
@@ -80,6 +80,37 @@ class OpenRedirectScanner(ScannerBase):
             except Exception:
                 continue
         return None
+
+    def validate(self, detection: DetectionResult) -> ValidationResult | None:
+        resp = detection.raw_response
+        if not resp:
+            return None
+        loc = resp.headers.get("Location", "")
+        if not loc:
+            return None
+        if loc.lower().startswith("javascript:"):
+            return ValidationResult(
+                confirmed=True,
+                signals=["javascript_url"],
+                method="javascript_confirm",
+                detail="JavaScript URL in Location header confirmed",
+            )
+        followed = safe_get(self.session, loc, self.timeout, raise_for_status=False, allow_redirects=True)
+        if followed:
+            final_url = followed.url or loc
+            parsed = urlparse(final_url)
+            if parsed.netloc and parsed.netloc != urlparse(detection.url).netloc:
+                return ValidationResult(
+                    confirmed=True,
+                    signals=[f"redirected_to:{final_url[:80]}"],
+                    method="redirect_follow",
+                    detail=f"Redirect followed to external domain: {final_url}",
+                )
+        return ValidationResult(
+            confirmed=False,
+            method="redirect_not_followed",
+            detail=f"Location header present but redirect not confirmed to external domain",
+        )
 
     def generate_reproduction(self, detection: DetectionResult) -> list[str]:
         return [
@@ -116,6 +147,11 @@ class OpenRedirectScanner(ScannerBase):
                         verification_stage=VerificationStage.VALIDATED.value,
                     )
                     if f:
+                        validation_result = self.validate(detection)
+                        if validation_result and validation_result.confirmed:
+                            f["verification_stage"] = VerificationStage.EXPLOITABLE.value
+                        else:
+                            f["verification_stage"] = VerificationStage.VALIDATED.value
                         fp = f.get("fingerprint", "")
                         if fp and self.evidence_engine is not None:
                             req_ev = HttpRequestEvidence(

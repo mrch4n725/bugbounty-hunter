@@ -652,6 +652,19 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     log("[*] Checking self-halting conditions...", Colors.CYAN)
     updated = VulnScanner.check_self_halt(updated)
 
+    log("[*] Validating evidence completeness...", Colors.CYAN)
+    from engines.evidence_validator import EvidenceCompletenessValidator
+    from models.finding import Finding
+    evidence_validated = []
+    for f in updated:
+        if isinstance(f, dict):
+            obj = Finding.from_dict(f)
+            obj = EvidenceCompletenessValidator.validate(obj)
+            evidence_validated.append(obj.to_dict())
+        else:
+            evidence_validated.append(f)
+    updated = evidence_validated
+
     updated = prioritize_findings(updated)
 
     # Merge TARGET_LEVEL findings (ApiScanner/IdorScanner don't use self._add())
@@ -736,6 +749,23 @@ def _write_report_and_summary(config, all_findings, recon_data, js_data=None, co
     validated = [f for f in all_findings if f.get("verification_stage") == "validated"]
     exploitable = [f for f in all_findings if f.get("verification_stage") == "exploitable"]
     verified = [f for f in all_findings if f.get("verification_stage") == "verified"]
+
+    # Root-cause grouping for terminal summary
+    from engines.root_cause import ROOT_CAUSE_MAP
+    root_causes: dict[str, list] = {}
+    for f in all_findings:
+        vt = (f.get("vuln_type") or f.get("title") or "").lower()
+        for pattern, label in ROOT_CAUSE_MAP.items():
+            if pattern in vt:
+                root_causes.setdefault(label, []).append(f)
+                break
+        else:
+            root_causes.setdefault("Other", []).append(f)
+    if root_causes:
+        log(f"\n  Root Causes", Colors.BOLD)
+        for label, items in sorted(root_causes.items(), key=lambda x: -len(x[1])):
+            log(f"    {label}: {len(items)} finding(s)", Colors.WHITE)
+
     log(f"\n{'─'*50}", Colors.CYAN)
     log("  SCAN SUMMARY", Colors.BOLD)
     log(f"{'─'*50}", Colors.CYAN)
@@ -772,6 +802,10 @@ def main():
 
     config = build_config(args)
     set_mask_sensitive_default(not config.get("no_mask_curl", False))
+    return run(config)
+
+
+def run(config: dict) -> int:
 
     # ── Capability-driven startup ────────────────────────────────────────
     capabilities, container = bootstrap(config)

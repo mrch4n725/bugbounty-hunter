@@ -87,6 +87,50 @@ class LFIScanner(ScannerBase):
                 continue
         return None
 
+    def validate(self, detection: DetectionResult) -> ValidationResult | None:
+        resp = detection.raw_response
+        if not resp:
+            return None
+        body = resp.text or ""
+        sigs_found = [sig for sig in LFI_SIGNATURES if sig in body]
+        count = len(sigs_found)
+        if count >= 2:
+            return ValidationResult(
+                confirmed=True,
+                signals=sigs_found,
+                method="multi_sig",
+                detail=f"LFI confirmed: {count} file signature(s) in response",
+            )
+        if count == 1:
+            extra_payloads = [
+                "../../../../etc/shadow",
+                "../../../../windows/system.ini",
+            ]
+            extras_hit = 0
+            for alt in extra_payloads:
+                alt_url = self._inject_param(detection.url, detection.parameter, alt)
+                ar = safe_get(self.session, alt_url, self.timeout)
+                if ar and any(s in (ar.text or "") for s in LFI_SIGNATURES):
+                    extras_hit += 1
+            if extras_hit >= 1:
+                return ValidationResult(
+                    confirmed=True,
+                    signals=sigs_found + [f"alt_payload_x{extras_hit}"],
+                    method="cross_payload",
+                    detail=f"LFI confirmed via {extras_hit} alternate payload(s)",
+                )
+            return ValidationResult(
+                confirmed=False,
+                signals=sigs_found,
+                method="single_sig",
+                detail="Single file signature found; cross-payload check inconclusive",
+            )
+        return ValidationResult(
+            confirmed=False,
+            method="no_sig",
+            detail="No known file signatures in response",
+        )
+
     def generate_reproduction(self, detection: DetectionResult) -> list[str]:
         return [
             f"Send GET to {detection.url}",
@@ -130,6 +174,11 @@ class LFIScanner(ScannerBase):
                         verification_stage=VerificationStage.VALIDATED.value,
                     )
                     if f:
+                        validation_result = self.validate(detection)
+                        if validation_result and validation_result.confirmed:
+                            f["verification_stage"] = VerificationStage.VALIDATED.value
+                        else:
+                            f["verification_stage"] = VerificationStage.DETECTED.value
                         self.evidence_engine.store(req_ev)
                         self.evidence_engine.store(resp_ev)
                         self.evidence_engine.link_to_finding(req_ev, f.get("fingerprint", ""))

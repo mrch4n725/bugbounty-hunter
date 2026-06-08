@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from pathlib import Path
 
 from modules.utils import log, Colors
+from engines.outcome_feedback import OutcomeEngine
 from reporting import (
     ReporterBase, assess_finding_impact,
     HTMLReporter, JSONReporter, TXTReporter,
@@ -71,6 +72,46 @@ class Reporter:
             return ChatGPTReporter(self.config, self.findings, self.recon_data, self.js_data, **kwargs)
         else:
             raise ValueError(f"Unsupported report format: {self.report_format}")
+
+    @property
+    def outcome_engine(self) -> OutcomeEngine:
+        if not hasattr(self, '_outcome_engine'):
+            self._outcome_engine = OutcomeEngine(self.config)
+        return self._outcome_engine
+
+    def record_outcome(self, fingerprint: str, outcome: str,
+                       platform: str = "", note: str = "") -> None:
+        """Record a bug bounty outcome for a specific finding."""
+        for f in self.findings:
+            if f.get("fingerprint") == fingerprint:
+                self.outcome_engine.record_outcome(
+                    fingerprint=fingerprint,
+                    outcome=outcome,
+                    vuln_type=f.get("vuln_type", ""),
+                    severity=f.get("severity", ""),
+                    confidence_score=f.get("confidence_score", 0),
+                    verification_stage=f.get("verification_stage", ""),
+                    evidence_types=self._extract_evidence_types(f),
+                    platform=platform,
+                    note=note,
+                )
+                log(f"[Outcome] '{outcome}' recorded for {fingerprint[:12]}", Colors.CYAN)
+                return
+        log(f"[!] No finding with fingerprint {fingerprint[:12]}", Colors.YELLOW)
+
+    @staticmethod
+    def _extract_evidence_types(f: dict) -> list[str]:
+        ev_types = set()
+        ev_raw = f.get("evidence", "")
+        if isinstance(ev_raw, list):
+            for ev in ev_raw:
+                if hasattr(ev, "evidence_type"):
+                    ev_types.add(ev.evidence_type.value if hasattr(ev.evidence_type, "value") else str(ev.evidence_type))
+                elif isinstance(ev, dict) and "evidence_type" in ev:
+                    ev_types.add(ev["evidence_type"])
+                else:
+                    ev_types.add(type(ev).__name__)
+        return sorted(ev_types)
 
     def generate(self, suffix: str | None = None) -> str:
         """

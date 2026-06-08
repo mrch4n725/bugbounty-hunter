@@ -658,9 +658,9 @@ expected_maturity = {
     "xss": 4, "sqli": 4, "ssrf": 4, "blind_xss": 4, "cmd_injection": 4,
     "xxe": 4, "authorization": 4, "ssti": 4, "headers": 4, "sensitive": 4,
     "lfi": 3, "open_redirect": 3, "exposed_files": 3, "graphql": 3,
-    "idor": 3, "clickjacking": 1, "csrf": 1, "http_methods": 1,
-    "insecure_forms": 1, "dirb": 1, "subdomain_takeover": 1,
-    "rate_limiting": 1, "openapi": 2,
+    "idor": 3,     "clickjacking": 1, "csrf": 1, "http_methods": 1,
+    "insecure_forms": 1, "dirb": 3, "subdomain_takeover": 1,
+    "rate_limiting": 3, "openapi": 2,
 }
 for scanner_name, expected in expected_maturity.items():
     cls = cls_map.get(scanner_name)

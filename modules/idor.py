@@ -18,7 +18,7 @@ from modules.utils import (
     build_role_sessions, get_role_session,
     safe_cookies_dict,
 )
-from models.evidence import AuthorizationComparisonEvidence, EvidenceStatus
+from models.evidence import AuthorizationComparisonEvidence, CompositeEvidence, EvidenceStatus
 
 # ── ID parameter patterns ──────────────────────────────────────────────────────
 
@@ -592,5 +592,31 @@ class IdorScanner(VulnScanner):
         self.scan_sequential_enum(findings, candidates)
         self.scan_encoded_id_manipulation(findings, candidates)
         self.verify_ownership(findings, candidates)
+
+        # Bundle evidence items per finding into CompositeEvidence
+        for fdict in findings:
+            ev_list = fdict.get("evidence", [])
+            if isinstance(ev_list, str):
+                ev_list = [ev_list]
+            if isinstance(ev_list, list) and len(ev_list) > 1:
+                child_descs = []
+                for ev in ev_list:
+                    if hasattr(ev, "description"):
+                        child_descs.append(ev.description)
+                    elif isinstance(ev, dict):
+                        child_descs.append(ev.get("description", str(ev)))
+                    else:
+                        child_descs.append(str(ev))
+                composite = CompositeEvidence(
+                    child_descriptions=child_descs,
+                    evidence_count=len(ev_list),
+                    description=f"Composite evidence: {len(ev_list)} items for {fdict.get('parameter', 'IDOR')}",
+                    status=EvidenceStatus.VERIFIED,
+                )
+                ev_list.append(composite)
+                fdict["evidence"] = ev_list
+                if hasattr(self, '_container') and self._container and self._container.evidence_engine:
+                    self._container.evidence_engine.store(composite)
+                    self._container.evidence_engine.link_to_finding(composite, fdict.get("fingerprint", ""))
 
         return self._deduplicate(findings)

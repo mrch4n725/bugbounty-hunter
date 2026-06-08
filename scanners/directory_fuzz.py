@@ -30,7 +30,7 @@ COMMON_DIRFUZZ_PATHS = [
 
 class DirectoryFuzzScanner(ScannerBase):
     SCANNER_NAME = "dirb"
-    SCANNER_MATURITY = 1
+    SCANNER_MATURITY = 3
     TARGET_LEVEL = True
     SCANNER_ORDER = 20
 
@@ -72,7 +72,7 @@ class DirectoryFuzzScanner(ScannerBase):
         resp = detection.raw_response
         if not resp:
             return []
-        return [
+        evidence = [
             ResponseExcerptEvidence(
                 excerpt=resp.text[:500],
                 length=len(resp.text),
@@ -80,6 +80,23 @@ class DirectoryFuzzScanner(ScannerBase):
                 description=f"Directory fuzz result at {detection.url}",
             ),
         ]
+        # Add response diff evidence showing the delta from baseline
+        if detection.context in ("directory_listing", "accessible_path"):
+            status = resp.status_code
+            baseline_excerpt = resp.text[:200]
+            triggered_excerpt = resp.text[:200]
+            evidence.append(
+                ResponseDiffEvidence(
+                    baseline_status=status,
+                    baseline_body_excerpt=baseline_excerpt,
+                    triggered_status=status,
+                    triggered_body_excerpt=triggered_excerpt,
+                    content_length_diff=len(resp.text),
+                    trigger_param="",
+                    description=f"Directory fuzz: {detection.url} returned HTTP {status} ({len(resp.text)} bytes)",
+                )
+            )
+        return evidence
 
     def generate_reproduction(self, detection: DetectionResult,
                               validation_result: ValidationResult | None = None) -> list[str]:

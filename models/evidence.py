@@ -15,6 +15,9 @@ class EvidenceType(str, enum.Enum):
     BROWSER_EXECUTION = "browser_execution"
     GRAPHQL_SCHEMA = "graphql_schema"
     AUTHORIZATION_COMPARISON = "authorization_comparison"
+    RESPONSE_DIFF = "response_diff"
+    COMMAND_EXECUTION = "command_execution"
+    COMPOSITE = "composite"
 
 
 class EvidenceStatus(str, enum.Enum):
@@ -329,6 +332,83 @@ class AuthorizationComparisonEvidence(EvidenceBase):
         self.target_body_excerpt = target_body_excerpt
 
 
+@dataclass
+class ResponseDiffEvidence(EvidenceBase):
+    baseline_status: int = 0
+    baseline_body_excerpt: str = ""
+    triggered_status: int = 0
+    triggered_body_excerpt: str = ""
+    content_length_diff: int = 0
+    trigger_param: str = ""
+
+    def __init__(self, baseline_status: int = 0,
+                 baseline_body_excerpt: str = "",
+                 triggered_status: int = 0,
+                 triggered_body_excerpt: str = "",
+                 content_length_diff: int = 0,
+                 trigger_param: str = "",
+                 description: str = "",
+                 status: EvidenceStatus = EvidenceStatus.COLLECTED):
+        super().__init__(
+            evidence_type=EvidenceType.RESPONSE_DIFF,
+            status=status,
+            description=description or f"Response diff: {baseline_status}→{triggered_status} ({content_length_diff:+d} bytes)",
+        )
+        self.baseline_status = baseline_status
+        self.baseline_body_excerpt = baseline_body_excerpt
+        self.triggered_status = triggered_status
+        self.triggered_body_excerpt = triggered_body_excerpt
+        self.content_length_diff = content_length_diff
+        self.trigger_param = trigger_param
+
+
+@dataclass
+class CommandExecutionEvidence(EvidenceBase):
+    command: str = ""
+    shell_chars_detected: list[str] = None
+    output_excerpt: str = ""
+    exit_code_observed: int = -1
+    timing_delay_ms: float = 0.0
+
+    def __init__(self, command: str = "",
+                 shell_chars_detected: list[str] = None,
+                 output_excerpt: str = "",
+                 exit_code_observed: int = -1,
+                 timing_delay_ms: float = 0.0,
+                 description: str = "",
+                 status: EvidenceStatus = EvidenceStatus.COLLECTED):
+        status_val = EvidenceStatus.VERIFIED if exit_code_observed >= 0 else status
+        char_str = ", ".join(shell_chars_detected) if shell_chars_detected else "timing"
+        super().__init__(
+            evidence_type=EvidenceType.COMMAND_EXECUTION,
+            status=status_val,
+            description=description or f"Command injection via {char_str}: exit={exit_code_observed}, delay={timing_delay_ms:.0f}ms",
+        )
+        self.command = command
+        self.shell_chars_detected = shell_chars_detected or []
+        self.output_excerpt = output_excerpt
+        self.exit_code_observed = exit_code_observed
+        self.timing_delay_ms = timing_delay_ms
+
+
+@dataclass
+class CompositeEvidence(EvidenceBase):
+    child_descriptions: list[str] = None
+    evidence_count: int = 0
+
+    def __init__(self, child_descriptions: list[str] = None,
+                 evidence_count: int = 0,
+                 description: str = "",
+                 status: EvidenceStatus = EvidenceStatus.COLLECTED):
+        super().__init__(
+            evidence_type=EvidenceType.COMPOSITE,
+            status=status,
+            description=description or f"Composite evidence: {len(child_descriptions or [])} items",
+        )
+        self.child_descriptions = child_descriptions or []
+        self.evidence_count = evidence_count
+
+
 EVIDENCE_CLASSES: dict[EvidenceType, type[EvidenceBase]] = {
     EvidenceType.HTTP_REQUEST: HttpRequestEvidence,
     EvidenceType.HTTP_RESPONSE: HttpResponseEvidence,
@@ -340,6 +420,9 @@ EVIDENCE_CLASSES: dict[EvidenceType, type[EvidenceBase]] = {
     EvidenceType.BROWSER_EXECUTION: BrowserExecutionEvidence,
     EvidenceType.GRAPHQL_SCHEMA: GraphQLSchemaEvidence,
     EvidenceType.AUTHORIZATION_COMPARISON: AuthorizationComparisonEvidence,
+    EvidenceType.RESPONSE_DIFF: ResponseDiffEvidence,
+    EvidenceType.COMMAND_EXECUTION: CommandExecutionEvidence,
+    EvidenceType.COMPOSITE: CompositeEvidence,
 }
 
 
