@@ -7,14 +7,14 @@ Lifecycle:
   EXPLOITABLE: (not applicable)
   VERIFIED:   (not applicable)
 
-Maturity: Level 2 (Detect + Validate)
+Maturity: Level 3 (Detect + Validate + typed evidence + reproduction)
 """
 
 from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
 )
-from scanners.base import ScannerBase
+from scanners.base import ScannerBase, DetectionResult, ValidationResult
 from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
 
 EXPOSED_FILES = [
@@ -30,7 +30,7 @@ EXPOSED_FILES = [
 
 class ExposedFilesScanner(ScannerBase):
     SCANNER_NAME = "exposed_files"
-    SCANNER_MATURITY = 2
+    SCANNER_MATURITY = 3
     TARGET_LEVEL = True
     SCANNER_ORDER = 20
 
@@ -66,51 +66,106 @@ class ExposedFilesScanner(ScannerBase):
             return any(body.lstrip().startswith(w) for w in ("-- ", "CREATE", "INSERT", "DROP", "ALTER", "SELECT"))
         return True
 
+    def detect(self, url: str, parameter: str | None = None) -> DetectionResult | None:
+        resp = safe_get(self.session, url, self.timeout, raise_for_status=False)
+        if not (resp and resp.status_code == 200):
+            return None
+        return DetectionResult(
+            url=url,
+            parameter="",
+            payload="200",
+            context="exposed_file",
+            raw_response=resp,
+            evidence_signals=[f"HTTP 200 — {len(resp.text)} bytes"],
+        )
+
+    def validate(self, detection: DetectionResult) -> ValidationResult | None:
+        resp = detection.raw_response
+        if not resp:
+            return ValidationResult(confirmed=False, method="content_validation", detail="No response body to validate")
+        path = detection.url.split(self.base_url)[-1] if self.base_url in detection.url else ""
+        body = resp.text
+        raw = resp.content
+        content_ok = self._validate_content(path, body, raw)
+        if content_ok:
+            return ValidationResult(confirmed=True, method="content_validation",
+                                    detail=f"Content validation passed for {path}")
+        return ValidationResult(confirmed=False, method="content_validation",
+                                detail=f"Content validation failed for {path} — may be a generic 200 response")
+
+    def collect_evidence(self, detection: DetectionResult,
+                         validation_result: ValidationResult | None = None) -> list:
+        resp = detection.raw_response
+        if not resp:
+            return []
+        return [
+            HttpRequestEvidence(
+                method="GET",
+                url=detection.url,
+                curl_command=_build_curl("GET", detection.url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+            ),
+            ResponseExcerptEvidence(
+                excerpt=resp.text[:500],
+                length=len(resp.text),
+                context="exposed_file",
+            ),
+        ]
+
+    def generate_reproduction(self, detection: DetectionResult,
+                              validation_result: ValidationResult | None = None) -> list[str]:
+        url = detection.url
+        if validation_result and validation_result.confirmed:
+            return [
+                f"Send GET request to {url}",
+                f"Observe: Sensitive file is publicly accessible (HTTP 200, content validated)",
+                "Sensitive files should not be publicly accessible",
+            ]
+        return [
+            f"Send GET request to {url}",
+            "Inspect the HTTP 200 response for exposed sensitive content",
+        ]
+
     def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+        self._prepare_scan()
         target_base = self.base_url
         for exposed_path in EXPOSED_FILES:
             try:
                 file_url = target_base + exposed_path
                 if not self._in_scope(file_url):
                     continue
-                resp = safe_get(self.session, file_url, self.timeout, raise_for_status=False)
-                if not (resp and resp.status_code == 200):
+
+                detection = self.detect(file_url)
+                if detection is None:
                     continue
-                body = resp.text
-                raw = resp.content
+
+                validation_result = self.validate(detection)
+                evidence_list = self.collect_evidence(detection, validation_result)
+                resp = detection.raw_response
+
+                for ev in evidence_list:
+                    self.evidence_engine.store(ev)
+
                 severity, details = self._file_metadata(exposed_path)
-                content_ok = self._validate_content(exposed_path, body, raw)
-                if not content_ok:
+                if not validation_result or not validation_result.confirmed:
                     severity = "info"
                     details += " (content check failed — may be a generic 200 response)"
-
-                req_ev = HttpRequestEvidence(
-                    method="GET",
-                    url=file_url,
-                    curl_command=_build_curl("GET", file_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
-                )
-                resp_ev = ResponseExcerptEvidence(
-                    excerpt=body[:500],
-                    length=len(body),
-                    context="exposed_file",
-                )
-                req_fp = self.evidence_engine.store(req_ev)
-                resp_fp = self.evidence_engine.store(resp_ev)
 
                 f = finding(
                     vuln_type="Exposed Sensitive File",
                     url=file_url,
                     severity=severity,
                     details=details,
-                    evidence=f"HTTP {resp.status_code} — {len(body)} bytes",
+                    evidence=f"HTTP {resp.status_code} — {len(resp.text)} bytes" if resp else "",
                     request=_build_curl("GET", file_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
-                    response_excerpt=body[:500],
-                    steps_to_reproduce=[f"Send request to {file_url}", f"Observe: {details[:100]}"],
-                    verification_stage=VerificationStage.VALIDATED.value,
+                    response_excerpt=resp.text[:500] if resp else "",
+                    steps_to_reproduce=self.generate_reproduction(detection, validation_result),
+                    verification_stage=VerificationStage.VALIDATED.value if (validation_result and validation_result.confirmed) else VerificationStage.DETECTED.value,
                 )
                 if f:
-                    self.evidence_engine.link_to_finding(req_ev, f.get("fingerprint", ""))
-                    self.evidence_engine.link_to_finding(resp_ev, f.get("fingerprint", ""))
+                    fingerprint = f.get("fingerprint", "")
+                    if fingerprint:
+                        for ev in evidence_list:
+                            self.evidence_engine.link_to_finding(ev, fingerprint)
                     self._add_finding(f)
                 log(f"  [EXPOSED] {file_url}", Colors.RED, verbose_only=True, verbose=self.verbose)
             except Exception:

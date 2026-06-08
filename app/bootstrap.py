@@ -7,11 +7,11 @@ from app.container import ApplicationContainer
 def bootstrap(config: dict[str, Any]) -> tuple[CapabilityRegistry, ApplicationContainer]:
     """Application startup sequence.
 
-    1. Detect system capabilities.
+    1. Detect system capabilities (seeds global singleton).
     2. Create the dependency injection container.
     3. Return both so the caller can print summaries and wire services.
     """
-    capabilities = CapabilityRegistry(config)
+    capabilities = CapabilityRegistry.get_global(config)
     container = ApplicationContainer(config, capabilities)
     return capabilities, container
 

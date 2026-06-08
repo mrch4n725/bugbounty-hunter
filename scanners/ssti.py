@@ -7,18 +7,22 @@ Lifecycle:
   EXPLOITABLE: Read-proof payload produced meaningful output
   VERIFIED:   (not applicable)
 
-Maturity: Level 3 (Detect + Validate + Exploit safe proof)
+Maturity: Level 4 (Full lifecycle — typed evidence, reproduction, confidence)
 """
 
 import re
 from typing import Any
 from urllib.parse import urlparse, parse_qs
 
+from models.evidence import (
+    HttpRequestEvidence,
+    ResponseExcerptEvidence,
+)
 from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
 )
-from scanners.base import ScannerBase, DetectionResult
+from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
 SSTI_PAYLOADS = {
     "arithmetic": [
@@ -64,7 +68,7 @@ SSTI_ENGINE_PATTERNS = {
 
 class SSTIScanner(ScannerBase):
     SCANNER_NAME = "ssti"
-    SCANNER_MATURITY = 3
+    SCANNER_MATURITY = 4
     TARGET_LEVEL = False
 
     @staticmethod
@@ -84,7 +88,7 @@ class SSTIScanner(ScannerBase):
             if not resp:
                 continue
             body = resp.text
-            arithmetic_possible = any(e in body for e in ["49", "14", "0"])
+            arithmetic_possible = any(e in body for e in ["49", "14"])
             raw_payload_absent = payload not in body
             if arithmetic_possible and raw_payload_absent:
                 return DetectionResult(
@@ -161,7 +165,44 @@ class SSTIScanner(ScannerBase):
             steps.append("Observe read-proof output indicating full server-side execution")
         return steps
 
+    def collect_evidence(self, detection: DetectionResult,
+                         validation: dict | None = None,
+                         exploitation: dict | None = None) -> list:
+        ev_list = []
+        resp = detection.raw_response
+        if resp:
+            ev_list.append(HttpRequestEvidence(
+                method="GET",
+                url=detection.url,
+                curl_command=_build_curl("GET", detection.url, dict(self.session.headers),
+                                         cookies=dict(self.session.cookies)),
+                description=f"SSTI detection probe: {detection.payload}",
+            ))
+            ev_list.append(ResponseExcerptEvidence(
+                excerpt=resp.text[:500],
+                length=len(resp.text),
+                context=detection.context,
+                description=f"SSTI detection response ({detection.context})",
+            ))
+        if validation and validation.get("confirmed"):
+            ev_list.append(ResponseExcerptEvidence(
+                excerpt=f"Engine fingerprinted: {validation.get('engine', 'unknown')} | Method: {validation.get('method', '')}",
+                length=0,
+                context="engine_fingerprint",
+                description=f"SSTI validation: {validation.get('engine', 'unknown')} engine",
+            ))
+        if exploitation and exploitation.get("confirmed"):
+            proof = exploitation.get("proof", "")[:200]
+            ev_list.append(ResponseExcerptEvidence(
+                excerpt=proof,
+                length=len(proof),
+                context="read_proof",
+                description=f"SSTI exploitation proof: {proof[:80]}",
+            ))
+        return ev_list
+
     def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+        self._prepare_scan()
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
         for url in urls:
             if not self._in_scope(url):
@@ -194,6 +235,7 @@ class SSTIScanner(ScannerBase):
                         severity = "medium"
                         stage = VerificationStage.DETECTED.value
 
+                    evidence = self.collect_evidence(detection, validation, exploitation)
                     resp = detection.raw_response
                     engine_str = validation.get("engine", "") if validation else ""
                     f = finding(
@@ -209,6 +251,9 @@ class SSTIScanner(ScannerBase):
                         verification_stage=stage,
                     )
                     if f:
+                        for ev in evidence:
+                            self.evidence_engine.store(ev)
+                            self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
                         self._add_finding(f)
             except Exception as e:
                 log(f"  [SSTI] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)

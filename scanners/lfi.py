@@ -7,7 +7,7 @@ Lifecycle:
   EXPLOITABLE: (not applicable)
   VERIFIED:   (not applicable)
 
-Maturity: Level 2 (Detect + Validate)
+Maturity: Level 3 (Detect + Validate + typed evidence + reproduction)
 """
 
 from urllib.parse import urlparse, parse_qs
@@ -16,7 +16,7 @@ from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
 )
-from scanners.base import ScannerBase, DetectionResult
+from scanners.base import ScannerBase, DetectionResult, ValidationResult
 from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
 
 LFI_SIGNATURES = [
@@ -27,7 +27,7 @@ LFI_SIGNATURES = [
 
 class LFIScanner(ScannerBase):
     SCANNER_NAME = "lfi"
-    SCANNER_MATURITY = 2
+    SCANNER_MATURITY = 3
     TARGET_LEVEL = False
 
     def __init__(self, config: dict, recon: dict, container=None):
@@ -62,7 +62,9 @@ class LFIScanner(ScannerBase):
     def detect(self, url: str, parameter: str) -> DetectionResult | None:
         payloads = self._get_payloads()
         baseline_resp = safe_get(self.session, url, self.timeout)
-        baseline_body = baseline_resp.text if baseline_resp else ""
+        if baseline_resp is None:
+            return None
+        baseline_body = baseline_resp.text or ""
         for payload in payloads:
             try:
                 test_url = self._inject_param(url, parameter, payload)
@@ -91,6 +93,7 @@ class LFIScanner(ScannerBase):
         ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+        self._prepare_scan()
         raw_urls = self.recon.get("urls", []) if target_urls is None else target_urls
         for url in raw_urls:
             if "?" not in url or not self._in_scope(url):

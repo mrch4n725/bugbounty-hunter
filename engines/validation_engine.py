@@ -40,12 +40,31 @@ class ValidationEngine:
         self._capabilities = capabilities
         cfg_dict = config if isinstance(config, dict) else config.to_dict()
 
-        if capabilities and not capabilities.has("oob_validation"):
+        # Normalize capabilities to support both CapabilityRegistry and plain dict
+        def _has_cap(name: str) -> bool:
+            if capabilities is None:
+                return False
+            if hasattr(capabilities, "has"):
+                return capabilities.has(name)
+            if isinstance(capabilities, dict):
+                return capabilities.get(name, False)
+            return False
+
+        def _browser_available() -> bool:
+            if capabilities is None:
+                return False
+            if hasattr(capabilities, "browser_validation"):
+                return capabilities.browser_validation
+            if isinstance(capabilities, dict):
+                return capabilities.get("playwright", False) and capabilities.get("chromium", False)
+            return False
+
+        if not _has_cap("oob_validation"):
             self._oob = None
         else:
             self._oob = OOBDetectionFramework(cfg_dict)
 
-        if capabilities and not capabilities.browser_validation:
+        if not _browser_available():
             self._browser = None
         else:
             self._browser = BrowserValidator(cfg_dict)
@@ -92,6 +111,8 @@ class ValidationEngine:
                 description=f"OOB callback confirmed for {entry.get('vuln_type', 'unknown')} @ {entry.get('url', '')}",
                 status=EvidenceStatus.VERIFIED,
             )
+            # Store original target URL for finding creation
+            ev._original_url = entry.get("url", "")
             results.append(ev)
         return results
 

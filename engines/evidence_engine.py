@@ -26,11 +26,7 @@ class EvidenceEngine:
         Fingerprint is a SHA-256 of the evidence's serialized content
         (minus timestamp), enabling deduplication of identical evidence.
         """
-        d = evidence.to_dict()
-        d.pop("timestamp", None)
-        d.pop("id", None)
-        raw = evidence.__class__.__name__ + ":" + json.dumps(d, sort_keys=True, default=str)
-        fp = hashlib.sha256(raw.encode()).hexdigest()
+        fp = self._fingerprint(evidence)
         with self._lock:
             if fp not in self._fingerprints:
                 self._fingerprints[fp] = evidence
@@ -53,7 +49,7 @@ class EvidenceEngine:
     def export_for_finding(self, finding_id: str) -> list[dict[str, Any]]:
         """Export evidence for a finding as serializable dicts."""
         ev_list = self.get_evidence(finding_id)
-        return [e.to_dict() if hasattr(e, "to_dict") else {"raw": str(e)} for e in ev_list]
+        return [e.to_dict() for e in ev_list]
 
     def snapshot(self) -> dict[str, Any]:
         """Snapshot all evidence for resume persistence."""
@@ -71,8 +67,23 @@ class EvidenceEngine:
                     try:
                         ev = EvidenceBase.from_dict(d)
                         self._store.setdefault(fid, []).append(ev)
-                    except Exception:
-                        pass
+                        # Populate fingerprints for dedup after restore
+                        fp = self._fingerprint(ev)
+                        if fp not in self._fingerprints:
+                            self._fingerprints[fp] = ev
+                    except Exception as e:
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "EvidenceEngine.restore: skipped evidence %s: %s",
+                            d.get("evidence_type", "?"), e)
+
+    @staticmethod
+    def _fingerprint(evidence: EvidenceBase) -> str:
+        d = evidence.to_dict()
+        d.pop("timestamp", None)
+        d.pop("id", None)
+        raw = evidence.__class__.__name__ + ":" + json.dumps(d, sort_keys=True, default=str)
+        return hashlib.sha256(raw.encode()).hexdigest()
 
     def clear(self) -> None:
         with self._lock:

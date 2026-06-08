@@ -20,7 +20,7 @@ from modules.utils import (
     finding, log, Colors, _build_curl,
     VerificationStage,
 )
-from scanners.base import ScannerBase
+from scanners.base import ScannerBase, DetectionResult, ValidationResult
 from models.evidence import TimingEvidence
 
 HARDCODED_PATHS = [
@@ -83,6 +83,115 @@ class RateLimitingScanner(ScannerBase):
 
         return candidates
 
+    def _build_probe_data(self, form_fields: list) -> dict:
+        if form_fields:
+            probe_data = {}
+            for f in form_fields:
+                name = f.get("name", "")
+                ftype = f.get("type", "").lower()
+                if name.lower() in ("password", "passwd", "pass", "secret", "pin", "otp"):
+                    probe_data[name] = "Wr0ng_P4ss_probe!"
+                elif name.lower() in ("email", "username", "login"):
+                    probe_data[name] = "probe@ratelimit.test"
+                elif name.lower() in ("code", "token"):
+                    probe_data[name] = "000000"
+                else:
+                    probe_data[name] = f.get("value", "test")
+            return probe_data
+        return {
+            "username": "ratelimit_probe_user",
+            "password": "Wr0ng_P4ss_probe!",
+            "email": "probe@ratelimit.test",
+        }
+
+    def detect(self, url: str, parameter: str | None = None) -> DetectionResult | None:
+        return None
+
+    def detect_candidate(self, test_url: str, probe_data: dict) -> DetectionResult | None:
+        try:
+            base_resp = self.session.post(test_url, timeout=self.timeout, data={"baseline": "1"})
+            if base_resp.status_code in (404, 410):
+                return None
+        except Exception:
+            return None
+
+        _probe_cookies = dict(self.session.cookies)
+        _probe_headers = dict(self.session.headers)
+
+        def _probe(_idx: int, _url=test_url, _data=probe_data, _timeout=self.timeout,
+                   _cookies=_probe_cookies, _headers=_probe_headers) -> tuple[int, str]:
+            try:
+                import requests as _requests
+                delay = random.uniform(0.5, 1.5) if self.config.get("stealth") else max(0.05, self.config.get("delay", 0.0))
+                if delay:
+                    time.sleep(delay)
+                r = _requests.post(_url, data=_data, timeout=_timeout,
+                                   cookies=_cookies, headers=_headers, verify=False)
+                return (r.status_code, r.text[:500])
+            except Exception:
+                return (0, "")
+
+        results: list[tuple[int, str]] = []
+        start = time.time()
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            for status_code, body_snippet in pool.map(_probe, range(PROBE_COUNT)):
+                results.append((status_code, body_snippet))
+
+        elapsed = time.time() - start
+        statuses = [s for s, _ in results]
+        unique_statuses = set(statuses)
+        has_429 = 429 in unique_statuses
+        has_5xx = any(s >= 500 for s in unique_statuses)
+        first_body = results[0][1] if results else ""
+        body_changed = any(b != first_body for b in [b for _, b in results[1:]])
+
+        throttled = has_429 or (body_changed and not has_5xx)
+        if throttled:
+            return None
+
+        return DetectionResult(
+            url=test_url,
+            parameter="",
+            payload=f"{PROBE_COUNT}_probes",
+            context="missing_rate_limiting",
+            evidence_signals=[
+                f"Sent {PROBE_COUNT} POST requests in {elapsed:.1f}s. Statuses: {sorted(unique_statuses)}. No 429 received. Body changed: {body_changed}.",
+                f"elapsed_ms={elapsed * 1000:.0f}",
+            ],
+        )
+
+    def validate(self, detection: DetectionResult) -> ValidationResult | None:
+        return ValidationResult(confirmed=False, method="burst_analysis",
+                                detail=f"No rate limiting detected across {PROBE_COUNT} rapid requests")
+
+    def collect_evidence(self, detection: DetectionResult,
+                         validation_result: ValidationResult | None = None) -> list:
+        elapsed_ms = 0.0
+        for sig in detection.evidence_signals:
+            if sig.startswith("elapsed_ms="):
+                try:
+                    elapsed_ms = float(sig.split("=")[1])
+                except (ValueError, IndexError):
+                    pass
+        return [
+            TimingEvidence(
+                baseline_time_ms=0.0,
+                triggered_time_ms=elapsed_ms,
+                delay_threshold_ms=0.0,
+                total_attempts=PROBE_COUNT,
+                description=f"Rate limit burst: {PROBE_COUNT} POSTs in {elapsed_ms / 1000:.2f}s",
+            ),
+        ]
+
+    def generate_reproduction(self, detection: DetectionResult,
+                              validation_result: ValidationResult | None = None) -> list[str]:
+        return [
+            f"Send {PROBE_COUNT} rapid POST requests to {detection.url} in quick succession (with minimal delay between requests)",
+            f"None of the {PROBE_COUNT} requests returned HTTP 429 (rate limited) or showed throttling behavior",
+            "Without rate limiting, an attacker can perform brute-force password guessing, credential stuffing, or OTP enumeration at full speed",
+        ]
+
     def scan(self, target_urls: list[str] | None = None) -> list[dict]:
         candidates = self._build_candidates(target_urls)
         for candidate in candidates:
@@ -91,101 +200,44 @@ class RateLimitingScanner(ScannerBase):
                 continue
             form_fields = candidate["form_fields"]
             severity = candidate["severity"]
+            probe_data = self._build_probe_data(form_fields)
 
             try:
-                base_resp = self.session.post(test_url, timeout=self.timeout, data={"baseline": "1"})
-                if base_resp.status_code in (404, 410):
+                detection = self.detect_candidate(test_url, probe_data)
+                if detection is None:
                     continue
-            except Exception:
-                continue
 
-            if form_fields:
-                probe_data = {}
-                for f in form_fields:
-                    name = f.get("name", "")
-                    ftype = f.get("type", "").lower()
-                    if name.lower() in ("password", "passwd", "pass", "secret", "pin", "otp"):
-                        probe_data[name] = "Wr0ng_P4ss_probe!"
-                    elif name.lower() in ("email", "username", "login"):
-                        probe_data[name] = "probe@ratelimit.test"
-                    elif name.lower() in ("code", "token"):
-                        probe_data[name] = "000000"
-                    else:
-                        probe_data[name] = f.get("value", "test")
-            else:
-                probe_data = {
-                    "username": "ratelimit_probe_user",
-                    "password": "Wr0ng_P4ss_probe!",
-                    "email": "probe@ratelimit.test",
-                }
+                validation_result = self.validate(detection)
+                evidence_list = self.collect_evidence(detection, validation_result)
 
-            _probe_cookies = dict(self.session.cookies)
-            _probe_headers = dict(self.session.headers)
+                for ev in evidence_list:
+                    self.evidence_engine.store(ev)
 
-            def _probe(_idx: int, _url=test_url, _data=probe_data, _timeout=self.timeout,
-                       _cookies=_probe_cookies, _headers=_probe_headers) -> tuple[int, str]:
-                try:
-                    import requests as _requests
-                    delay = random.uniform(0.5, 1.5) if self.config.get("stealth") else max(0.05, self.config.get("delay", 0.0))
-                    if delay:
-                        time.sleep(delay)
-                    r = _requests.post(_url, data=_data, timeout=_timeout,
-                                       cookies=_cookies, headers=_headers, verify=False)
-                    return (r.status_code, r.text[:500])
-                except Exception:
-                    return (0, "")
+                response_excerpt = ""
+                for sig in detection.evidence_signals:
+                    if not sig.startswith("elapsed_ms="):
+                        response_excerpt = sig[:300]
+                        break
 
-            results: list[tuple[int, str]] = []
-            start = time.time()
-
-            with ThreadPoolExecutor(max_workers=5) as pool:
-                for status_code, body_snippet in pool.map(_probe, range(PROBE_COUNT)):
-                    results.append((status_code, body_snippet))
-
-            elapsed = time.time() - start
-            statuses = [s for s, _ in results]
-            unique_statuses = set(statuses)
-            has_429 = 429 in unique_statuses
-            has_5xx = any(s >= 500 for s in unique_statuses)
-            first_body = results[0][1] if results else ""
-            body_changed = any(b != first_body for b in [b for _, b in results[1:]])
-
-            timing_ev = TimingEvidence(
-                baseline_time_ms=0.0,
-                triggered_time_ms=elapsed * 1000,
-                delay_threshold_ms=0.0,
-                total_attempts=PROBE_COUNT,
-                description=f"Rate limit burst: {PROBE_COUNT} POSTs in {elapsed:.2f}s",
-            )
-            self.evidence_engine.store(timing_ev)
-
-            throttled = has_429 or (body_changed and not has_5xx)
-            if not throttled:
                 f = finding(
                     vuln_type="Missing Rate Limiting",
                     url=test_url,
                     severity=severity,
-                    details=f"Endpoint accepted {PROBE_COUNT} POST requests in {elapsed:.1f}s without rate limiting",
-                    evidence=f"Sent {PROBE_COUNT} POST requests. Statuses: {sorted(unique_statuses)}. No 429 received. Body changed: {body_changed}.",
+                    details=f"Endpoint accepted {PROBE_COUNT} POST requests without rate limiting",
+                    evidence=detection.evidence_signals[0] if detection.evidence_signals else "",
                     request=_build_curl("POST", test_url, dict(self.session.headers), data=probe_data),
-                    response_excerpt=f"Sample response (req 1 of {PROBE_COUNT}): {results[0][1][:300]}" if results else "",
-                    steps_to_reproduce=[
-                        f"Send {PROBE_COUNT} rapid POST requests to {test_url}",
-                        "Observe no 429 or throttling response",
-                        "Brute-force or credential stuffing attack possible",
-                    ],
+                    response_excerpt=response_excerpt,
+                    steps_to_reproduce=self.generate_reproduction(detection, validation_result),
                     verification_stage=VerificationStage.DETECTED.value,
                 )
                 if f:
-                    self.evidence_engine.link_to_finding(timing_ev, f.get("fingerprint", ""))
+                    fingerprint = f.get("fingerprint", "")
+                    if fingerprint:
+                        for ev in evidence_list:
+                            self.evidence_engine.link_to_finding(ev, fingerprint)
                     self._add_finding(f)
-                log(f"  [RATE LIMITING] {test_url} — no 429 in {elapsed:.1f}s",
+                log(f"  [RATE LIMITING] {test_url} — no 429",
                     Colors.RED, verbose_only=True, verbose=self.verbose)
-            elif has_429:
-                log(f"  [RATE LIMITING] {test_url} — rate limited (429 present)",
-                    Colors.GREEN, verbose_only=True, verbose=self.verbose)
-            elif body_changed:
-                log(f"  [RATE LIMITING] {test_url} — body changed (throttling suspected)",
-                    Colors.YELLOW, verbose_only=True, verbose=self.verbose)
-
+            except Exception:
+                continue
         return self._get_findings()

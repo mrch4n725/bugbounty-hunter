@@ -91,18 +91,22 @@ class Reporter:
             if self.config.get("group_by_root_cause", False):
                 group_by_root_cause(reporter.findings)
 
-            report_content = reporter.render()
+            result = reporter.render()
             file_extension = {
                 'html': 'html', 'json': 'json', 'txt': 'txt',
                 'hackerone': 'md', 'bugcrowd': 'md', 'chatgpt': 'md',
             }.get(self.report_format)
 
             if self.report_format == 'markdown-report':
-                return report_content  # returns directory path
+                return result  # returns directory path
 
-            file_path = reporter._get_report_path(file_extension, suffix)
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(report_content)
+            # ChatGPTReporter.render() writes its own file and returns the path
+            if self.report_format == 'chatgpt':
+                file_path = result
+            else:
+                file_path = reporter._get_report_path(file_extension, suffix)
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(result)
 
             log(f"  [Report] {self.report_format.upper()} report written to {file_path}",
                 Colors.GREEN)

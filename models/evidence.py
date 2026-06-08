@@ -350,4 +350,9 @@ def evidence_from_dict(d: dict[str, Any]) -> EvidenceBase:
     kwargs.pop("evidence_type", None)
     if "status" in kwargs and isinstance(kwargs["status"], str):
         kwargs["status"] = EvidenceStatus(kwargs["status"])
-    return cls(**kwargs)
+    # Subclass __init__ may not accept timestamp; set after construction
+    timestamp = kwargs.pop("timestamp", "")
+    obj = cls(**kwargs)
+    if timestamp:
+        obj.timestamp = timestamp
+    return obj

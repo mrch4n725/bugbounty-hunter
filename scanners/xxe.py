@@ -14,8 +14,8 @@ from modules.utils import (
     safe_post, finding, log, Colors, _build_curl,
     VerificationStage,
 )
-from scanners.base import ScannerBase
-from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence, OOBCallbackEvidence
+from scanners.base import ScannerBase, DetectionResult, ValidationResult
+from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
 
 XXE_PAYLOADS = {
     "in_band": [
@@ -52,7 +52,92 @@ class XXEScanner(ScannerBase):
         super().__init__(config, recon, container=container)
         self._oob_registrations: list[tuple[str, str, str]] = []
 
+    # ── Detection phase ─────────────────────────────────────────────────
+
+    def detect(self, url: str, parameter: str | None = None) -> DetectionResult | None:
+        xml_headers = {"Content-Type": "application/xml"}
+        xxe_payloads = self._load_payloads("xxe")
+
+        for payload in xxe_payloads.get("in_band", XXE_PAYLOADS.get("in_band", [])):
+            try:
+                resp = safe_post(self.session, url, payload, self.timeout, headers=xml_headers)
+                if not resp:
+                    continue
+                body = resp.text
+                for sig in XXE_SIGNATURES:
+                    if sig in body:
+                        return DetectionResult(
+                            url=url,
+                            parameter="POST body",
+                            payload=payload,
+                            context=f"in_band:{sig}",
+                            raw_response=resp,
+                            evidence_signals=[f"in_band:{sig}"],
+                        )
+            except Exception:
+                continue
+
+        for payload in xxe_payloads.get("error_based", XXE_PAYLOADS.get("error_based", [])):
+            try:
+                resp = safe_post(self.session, url, payload, self.timeout, headers=xml_headers)
+                if not resp:
+                    continue
+                body = resp.text
+                for sig in XXE_SIGNATURES:
+                    if sig in body:
+                        return DetectionResult(
+                            url=url,
+                            parameter="POST body",
+                            payload=payload,
+                            context=f"error:{sig}",
+                            raw_response=resp,
+                            evidence_signals=[f"error:{sig}"],
+                        )
+            except Exception:
+                continue
+
+        return None
+
+    def validate(self, detection: DetectionResult) -> ValidationResult | None:
+        from scanners.base import ValidationResult
+        return ValidationResult(
+            confirmed=True,
+            signals=detection.evidence_signals,
+            method=detection.context.split(":")[0],
+            detail=detection.context,
+        )
+
+    def collect_evidence(self, detection: DetectionResult,
+                         validation_result: ValidationResult | None = None) -> list:
+        ev_list = []
+        resp = detection.raw_response
+        if resp:
+            req_ev = HttpRequestEvidence(
+                method="POST",
+                url=detection.url,
+                curl_command=_build_curl("POST", detection.url, dict(self.session.headers), data=detection.payload, cookies=dict(self.session.cookies)),
+            )
+            resp_ev = ResponseExcerptEvidence(
+                excerpt=resp.text[:500],
+                length=len(resp.text),
+                context="xxe_detection",
+            )
+            ev_list.extend([req_ev, resp_ev])
+        return ev_list
+
+    def generate_reproduction(self, detection: DetectionResult,
+                              validation_result: ValidationResult | None = None) -> list[str]:
+        sig = detection.context.split(":")[1] if ":" in detection.context else detection.context
+        return [
+            f"Send POST request to {detection.url} with Content-Type: application/xml and an XXE payload containing an external entity",
+            f"Observe in response: {sig!r} — file content returned from server-side entity resolution",
+            "This confirms the XML parser processes external entities without restriction",
+        ]
+
+    # ── Scan entry point ────────────────────────────────────────────────
+
     def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+        self._prepare_scan()
         oob_host = self.validation.callback_host if self.validation else ""
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
         xml_headers = {"Content-Type": "application/xml"}
@@ -62,78 +147,38 @@ class XXEScanner(ScannerBase):
             if not self._in_scope(url):
                 continue
             signals = {"in_band": False, "error": False}
-            evidence_parts = []
 
-            for payload in xxe_payloads.get("in_band", XXE_PAYLOADS.get("in_band", [])):
-                try:
-                    resp = safe_post(self.session, url, payload, self.timeout, headers=xml_headers)
-                    if not resp:
-                        continue
-                    body = resp.text
-                    for sig in XXE_SIGNATURES:
-                        if sig in body:
-                            signals["in_band"] = True
-                            evidence_parts.append(f"in_band:{sig}")
-                            req_ev = HttpRequestEvidence(method="POST", url=url, curl_command=_build_curl("POST", url, dict(self.session.headers), data=payload, cookies=dict(self.session.cookies)))
-                            resp_ev = ResponseExcerptEvidence(excerpt=body[:500], length=len(body), context="xxe_in_band")
-                            self.evidence_engine.store(req_ev)
-                            self.evidence_engine.store(resp_ev)
-                            f = finding(
-                                vuln_type="XML External Entity (XXE) Injection",
-                                url=url, severity="critical",
-                                details="In-band XXE: file content returned in response via XML entity",
-                                evidence=f"Signature: {sig!r}",
-                                request=_build_curl("POST", url, dict(self.session.headers), data=payload, cookies=dict(self.session.cookies)),
-                                response_excerpt=body[:500],
-                                steps_to_reproduce=[f"Send POST request to {url} with XXE payload", f"Observe: {sig}"],
-                                verification_stage=VerificationStage.VALIDATED.value,
-                            )
-                            if f:
-                                self.evidence_engine.link_to_finding(req_ev, f.get("fingerprint", ""))
-                                self.evidence_engine.link_to_finding(resp_ev, f.get("fingerprint", ""))
-                                self._add_finding(f)
-                            log(f"  [XXE] In-band {url}", Colors.RED, verbose_only=True, verbose=self.verbose)
-                            break
-                    if signals["in_band"]:
-                        break
-                except Exception:
-                    continue
+            detection = self.detect(url)
+            if detection is not None:
+                validation_result = self.validate(detection)
+                evidence_list = self.collect_evidence(detection, validation_result)
+                is_error = detection.context.startswith("error")
+                signals["error" if is_error else "in_band"] = True
 
-            if not signals["in_band"]:
-                for payload in xxe_payloads.get("error_based", XXE_PAYLOADS.get("error_based", [])):
-                    try:
-                        resp = safe_post(self.session, url, payload, self.timeout, headers=xml_headers)
-                        if not resp:
-                            continue
-                        body = resp.text
-                        for sig in XXE_SIGNATURES:
-                            if sig in body:
-                                signals["error"] = True
-                                evidence_parts.append(f"error:{sig}")
-                                f = finding(
-                                    vuln_type="XML External Entity (XXE) Injection",
-                                    url=url, severity="critical",
-                                    details="Error-based XXE: file content leaked via parser error message",
-                                    evidence=f"Signature: {sig!r}",
-                                    request=_build_curl("POST", url, dict(self.session.headers), data=payload, cookies=dict(self.session.cookies)),
-                                    response_excerpt=body[:500],
-                                    steps_to_reproduce=[f"Send POST request to {url} with XXE payload", f"Observe: {sig}"],
-                                    verification_stage=VerificationStage.VALIDATED.value,
-                                )
-                                if f:
-                                    self._add_finding(f)
-                                log(f"  [XXE Error] {url}", Colors.RED, verbose_only=True, verbose=self.verbose)
-                                break
-                        if signals["error"]:
-                            break
-                    except Exception:
-                        continue
+                for ev in evidence_list:
+                    self.evidence_engine.store(ev)
+
+                f = finding(
+                    vuln_type="XML External Entity (XXE) Injection",
+                    url=url, severity="critical",
+                    details="In-band XXE: file content returned in response via XML entity" if not is_error
+                            else "Error-based XXE: file content leaked via parser error message",
+                    evidence=f"Signature: {detection.evidence_signals[0] if detection.evidence_signals else ''}",
+                    request=_build_curl("POST", url, dict(self.session.headers), data=detection.payload, cookies=dict(self.session.cookies)),
+                    response_excerpt=detection.raw_response.text[:500] if detection.raw_response else "",
+                    steps_to_reproduce=self.generate_reproduction(detection, validation_result),
+                    verification_stage=VerificationStage.VALIDATED.value,
+                )
+                if f:
+                    for ev in evidence_list:
+                        self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
+                    self._add_finding(f)
+                log(f"  [XXE{' Error' if is_error else ''}] {url}", Colors.RED, verbose_only=True, verbose=self.verbose)
 
             if oob_host and not signals["in_band"] and not signals["error"]:
                 for payload in xxe_payloads.get("oob", XXE_PAYLOADS.get("oob", [])):
                     try:
-                        oob_payload = oob_host
-                        formatted = payload.replace("{oob}", f"{self.validation.generate_oob_payload()}.{oob_host}" if hasattr(self.validation, "generate_oob_payload") else f"x.{oob_host}")
+                        formatted = payload.replace("{oob}", self.validation.callback_host) if self.validation else payload.replace("{oob}", "x.oob")
                         safe_post(self.session, url, formatted, self.timeout, headers=xml_headers, raise_for_status=False)
                         self.validation.register_oob("xxe", formatted, url)
                         self._oob_registrations.append(("xxe", formatted, url))
@@ -164,9 +209,9 @@ class XXEScanner(ScannerBase):
                 verification_stage=VerificationStage.VERIFIED.value,
                 response_excerpt="(XXE confirmed via out-of-band callback — XML parser made external request)",
                 steps_to_reproduce=[
-                    f"Send XXE payload to {url_str}",
-                    "Observe OOB callback — confirms XML external entity processing",
-                    "Use XXE to read local files or access internal services",
+                    f"Send POST request to {url_str} with Content-Type: application/xml and an OOB XXE payload pointing to an attacker-controlled host",
+                    "Observe OOB callback — the XML parser made an external request, confirming blind XXE",
+                    f"Escalate: use XXE to read local files via parameter entities (file:///etc/passwd) or SSRF to internal services",
                 ],
             )
             if f:

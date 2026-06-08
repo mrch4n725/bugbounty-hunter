@@ -6,6 +6,13 @@ from reporting.base import ReporterBase
 
 
 class BugcrowdReporter(ReporterBase):
+    @staticmethod
+    def _get_confidence_reasons_bc(f: Any) -> str:
+        reasons = f.get("confidence_reasons")
+        if not reasons or not isinstance(reasons, list) or len(reasons) == 0:
+            return ""
+        return "; ".join(reasons)
+
     def render(self) -> str:
         now = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
 
@@ -14,7 +21,7 @@ class BugcrowdReporter(ReporterBase):
             sev = f.get("severity", "info").upper()
             title = f.get("title") or f.get("details", "Untitled")
             url = f.get("url", self.target)
-            stage = f.get("verification_stage", "").title() or "Detected"
+            stage = (f.get("verification_stage", "").replace("_", " ").title()) or "Detected"
             confidence = f.get("confidence_score")
             cs = f"{confidence:.0f}/100" if confidence is not None else "—"
             cvss_score = self._get_cvss_score(f)
@@ -24,6 +31,8 @@ class BugcrowdReporter(ReporterBase):
         summary_header = "| # | Title | Severity | URL | Stage | Confidence | CVSS |"
         summary_sep = "|---|-------|----------|-----|-------|------------|------|"
         summary_table = "\n".join(summary_rows) if summary_rows else "| No findings. |"
+
+        root_cause_section = self._render_root_cause_sections_md()
 
         per_finding = []
         for i, f in enumerate(self.findings, 1):
@@ -127,12 +136,13 @@ class BugcrowdReporter(ReporterBase):
 |-------|-------|
 | Severity | {sev} |
 | URL | `{f.get('url', self.target)}` |
-| Verification Stage | {f.get('verification_stage', '').title() or 'Detected'} |
+ | Verification Stage | {f.get('verification_stage', '').replace('_', ' ').title() or 'Detected'} |
 | Confidence | {cs} |
 | CVSS | {cvss_score:.1f} ({cvss_rating}) |
 | CVSS Vector | `{cvss_vector}` |
 | Parameter | `{f.get('parameter', '—')}` |
 | False Positive Risk | {f.get('false_positive_risk', '—')} |
+| Confidence Reasons | {self._get_confidence_reasons_bc(f) or '—'} |
 
 ### Description
 {what}
@@ -154,6 +164,8 @@ class BugcrowdReporter(ReporterBase):
 ### Impact
 {impact_narrative}
 
+{self._format_structured_impact(f)}
+
 ### Remediation
 {remed}
 
@@ -162,12 +174,17 @@ class BugcrowdReporter(ReporterBase):
 
         body = "\n".join(per_finding) if per_finding else "No vulnerabilities detected."
 
+        exec_summary = self._build_executive_summary()
+
         return f"""# Bugcrowd Submission: {self.target}
 
 **Generated:** {now}
 **Tool:** BugBounty-Hunter
 **Total Findings:** {len(self.findings)}
 
+{exec_summary}
+
+{root_cause_section}
 ## Finding Summary
 
 {summary_header}

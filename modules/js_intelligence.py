@@ -15,14 +15,6 @@ from urllib.parse import urljoin, urlparse
 
 from modules.utils import SecretValidator
 
-# Install esprima (pip install esprima) for AST-based parsing.
-# Regex fallback is used automatically when esprima is absent.
-try:
-    import esprima
-    _ESPRIMA_AVAILABLE = True
-except ImportError:
-    _ESPRIMA_AVAILABLE = False
-
 
 SECRET_SEVERITY = {
     "AWS Access Key": "critical", "AWS Secret Key": "critical",
@@ -162,7 +154,7 @@ class JSIntelligence:
         if container and container.capabilities:
             self._ast_available = container.capabilities.has("esprima")
         else:
-            self._ast_available = _ESPRIMA_AVAILABLE
+            self._ast_available = False
 
     def _fingerprint(self, secret_type: str, value: str) -> str:
         return hashlib.sha256(f"{secret_type}:{value}".encode()).hexdigest()

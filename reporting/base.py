@@ -1,4 +1,5 @@
 import hashlib
+import html
 import json
 import os
 import re
@@ -8,6 +9,8 @@ from typing import Any, Dict, List, Optional, Union
 
 from modules.utils import log, Colors, _build_curl
 from models.finding import Finding
+from engines.root_cause import RootCauseAggregator, RootCauseGroup
+from engines.evidence_validator import EvidenceCompletenessValidator
 
 
 CVSS_BY_SEVERITY: Dict[str, float] = {
@@ -185,7 +188,7 @@ def assess_finding_impact(finding: Union[Dict[str, Any], Finding]) -> Union[Dict
             matrix_entry = IMPACT_MATRIX[key]
             break
     if not matrix_entry:
-        finding_type = (finding.get("type") or "").lower()
+        finding_type = (finding.get("vuln_type") or "").lower()
         for key in IMPACT_MATRIX:
             if finding_type.startswith(key) or key in finding_type:
                 matrix_entry = IMPACT_MATRIX[key]
@@ -283,7 +286,12 @@ class ReporterBase:
         # Enrich with evidence-engine linked evidence
         enriched = self._enrich_finding_evidence(normalized)
         # Apply impact assessment (mutates finding in-place for dict-compat fields)
-        self.findings: list[Finding] = [assess_finding_impact(f) for f in enriched]
+        impacted: list[Finding] = [assess_finding_impact(f) for f in enriched]
+        # Evidence completeness validation — catches weak findings
+        self.findings: list[Finding] = EvidenceCompletenessValidator.validate_all(impacted)
+        # Root-cause aggregation
+        aggregator = RootCauseAggregator(config)
+        self.root_cause_groups: list[RootCauseGroup] = aggregator.aggregate(self.findings)
         self.recon_data = recon_data or {}
         self.js_data = js_data or {}
         self.target = config.get('target', 'target')
@@ -353,7 +361,8 @@ class ReporterBase:
         return counts
 
     def _get_confirmed_counts(self) -> Dict[str, int]:
-        c = sum(1 for f in self.findings if f.get("confirmed"))
+        confirmed_stages = {"verified", "exploitable", "validated"}
+        c = sum(1 for f in self.findings if f.get("verification_stage", "").lower() in confirmed_stages)
         return {"confirmed": c, "unconfirmed": len(self.findings) - c}
 
     def _get_confidence_breakdown(self) -> Dict[str, int]:
@@ -373,12 +382,28 @@ class ReporterBase:
         return counts
 
     def _get_verification_breakdown(self) -> Dict[str, int]:
-        counts: Dict[str, int] = {"detected": 0, "validated": 0, "exploitable": 0}
+        counts: Dict[str, int] = {"detected": 0, "partially_validated": 0, "validated": 0, "exploitable": 0, "verified": 0}
         for f in self.findings:
             stage = f.get("verification_stage", "detected").lower()
             if stage in counts:
                 counts[stage] += 1
         return counts
+
+    def _get_historical_breakdown(self) -> dict[str, int]:
+        counts: dict[str, int] = {
+            "new": 0, "previously_seen": 0, "regressed": 0,
+            "resolved": 0, "improved": 0, "degraded": 0,
+        }
+        for f in self.findings:
+            hist = f.get("historical", {}) if isinstance(f, dict) else getattr(f, "historical", {})
+            cls = hist.get("classification", "") if isinstance(hist, dict) else ""
+            if cls in counts:
+                counts[cls] += 1
+        return counts
+
+    def _has_history(self) -> bool:
+        return bool(self._get_historical_breakdown().get("previously_seen", 0) +
+                    self._get_historical_breakdown().get("regressed", 0))
 
     def _get_affected_component(self, url: str) -> str:
         cleaned = url.split("?")[0].split("#")[0]
@@ -435,7 +460,7 @@ class ReporterBase:
         for attr in ('impact_assessment', 'confirmed', 'priority_score',
                      'group_severity', 'group_verification_stage', 'group_confidence',
                      'component', 'request_response', 'what_is_it', 'grouped_urls',
-                     'business_impact', 'demonstrated_impact'):
+                     'business_impact', 'demonstrated_impact', 'historical'):
             if hasattr(f, attr):
                 val = getattr(f, attr)
                 if val is not None and val != "":
@@ -456,6 +481,78 @@ class ReporterBase:
             lines = lines[:max_lines] + ["... (truncated)"]
         return "\n".join(lines)
 
+    def _build_executive_summary(self) -> str:
+        sev = self._get_severity_counts()
+        ver = self._get_verification_breakdown()
+        conf = self._get_confidence_breakdown()
+        hist = self._get_historical_breakdown()
+        total = len(self.findings)
+
+        # Top 3 most severe exploitable findings
+        sorted_f = sorted(
+            [f for f in self.findings if f.get("severity", "info").lower() in ("critical", "high")],
+            key=lambda x: -(x.get("confidence_score", 0) or 0)
+        )
+        top_lines = []
+        for f in sorted_f[:3]:
+            title = f.get("title", "Finding")
+            url = f.get("url", "")
+            stage = f.get("verification_stage", "detected").replace("_", " ").title()
+            score = f.get("confidence_score", 0)
+            top_lines.append(f"- [{f.get('severity', 'INFO').upper()}] {title} @ {url} ({stage}, {score:.0f}/100)")
+
+        top_text = "\n".join(top_lines) if top_lines else "  None"
+        verified = ver.get("verified", 0)
+        exploitable = ver.get("exploitable", 0)
+
+        history_line = ""
+        if any(v > 0 for v in hist.values()):
+            parts = []
+            if hist.get("new", 0):
+                parts.append(f"New: {hist['new']}")
+            if hist.get("previously_seen", 0):
+                parts.append(f"Previously Seen: {hist['previously_seen']}")
+            if hist.get("regressed", 0):
+                parts.append(f"Regressed: {hist['regressed']}")
+            if hist.get("improved", 0):
+                parts.append(f"Improved: {hist['improved']}")
+            if hist.get("degraded", 0):
+                parts.append(f"Degraded: {hist['degraded']}")
+            if hist.get("resolved", 0):
+                parts.append(f"Resolved: {hist['resolved']}")
+            if parts:
+                history_line = f"Historical: {' | '.join(parts)}\n"
+
+        return (
+            f"Executive Summary\n"
+            f"{'=' * 60}\n"
+            f"Target: {self.target}\n"
+            f"Scan Date: {self.timestamp}\n"
+            f"Total Findings: {total}\n"
+            f"Severity: Critical {sev.get('critical',0)} | High {sev.get('high',0)} | "
+            f"Medium {sev.get('medium',0)} | Low {sev.get('low',0)} | Info {sev.get('info',0)}\n"
+            f"Verification: Verified {verified} | Exploitable {exploitable} | "
+            f"Validated {ver.get('validated',0)} | Partially Validated {ver.get('partially_validated',0)} | "
+            f"Detected {ver.get('detected',0)}\n"
+            f"Confidence: Confirmed {conf.get('confirmed',0)} | High {conf.get('high',0)} | "
+            f"Likely {conf.get('likely',0)} | Unverified {conf.get('unverified',0)}\n"
+            f"{history_line}"
+            f"Top Critical/High Findings:\n{top_text}\n"
+        )
+
+    def _format_structured_impact(self, f: Any) -> str:
+        ia = f.get("impact_assessment", {})
+        if not ia:
+            return ""
+        parts = [
+            f"Data Exposure: {ia.get('data_exposure', {}).get('label', 'N/A')}",
+            f"ATO Potential: {ia.get('account_takeover_potential', {}).get('label', 'N/A')}",
+            f"RCE Potential: {ia.get('rce_potential', {}).get('label', 'N/A')}",
+        ]
+        if ia.get("demonstrated_impact"):
+            parts.append(f"Demonstrated: {ia['demonstrated_impact']}")
+        return " | ".join(parts)
+
     def _build_curl_command(self, finding: Dict[str, Any]) -> str:
         req = finding.get("request", "")
         if req.startswith("curl"):
@@ -471,9 +568,14 @@ class ReporterBase:
         url = finding.get("url", "the affected endpoint")
         param = finding.get("parameter", "")
         evidence = finding.get("evidence", "")
+        if isinstance(evidence, list):
+            evidence = " ".join(str(e) for e in evidence)
 
         if impact:
-            return impact.format(url=url, parameter=param, evidence=evidence)
+            try:
+                return impact.format(url=url, parameter=param, evidence=evidence)
+            except KeyError:
+                pass
 
         vuln_type = (finding.get("title") or "").lower()
         biz_impact = ""
@@ -520,7 +622,7 @@ class ReporterBase:
         for key in REMEDIATION_MATRIX:
             if key in vuln_type:
                 return REMEDIATION_MATRIX[key]
-        finding_type = (finding.get("type") or "").lower()
+        finding_type = (finding.get("vuln_type") or "").lower()
         for key in REMEDIATION_MATRIX:
             if key in finding_type:
                 return REMEDIATION_MATRIX[key]
@@ -549,6 +651,99 @@ class ReporterBase:
     def _verification_badge_html(self, stage: Optional[str]) -> str:
         if not stage:
             return '<span style="color:#95a5a6">—</span>'
-        colors = {"detected": "#e74c3c", "validated": "#f39c12", "exploitable": "#2ecc71"}
+        colors = {"detected": "#e74c3c", "partially_validated": "#9b59b6", "validated": "#f39c12", "exploitable": "#2ecc71", "verified": "#27ae60"}
         color = colors.get(stage.lower(), "#95a5a6")
-        return f'<span style="color:{color};font-weight:bold">{stage.title()}</span>'
+        label = stage.replace("_", " ").title()
+        return f'<span style="color:{color};font-weight:bold">{label}</span>'
+
+    # ── Root Cause Aggregation Utilities ─────────────────────────────────
+
+    def root_cause_groups_to_dicts(self) -> list[Dict[str, Any]]:
+        """Convert RootCauseGroup objects to serializable dicts."""
+        return [g.to_dict() for g in self.root_cause_groups]
+
+    def _rc_group_severity_color(self, severity: str) -> str:
+        return self.SEVERITY_COLORS.get(severity, '#95a5a6')
+
+    def _rc_group_severity_badge_html(self, severity: str) -> str:
+        return f'<span class="sev-badge sev-{severity}" style="background:{self.SEVERITY_COLORS.get(severity, "#95a5a6")}">{severity.upper()}</span>'
+
+    def _render_root_cause_sections_html(self) -> str:
+        """Render root cause aggregation sections for HTML reports.
+        Returns HTML string to insert before individual findings.
+        """
+        if not self.root_cause_groups or len(self.root_cause_groups) <= 1:
+            return ""
+        parts = ['<section id="root-causes">',
+                 '<h2>Root Cause Summary</h2>',
+                 '<p class="text2" style="margin-bottom:16px">Findings grouped by shared root cause — '
+                 f'{len(self.root_cause_groups)} root causes across {len(self.findings)} findings.</p>']
+        for group in self.root_cause_groups:
+            color = self._rc_group_severity_color(group.severity)
+            parts.append(f'<div class="finding-card {group.severity}" style="margin-bottom:16px">')
+            parts.append('<div class="finding-header">')
+            parts.append(f'<span class="finding-title" style="border-left:3px solid {color};padding-left:8px">{html.escape(group.root_cause)}</span>')
+            parts.append('<span class="finding-meta">')
+            parts.append(self._rc_group_severity_badge_html(group.severity))
+            parts.append(f'<span class="conf-badge conf-high" style="background:{color};color:#fff">{group.count} findings</span>')
+            parts.append(f'<span class="stage-badge">{len(group.affected_endpoints)} endpoints</span>')
+            parts.append('</span></div>')
+            parts.append('<div class="finding-body">')
+            parts.append(f'<div class="row"><strong>Root Cause:</strong> {html.escape(group.root_cause)}</div>')
+            parts.append(f'<div class="row"><strong>Confidence:</strong> {group.confidence:.0f}/100</div>')
+            parts.append(f'<div class="row"><strong>Evidence:</strong> {html.escape(group.evidence_summary)}</div>')
+            parts.append(f'<div class="row"><strong>Vulnerability Types:</strong> {", ".join(html.escape(t) for t in group.vulnerability_types)}</div>')
+            parts.append(f'<div class="row"><strong>Affected Endpoints ({len(group.affected_endpoints)}):</strong></div>')
+            parts.append('<ul style="margin:4px 0 12px 20px;font-family:\'Courier New\',monospace;font-size:.85em">')
+            for ep in group.affected_endpoints:
+                parts.append(f'<li>{html.escape(ep)}</li>')
+            parts.append('</ul>')
+            parts.append('</div></div>')
+        parts.append('</section>')
+        return "\n".join(parts)
+
+    def _render_root_cause_sections_txt(self) -> str:
+        """Render root cause aggregation for text reports."""
+        if not self.root_cause_groups or len(self.root_cause_groups) <= 1:
+            return ""
+        lines = [
+            "=" * 70,
+            "ROOT CAUSE SUMMARY",
+            "=" * 70,
+            f"Findings grouped by root cause: {len(self.root_cause_groups)} groups across {len(self.findings)} findings",
+            "",
+        ]
+        for i, group in enumerate(self.root_cause_groups, 1):
+            lines.append(f"  {i}. {group.root_cause.upper()} [{group.severity.upper()}]")
+            lines.append(f"     Confidence: {group.confidence:.0f}/100")
+            lines.append(f"     Findings: {group.count} | Endpoints: {len(group.affected_endpoints)}")
+            lines.append(f"     Vulnerability types: {', '.join(group.vulnerability_types)}")
+            lines.append(f"     Affected Endpoints:")
+            for ep in group.affected_endpoints:
+                lines.append(f"       - {ep}")
+            lines.append("")
+        lines.append("-" * 70)
+        return "\n".join(lines)
+
+    def _render_root_cause_sections_md(self) -> str:
+        """Render root cause aggregation for Markdown/ChatGPT reports."""
+        if not self.root_cause_groups or len(self.root_cause_groups) <= 1:
+            return ""
+        lines = [
+            "---",
+            "## Root Cause Summary",
+            "",
+            f"Findings grouped by shared root cause: {len(self.root_cause_groups)} groups across {len(self.findings)} findings.",
+            "",
+        ]
+        for group in self.root_cause_groups:
+            lines.append(f"### {group.root_cause}")
+            lines.append(f"**Severity:** {group.severity.upper()} | **Findings:** {group.count} | **Confidence:** {group.confidence:.0f}/100")
+            lines.append(f"**Vulnerability Types:** {', '.join(group.vulnerability_types)}")
+            lines.append("**Affected Endpoints:**")
+            for ep in group.affected_endpoints:
+                lines.append(f"- `{ep}`")
+            lines.append("")
+        lines.append("---")
+        lines.append("")
+        return "\n".join(lines)

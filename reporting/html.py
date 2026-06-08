@@ -119,6 +119,7 @@ class HTMLReporter(ReporterBase):
             "dateCreated": datetime.now().isoformat(),
             "severity_counts": severity_counts,
             "verification_breakdown": verification_breakdown,
+            "historical_breakdown": self._get_historical_breakdown() if hasattr(self, '_get_historical_breakdown') else {},
             "findings": [
                 {
                     "title": f.get("title", ""),
@@ -129,12 +130,18 @@ class HTMLReporter(ReporterBase):
                     "verification_stage": f.get("verification_stage", "detected"),
                     "confidence_score": f.get("confidence_score", 0),
                     "false_positive_risk": f.get("false_positive_risk", ""),
+                    "confidence_reasons": f.get("confidence_reasons", []),
                     "cvss_score": self._get_cvss_score(f),
+                    "historical_classification": (
+                        f.get("historical", {}).get("classification", "")
+                        if isinstance(f, dict)
+                        else getattr(f, "historical", {}).get("classification", "")
+                    ),
                 }
                 for f in sorted_findings
             ],
         }
-        jsonld_html = json.dumps(jsonld_data, indent=2)
+        jsonld_html = json.dumps(jsonld_data, indent=2).replace("</script>", "<\\/script>")
 
         ai_summary_section = self._create_ai_summary_section_html(sorted_findings, severity_counts, verification_breakdown)
 
@@ -167,6 +174,7 @@ class HTMLReporter(ReporterBase):
         </div>
         {config_section}
         {ai_summary_section}
+        {self._render_root_cause_sections_html()}
         <section>
             <h2>Findings <span style="font-size:.6em;color:var(--text2)">({sum(severity_counts.values())})</span></h2>
             <div class="filters" id="filters">
@@ -178,6 +186,7 @@ class HTMLReporter(ReporterBase):
                 <button class="filter-btn" data-filter="info">Info</button>
                 <button class="filter-btn" data-filter="exploitable">Exploitable</button>
                 <button class="filter-btn" data-filter="validated">Validated</button>
+                <button class="filter-btn" data-filter="partially_validated">Partial</button>
                 <button class="filter-btn" data-filter="detected">Detected</button>
             </div>
             <div id="findingsContainer">{findings_cards if sorted_findings else '<div class="empty-message">No vulnerabilities found.</div>'}</div>
@@ -193,7 +202,7 @@ class HTMLReporter(ReporterBase):
         var sevCtx = document.getElementById('sevChart').getContext('2d');
         new Chart(sevCtx, {{type:'doughnut',data:{{labels:Object.keys(sevData).filter(k=>sevData[k]>0).map(k=>k.charAt(0).toUpperCase()+k.slice(1)),datasets:[{{data:Object.values(sevData).filter(v=>v>0),backgroundColor:['#e74c3c','#e67e22','#f1c40f','#3498db','#95a5a6'],borderWidth:0}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:'right',labels:{{color:'#999'}}}}}}}}}});
         var verCtx = document.getElementById('verChart').getContext('2d');
-        new Chart(verCtx, {{type:'doughnut',data:{{labels:Object.keys(verData).filter(k=>verData[k]>0).map(k=>k.charAt(0).toUpperCase()+k.slice(1)),datasets:[{{data:Object.values(verData).filter(v=>v>0),backgroundColor:['#e74c3c','#f39c12','#2ecc71','#9b59b6'],borderWidth:0}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:'right',labels:{{color:'#999'}}}}}}}}}});
+        new Chart(verCtx, {{type:'doughnut',data:{{labels:Object.keys(verData).filter(k=>verData[k]>0).map(k=>k.charAt(0).toUpperCase()+k.slice(1)),datasets:[{{data:Object.values(verData).filter(v=>v>0),backgroundColor:['#e74c3c','#f39c12','#3498db','#2ecc71','#9b59b6'],borderWidth:0}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:'right',labels:{{color:'#999'}}}}}}}}}});
         document.querySelectorAll('.filter-btn').forEach(btn=>{{btn.addEventListener('click',function(){{document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));this.classList.add('active');var filter=this.dataset.filter;document.querySelectorAll('.finding-card').forEach(card=>{{if(filter==='all'){{card.style.display='';return;}}var show=card.dataset.severity===filter||card.dataset.stage===filter;card.style.display=show?'':'none';}});}});}});
         document.querySelectorAll('.finding-header').forEach(hdr=>{{hdr.addEventListener('click',function(){{this.parentElement.classList.toggle('open');}});}});
         function toggleTheme(){{document.body.classList.toggle('light');}}
@@ -219,7 +228,32 @@ class HTMLReporter(ReporterBase):
         cards += f'<div class="stat-card conf"><div class="val">{ver.get("exploitable",0)}</div><div class="lbl">Exploitable</div></div>'
         cards += f'<div class="stat-card valid"><div class="val">{ver.get("validated",0)}</div><div class="lbl">Validated</div></div>'
         cards += f'<div class="stat-card detect"><div class="val">{ver.get("detected",0)}</div><div class="lbl">Detected</div></div>'
+        cards += f'<div class="stat-card valid" style="border-top-color:#9b59b6"><div class="val" style="color:#9b59b6">{ver.get("partially_validated",0)}</div><div class="lbl">Partial</div></div>'
+        hist = self._get_historical_breakdown() if hasattr(self, '_get_historical_breakdown') else {}
+        if any(v > 0 for v in hist.values()):
+            for cls, color in [("previously_seen","#3498db"),("regressed","#e74c3c"),("improved","#2ecc71"),("degraded","#e67e22")]:
+                val = hist.get(cls, 0)
+                if val:
+                    cards += f'<div class="stat-card" style="border-top-color:{color}"><div class="val" style="color:{color}">{val}</div><div class="lbl" style="color:{color}80">{cls.replace("_"," ").title()}</div></div>'
         return cards
+
+    def _get_history_badge_html(self, f: Any) -> str:
+        hist = f.get("historical", {}) if isinstance(f, dict) else getattr(f, "historical", {})
+        if not hist or not isinstance(hist, dict):
+            return ""
+        cls = hist.get("classification", "")
+        if not cls or cls == "new":
+            return ""
+        label = hist.get("label", cls.replace("_", " ").title())
+        color_map = {
+            "previously_seen": "#3498db",
+            "regressed": "#e74c3c",
+            "improved": "#2ecc71",
+            "degraded": "#e67e22",
+            "resolved": "#95a5a6",
+        }
+        color = color_map.get(cls, "#95a5a6")
+        return f'<span class="hist-badge" style="background:{color}20;color:{color};border:1px solid {color}40;border-radius:3px;padding:1px 6px;font-size:.75em;margin-left:4px">{html.escape(label)}</span>'
 
     def _get_evidence_html(self, f: Any) -> str:
         """Render evidence from Finding (list) or legacy (string) format.
@@ -347,6 +381,33 @@ class HTMLReporter(ReporterBase):
         e_evidence = html.escape(evidence)
         return f'<div class="row"><strong>Evidence:</strong><details><summary>View evidence ({len(evidence)} chars)</summary><div class="evidence">{e_evidence}</div></details></div>'
 
+    @staticmethod
+    def _get_structured_impact_html(f: Any) -> str:
+        ia = f.get("impact_assessment", {})
+        if not ia:
+            return ""
+        parts = []
+        if ia.get("data_exposure", {}).get("label"):
+            parts.append(f'<span style="color:var(--text2);font-size:.85em">Data Exposure: {ia["data_exposure"]["label"]}</span>')
+        if ia.get("account_takeover_potential", {}).get("label"):
+            parts.append(f'<span style="color:var(--text2);font-size:.85em">ATO: {ia["account_takeover_potential"]["label"]}</span>')
+        if ia.get("rce_potential", {}).get("label"):
+            parts.append(f'<span style="color:var(--text2);font-size:.85em">RCE: {ia["rce_potential"]["label"]}</span>')
+        if not parts:
+            return ""
+        return f'<div class="row"><strong>Structured Impact:</strong> {" | ".join(parts)}</div>'
+
+    @staticmethod
+    def _get_confidence_reasons_html(f: Any) -> str:
+        reasons = f.get("confidence_reasons")
+        if not reasons or not isinstance(reasons, list) or len(reasons) == 0:
+            return ""
+        items = "".join(
+            f'<li style="color:{"green" if r.startswith("+") else "#cc5555"}">{html.escape(r)}</li>'
+            for r in reasons
+        )
+        return f'<div class="row"><strong>Confidence Reasons:</strong><ul style="margin:2px 0;padding-left:20px">{items}</ul></div>'
+
     def _build_finding_cards_html(self, findings: List[Dict[str, Any]]) -> str:
         if not findings:
             return '<div class="empty-message">No vulnerabilities found.</div>'
@@ -369,7 +430,7 @@ class HTMLReporter(ReporterBase):
 
             sev_class = {"critical":"critical","high":"high","medium":"medium","low":"low","info":"info"}.get(sev,"info")
             conf_class = "high" if score >= 61 else ("mid" if score >= 31 else "low")
-            stage_label = stage.title()
+            stage_label = stage.replace("_", " ").title()
 
             e_details = html.escape(details)
             e_vuln_url = html.escape(vuln_url)
@@ -422,6 +483,9 @@ class HTMLReporter(ReporterBase):
             ai_lines.append(f"Parameter: {param or 'N/A'}")
             ai_lines.append(f"Stage: {stage_label}")
             ai_lines.append(f"Confidence: {score:.0f}/100")
+            hist = f.get("historical", {}) if isinstance(f, dict) else getattr(f, "historical", {})
+            if hist and isinstance(hist, dict) and hist.get("classification", "") not in ("", "new"):
+                ai_lines.append(f"Historical: {hist.get('label', hist.get('classification', ''))}")
             ai_lines.append(f"False Positive Risk: {fpr or 'N/A'}")
             ai_lines.append(f"CVSS: {cvss_score:.1f}")
             ai_lines.append("")
@@ -469,6 +533,7 @@ class HTMLReporter(ReporterBase):
                         <span class="sev-badge sev-{sev_class}">{sev.upper()}</span>
                         <span class="conf-badge conf-{conf_class}">{score:.0f}%</span>
                         <span class="stage-badge">{stage_label}</span>
+                        {self._get_history_badge_html(f)}
                     </div>
                 </div>
                 <div class="finding-body">
@@ -481,7 +546,9 @@ class HTMLReporter(ReporterBase):
                     {screenshot_html}
                     {steps_html}
                     <div class="row"><strong>FP Risk:</strong> {e_fpr} | {cvss_html}</div>
+                    {self._get_confidence_reasons_html(f)}
                     <div class="row"><strong>Impact:</strong> {e_impact}</div>
+                    {self._get_structured_impact_html(f)}
                     <div class="row"><strong>Remediation:</strong> {e_remediation}</div>
                     <span class="ai-copy-data" style="display:none">{e_ai_text}</span>
                 </div>
@@ -525,7 +592,7 @@ document.addEventListener('click', function(e) {
             title = f.get("title", "Finding")
             url = f.get("url", "")
             score = f.get("confidence_score", 0)
-            stage = f.get("verification_stage", "detected").title()
+            stage = f.get("verification_stage", "detected").replace("_", " ").title()
             top_lines.append(f"- [{sev.upper()}] {title} @ {url} (Confidence: {score:.0f}/100, Stage: {stage})")
             if len(top_lines) >= 5:
                 break
@@ -607,7 +674,7 @@ document.addEventListener('click', function(e) {
                 source = html.escape(s.get("source_url", "").split("/")[-1] or s.get("source_url",""))
                 s_type = html.escape(s.get("type",""))
                 validated = s.get("validated")
-                if validated is True:
+                if validated == True:
                     badge = '<span style="color:#2ecc71;font-weight:bold">✓ Confirmed</span>'
                     row_class = 'style="background:rgba(46,204,113,.08)"'
                 else:

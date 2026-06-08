@@ -7,16 +7,17 @@ Lifecycle:
   EXPLOITABLE: (not applicable)
   VERIFIED:   (not applicable)
 
-Maturity: Level 2 (Detect + limited Validate)
+Maturity: Level 4 (Full lifecycle — typed evidence, reproduction, confidence, skip legacy)
 """
 
 from typing import Any
 
+from models.evidence import ResponseExcerptEvidence
 from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
 )
-from scanners.base import ScannerBase, DetectionResult
+from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
 SECURITY_HEADERS = {
     "Strict-Transport-Security": "high",
@@ -32,7 +33,7 @@ SECURITY_HEADERS = {
 class HeadersScanner(ScannerBase):
     SCANNER_NAME = "headers"
     TARGET_LEVEL = True
-    SCANNER_MATURITY = 2
+    SCANNER_MATURITY = 4
 
     # ── Detection phase ─────────────────────────────────────────────────
 
@@ -71,14 +72,24 @@ class HeadersScanner(ScannerBase):
         # Weak CSP
         csp = resp.headers.get("Content-Security-Policy", "")
         if csp:
-            if "unsafe-inline" in csp or "unsafe-eval" in csp or "*" in csp:
+            csp_lower = csp.lower()
+            directives = dict(p.split(None, 1) if ' ' in p else (p, '') for p in csp_lower.split(';'))
+            weak_directives = []
+            for directive, value in directives.items():
+                directive = directive.strip()
+                value = value.strip()
+                if directive in ("default-src", "script-src", "object-src", "frame-src", "base-uri"):
+                    if "unsafe-inline" in value or "unsafe-eval" in value or value == "*" or value.startswith("* "):
+                        weak_directives.append(directive)
+            if weak_directives:
+                evidence = "; ".join(f"{d} has {'unsafe-inline/unsafe-eval/wildcard' if d in weak_directives else 'weak value'}" for d in weak_directives)
                 results.append(DetectionResult(
                     url=url,
                     parameter="Content-Security-Policy",
                     payload=csp[:120],
                     context="weak_csp",
                     raw_response=resp,
-                    evidence_signals=["Weak CSP: " + ("unsafe-inline" if "unsafe-inline" in csp else "unsafe-eval" if "unsafe-eval" in csp else "wildcard")],
+                    evidence_signals=[f"Weak CSP directive(s): {', '.join(weak_directives)}"],
                 ))
 
         # Cookie analysis
@@ -131,7 +142,38 @@ class HeadersScanner(ScannerBase):
 
     # ── Scan entry point ────────────────────────────────────────────────
 
+    def generate_reproduction(self, detection: DetectionResult | None = None) -> list[str]:
+        if detection:
+            url = detection.url
+            header = detection.parameter
+            context = detection.context
+            if context == "missing_header":
+                return [
+                    f"Send GET request to {url}",
+                    f"Observe missing security header: {header}",
+                ]
+            elif context == "information_disclosure":
+                return [
+                    f"Send GET request to {url}",
+                    f"Observe information disclosure header: {header}={detection.payload}",
+                ]
+            elif context == "weak_csp":
+                return [
+                    f"Send GET request to {url}",
+                    f"Observe weak Content-Security-Policy: {detection.payload[:80]}",
+                ]
+            elif context == "insecure_cookie":
+                return [
+                    f"Send GET request to {url}",
+                    f"Observe insecure cookie flags: {detection.payload[:80]}",
+                ]
+        return [
+            "Send GET request to the target URL",
+            "Inspect response headers for security misconfigurations",
+        ]
+
     def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+        self._prepare_scan()
         target = self.config.get("target", "")
         if not target or not self._in_scope(target):
             return []
@@ -174,16 +216,30 @@ class HeadersScanner(ScannerBase):
                     request=curl_cmd,
                     response_excerpt=resp_text,
                     steps_to_reproduce=[
-                        f"Send GET request to {url}",
-                        f"Observe missing header: {d.parameter}",
-                    ] if d.context == "missing_header" else [
-                        f"Send GET request to {url}",
+                        f"Send GET request to {url} and inspect response headers (curl -I or browser DevTools > Network tab)",
+                        "Recommended security headers for web applications: Content-Security-Policy, X-Content-Type-Options, Strict-Transport-Security, X-Frame-Options, Referrer-Policy, Permissions-Policy",
+                    ] if d.context == "missing_header" else ([
+                        f"Send GET request to {url} and inspect response headers",
                         f"Observe {d.context.replace('_', ' ')}: {d.payload[:80]}",
-                    ],
+                    ] if d.context != "weak_csp" else [
+                        f"Send GET request to {url} and inspect Content-Security-Policy header",
+                        f"Weak directive(s) found — inspect the full CSP value: {d.payload[:120]}",
+                        "A strict CSP should avoid unsafe-inline, unsafe-eval, and wildcard (*) sources",
+                    ]),
                     verification_stage=stage,
                 )
                 if f:
                     self._add_finding(f)
                     findings.append(f)
+                    fp = f.get("fingerprint", "")
+                    if fp and self.evidence_engine is not None and resp is not None:
+                        resp_ev = ResponseExcerptEvidence(
+                            excerpt=resp.text[:500],
+                            length=len(resp.text),
+                            context=d.context,
+                            description=f"Response for header check at {url}",
+                        )
+                        self.evidence_engine.store(resp_ev)
+                        self.evidence_engine.link_to_finding(resp_ev, fp)
 
         return self._get_findings()

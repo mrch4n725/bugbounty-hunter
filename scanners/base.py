@@ -98,8 +98,25 @@ class ScannerBase:
     def collect_evidence(self, result) -> list:
         return []
 
-    def generate_reproduction(self, result) -> list[str]:
-        return []
+    def generate_reproduction(self, result=None) -> list[str]:
+        url = getattr(result, "url", "") if result else ""
+        ctx = getattr(result, "context", "") if result else ""
+        if url and ctx:
+            return [
+                f"Send request to {url}",
+                f"Observe: {ctx}",
+                "Verify by inspecting the response for the expected vulnerability signal",
+            ]
+        if url:
+            return [
+                f"Send request to {url}",
+                "Inspect the response for anomalies or unexpected behavior",
+            ]
+        return [
+            "Identify the target endpoint that may be vulnerable",
+            "Send a crafted request with a test payload",
+            "Inspect the response for the expected vulnerability signal",
+        ]
 
     def calculate_confidence(self, detection: bool, validation: bool,
                              exploitation: bool, extra: int = 0) -> int:
@@ -182,7 +199,10 @@ class ScannerBase:
         self.config["technology"] = tf.all()
 
     def _load_payloads(self, payload_type: str) -> Any:
-        import yaml
+        try:
+            import yaml
+        except ImportError:
+            return self._payload_fallback(payload_type)
         yaml_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "payloads", f"{payload_type}.yaml"
         )
@@ -203,16 +223,19 @@ class ScannerBase:
                     return raw
         except (FileNotFoundError, yaml.YAMLError):
             pass
+        return self._payload_fallback(payload_type)
+
+    def _payload_fallback(self, payload_type: str) -> Any:
         fallbacks = {
-            "sqli": None,
-            "xss": None,
-            "lfi": None,
-            "ssrf": None,
-            "xxe": None,
-            "ssti": None,
-            "cmdi": None,
+            "sqli": {},
+            "xss": {},
+            "lfi": [],
+            "ssrf": [],
+            "xxe": {},
+            "ssti": {},
+            "cmdi": {},
         }
-        fb = fallbacks.get(payload_type, [])
+        fb = fallbacks.get(payload_type, {})
         if self.verbose:
             log(f"[*] Payload YAML for '{payload_type}' not found — using scanner defaults",
                 Colors.YELLOW, verbose_only=True, verbose=self.verbose)
@@ -247,16 +270,91 @@ class ScannerBase:
             t.join()
         return results
 
+    def _enrich_confidence(self, f) -> None:
+        from models.finding import calculate_confidence as calc_conf
+        from models.finding import evidence_strength_from_score, false_positive_risk_from_score
+        stage = f.get("verification_stage", "").lower()
+        score = f.get("confidence_score", 0)
+        if score < 25:
+            new_score = calc_conf(
+                detection=True,
+                validation=stage in ("validated", "exploitable", "verified"),
+                exploitation=stage in ("exploitable", "verified"),
+            )
+            f["confidence_score"] = new_score
+            f["evidence_strength"] = evidence_strength_from_score(new_score).value
+            f["false_positive_risk"] = false_positive_risk_from_score(new_score).value
+        # Always populate confidence reasons
+        reasons = f.get("confidence_reasons")
+        if not reasons or not isinstance(reasons, list) or len(reasons) == 0:
+            reasons = []
+            if stage == "detected":
+                reasons.append("+ Detection signal present")
+                reasons.append("- Not yet validated (no secondary confirmation)")
+            elif stage == "validated":
+                reasons.append("+ Detection signal present")
+                reasons.append("+ Secondary validation confirmed")
+            elif stage == "exploitable":
+                reasons.append("+ Detection signal present")
+                reasons.append("+ Secondary validation confirmed")
+                reasons.append("+ Exploitation proof demonstrated")
+            elif stage == "verified":
+                reasons.append("+ Detection signal present")
+                reasons.append("+ Secondary validation confirmed")
+                reasons.append("+ Exploitation proof demonstrated")
+                reasons.append("+ Independently verified (OOB/browser/evidence)")
+            f["confidence_reasons"] = reasons
+
+    def _add_capability_confidence_reasons(self, f) -> None:
+        """Add or adjust confidence reasons based on available capabilities."""
+        try:
+            from app.capabilities import CapabilityRegistry
+            caps = CapabilityRegistry.get_global()
+        except Exception:
+            return
+        reasons = f.get("confidence_reasons")
+        if not isinstance(reasons, list):
+            reasons = []
+        score = f.get("confidence_score", 0)
+        has_browser = caps.has("playwright") and caps.has("chromium")
+        has_oob = caps.has("oob_validation")
+        has_esprima = caps.has("esprima")
+
+        if has_browser and score < 80:
+            if not any("browser" in r for r in reasons):
+                reasons.append("+ Browser validation available (can increase confidence)")
+        if not has_browser:
+            if not any("No browser" in r for r in reasons):
+                reasons.append("- No browser validation (XSS/JS findings unverifiable via Playwright)")
+                if f.get("vuln_type", "").lower() in ("xss", "dom xss", "blind xss"):
+                    reasons.append("- XSS confidence limited without browser execution")
+        if has_oob and score < 80:
+            if not any("OOB" in r for r in reasons):
+                reasons.append("+ OOB callback validation available (can increase confidence)")
+        if not has_oob:
+            if not any("No OOB" in r for r in reasons):
+                reasons.append("- No OOB callback service (SSRF/XXE/CMDI unverifiable out-of-band)")
+        if not has_esprima:
+            if not any("No JS parser" in r for r in reasons):
+                reasons.append("- No JS parser (limited DOM/JS analysis)")
+        if score >= 80 and not any("high confidence" in r for r in reasons):
+            reasons.append("+ High confidence score achieved (score >= 80)")
+        if score >= 25 and not any("score >= 25" in r for r in reasons):
+            reasons.append("+ Base confidence threshold met (score >= 25)")
+        f["confidence_reasons"] = reasons
+
     def _add_finding(self, f) -> bool:
         if not f:
             return False
         with self._lock:
             if not self.dedup.add_legacy(f):
                 return False
+            self._enrich_confidence(f)
+            self._add_capability_confidence_reasons(f)
             sev = f.get("severity", "info").upper()
             title = f.get("title", "Finding")[:60]
             url = f.get("url", "")[:60]
-            stage = f.get("verification_stage", "detected").title()
+            stage = f.get("verification_stage", "detected").replace("_", " ").title()
             score = f.get("confidence_score", 0)
             log(f"  [FOUND] [{sev}] {title} @ {url} [{stage}, {score:.0f}/100]",
                 Colors.RED if sev in ("CRITICAL", "HIGH") else Colors.YELLOW)
@@ -268,15 +366,23 @@ class ScannerBase:
                 try:
                     from models.evidence import HttpRequestEvidence
                     req_str = f.get("request", "")
+                    method = "GET"
+                    if req_str.startswith("curl"):
+                        parts = req_str.split()
+                        for i, p in enumerate(parts):
+                            if p == "-X" and i + 1 < len(parts):
+                                method = parts[i + 1]
+                                break
                     req_ev = HttpRequestEvidence(
-                        method=req_str.split()[0] if " " in req_str else "GET",
+                        method=method,
                         url=url,
                         curl_command=request_str,
                     )
                     self.evidence_engine.store(req_ev)
                     self.evidence_engine.link_to_finding(req_ev, fp)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log(f"  [evidence] Failed to auto-create HttpRequestEvidence: {e}",
+                        Colors.WHITE, verbose_only=True, verbose=self.verbose)
             return True
 
     def _get_findings(self) -> list:

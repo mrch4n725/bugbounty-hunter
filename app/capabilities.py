@@ -231,7 +231,10 @@ class CapabilityRegistry:
             self._oob_auto_host = host
             self.config["oob_host"] = host
             return True, f"auto:{host}"
-        return False, "configure --oob-host"
+        host = "oast.fun"
+        self._oob_auto_host = host
+        self.config["oob_host"] = host
+        return True, f"default:{host}"
 
     def _detect_oob_services(self) -> list[str]:
         """Try to auto-detect available OOB callback services."""
@@ -252,19 +255,18 @@ class CapabilityRegistry:
     def _check_interactsh() -> str | None:
         """Check if interactsh is reachable. Returns oob host domain if so."""
         import urllib.request
-        import json
         try:
             req = urllib.request.Request("https://oast.fun", method="HEAD")
-            resp = urllib.request.urlopen(req, timeout=5)
-            if resp.status < 400:
-                return "oast.fun"
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status < 400:
+                    return "oast.fun"
         except Exception:
             pass
         try:
             req = urllib.request.Request("https://oast.pro", method="HEAD")
-            resp = urllib.request.urlopen(req, timeout=5)
-            if resp.status < 400:
-                return "oast.pro"
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status < 400:
+                    return "oast.pro"
         except Exception:
             pass
         return None
@@ -275,11 +277,11 @@ class CapabilityRegistry:
         import urllib.request
         try:
             req = urllib.request.Request("http://dnslog.cn/getdomain.php", method="GET")
-            resp = urllib.request.urlopen(req, timeout=5)
-            if resp.status == 200:
-                domain = resp.read().decode().strip()
-                if domain:
-                    return domain
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    domain = resp.read().decode().strip()
+                    if domain:
+                        return domain
         except Exception:
             pass
         return None

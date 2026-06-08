@@ -25,6 +25,13 @@ class ChatGPTReporter(ReporterBase):
     - All findings in one file for single copy-paste
     """
 
+    @staticmethod
+    def _get_confidence_reasons_chat(f: Any) -> str:
+        reasons = f.get("confidence_reasons")
+        if not reasons or not isinstance(reasons, list) or len(reasons) == 0:
+            return ""
+        return "; ".join(reasons)
+
     def _evidence_to_markdown(self, evidence_raw: Any) -> str:
         """Render a single evidence item to a markdown string."""
         if isinstance(evidence_raw, TimingEvidence):
@@ -108,6 +115,11 @@ class ChatGPTReporter(ReporterBase):
         for key in ("detected", "validated", "exploitable"):
             if ver.get(key, 0):
                 frontmatter_lines.append(f"stage_{key}: {ver[key]}")
+        hist = self._get_historical_breakdown() if hasattr(self, '_get_historical_breakdown') else {}
+        if any(v > 0 for v in hist.values()):
+            for key in ("new", "previously_seen", "regressed", "resolved", "improved", "degraded"):
+                if hist.get(key, 0):
+                    frontmatter_lines.append(f"history_{key}: {hist[key]}")
         frontmatter_lines.append("---\n")
 
         content = "\n".join(frontmatter_lines)
@@ -126,17 +138,23 @@ class ChatGPTReporter(ReporterBase):
             "verification step would confirm or rule it out.\n"
             "4. Prioritise findings in this order: Exploitable > Validated > Detected, "
             "then Critical > High > Medium > Low within each stage.\n\n"
-            "Start with a one-paragraph executive summary covering the target, total "
-            "finding count, severity breakdown, and the single most critical issue.\n\n"
             "---\n\n"
         )
+
+        content += "## Executive Summary\n\n"
+        content += "```\n"
+        content += self._build_executive_summary()
+        content += "```\n\n"
+        content += "---\n\n"
+
+        content += self._render_root_cause_sections_md()
 
         for i, f in enumerate(sorted_findings, 1):
             title = f.get("title", f.get("vuln_type", "Finding"))
             sev_val = f.get("severity", "info").upper()
             url = f.get("url", "")
             details = f.get("details", "")
-            stage = f.get("verification_stage", "detected").title()
+            stage = f.get("verification_stage", "detected").replace("_", " ").title()
             score = f.get("confidence_score", 0)
             fpr = f.get("false_positive_risk", "")
             param = f.get("parameter", "")
@@ -152,7 +170,11 @@ class ChatGPTReporter(ReporterBase):
                 content += f"Parameter: {param}\n"
             content += f"Verification Stage: {stage}\n"
             content += f"Confidence: {score:.0f}/100\n"
-            content += f"False Positive Risk: {fpr or 'N/A'}\n\n"
+            hist = f.get("historical", {}) if isinstance(f, dict) else getattr(f, "historical", {})
+            if hist and isinstance(hist, dict) and hist.get("classification", "") not in ("", "new"):
+                content += f"Historical: {hist.get('label', hist.get('classification', ''))}\n"
+            content += f"False Positive Risk: {fpr or 'N/A'}\n"
+            content += f"Confidence Reasons: {self._get_confidence_reasons_chat(f) or 'N/A'}\n\n"
 
             content += f"### Description\n\n{details}\n\n"
 
@@ -181,6 +203,9 @@ class ChatGPTReporter(ReporterBase):
             impact = self._build_impact_narrative(f)
             remediation = self._build_remediation(f)
             content += f"### Impact\n\n{impact}\n\n"
+            structured_impact = self._format_structured_impact(f)
+            if structured_impact:
+                content += f"**Structured Impact:** {structured_impact}\n\n"
             content += f"### Remediation\n\n{remediation}\n\n"
 
             content += "---\n\n"
@@ -210,8 +235,8 @@ class ChatGPTReporter(ReporterBase):
                 "parameter":          f.get("parameter", ""),
                 "verification_stage": f.get("verification_stage", "detected"),
                 "confidence_score":   f.get("confidence_score", 0),
+                "confidence_reasons": f.get("confidence_reasons", []),
                 "false_positive_risk": f.get("false_positive_risk", ""),
-                "cvss_score":         self._get_cvss_score(f),
                 "cvss_vector":        self._get_cvss_vector(f),
                 "details":            f.get("details", ""),
                 "steps_to_reproduce": steps,
@@ -222,7 +247,7 @@ class ChatGPTReporter(ReporterBase):
                 "remediation":        self._build_remediation(f),
             }
             raw_data.append(entry)
-        content += json.dumps({"findings": raw_data}, indent=2)
+        content += json.dumps({"root_cause_groups": self.root_cause_groups_to_dicts(), "findings": raw_data}, indent=2)
         content += "\n```\n"
 
         filepath = os.path.join(self.output_dir, self._get_chatgpt_filename())

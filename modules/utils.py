@@ -26,28 +26,20 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-try:
-    from rich.console import Console
-    from rich.live import Live
-    from rich.progress import (
-        BarColumn,
-        Progress,
-        SpinnerColumn,
-        TextColumn,
-        TimeElapsedColumn,
-        TimeRemainingColumn,
-    )
-    from rich.table import Table
-
-    RICH_AVAILABLE = True
-except ImportError:
-    RICH_AVAILABLE = False
-
 _rich_console: Optional["Console"] = None
 _use_rich: bool = True
 _log_lock = threading.Lock()
 _seen_findings = set()
 _seen_findings_lock = threading.Lock()
+
+
+def _rich_available() -> bool:
+    """Check if Rich terminal library is available via CapabilityRegistry."""
+    try:
+        from app.capabilities import CapabilityRegistry
+        return CapabilityRegistry.get_global().has("rich")
+    except Exception:
+        return False
 
 
 def reset_seen_findings() -> None:
@@ -81,7 +73,7 @@ class ScanProgress:
         self._findings_count = 0
 
     def __enter__(self):
-        no_rich = self._config.get("no_rich", False) or not RICH_AVAILABLE
+        no_rich = self._config.get("no_rich", False) or not _rich_available()
         if no_rich:
             return self
         self._progress = Progress(
@@ -125,9 +117,9 @@ def _build_curl(
     cookies: Optional[Dict[str, str]] = None,
     mask_sensitive: Optional[bool] = None,
 ) -> str:
+    """Build a curl command string for reproduction of a request."""
     if mask_sensitive is None:
         mask_sensitive = _MASK_SENSITIVE_DEFAULT
-    """Build a curl command string for reproduction of a request."""
     parts = ["curl", "-X", method.upper()]
     if headers:
         for k, v in headers.items():
@@ -149,14 +141,15 @@ def _build_curl(
 def set_rich_enabled(enabled: bool) -> None:
     """Enable or disable Rich terminal output (e.g. --no-rich)."""
     global _use_rich
-    _use_rich = enabled and RICH_AVAILABLE
+    _use_rich = enabled and _rich_available()
 
 
 def _get_console() -> Optional["Console"]:
     global _rich_console
-    if not _use_rich or not RICH_AVAILABLE:
+    if not _use_rich or not _rich_available():
         return None
     if _rich_console is None:
+        from rich.console import Console
         _rich_console = Console()
     return _rich_console
 
@@ -258,7 +251,7 @@ class OOBDetectionFramework:
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.oob_host = config.get("oob_host", "")
+        self.oob_host = config.get("oob_host", "") or "oast.fun"
         self.callback_token = str(uuid.uuid4()).replace("-", "")[:16]
         self._interactions: Dict[str, List[Dict[str, Any]]] = {}
         self._lock = threading.Lock()
@@ -296,7 +289,9 @@ class OOBDetectionFramework:
         if not self.oob_host:
             return []
         confirmed: List[Dict[str, Any]] = []
-        for vuln_type, interactions in list(self._interactions.items()):
+        with self._lock:
+            items = list(self._interactions.items())
+        for vuln_type, interactions in items:
             for entry in interactions:
                 if entry.get("confirmed"):
                     continue
@@ -393,8 +388,17 @@ class BrowserValidator:
             try:
                 from playwright.sync_api import sync_playwright
                 self._pw = sync_playwright().start()
+            except Exception:
+                self._pw = None
+                self._browser = None
+                return None
+            try:
                 self._browser = self._pw.chromium.launch(headless=True)
             except Exception:
+                try:
+                    self._pw.stop()
+                except Exception:
+                    pass
                 self._pw = None
                 self._browser = None
             return self._browser
@@ -851,6 +855,7 @@ class TechnologyFingerprinter:
         self.session = session
         self.timeout = timeout
         self.results: Dict[str, List[str]] = {}
+        self._lock = threading.Lock()
 
     def fingerprint(self, url: str) -> Dict[str, List[str]]:
         """Fingerprint a URL by analyzing response headers and body."""
@@ -864,13 +869,14 @@ class TechnologyFingerprinter:
         headers = {k.lower(): v.lower() for k, v in resp.headers.items()}
         body = resp.text.lower()
 
-        for category, signatures in TECH_SIGNATURES.items():
-            if category not in self.results:
-                self.results[category] = []
-            for sig in signatures:
-                detected = self._match_signature(sig, headers, body)
-                if detected and sig["name"] not in self.results[category]:
-                    self.results[category].append(sig["name"])
+        with self._lock:
+            for category, signatures in TECH_SIGNATURES.items():
+                if category not in self.results:
+                    self.results[category] = []
+                for sig in signatures:
+                    detected = self._match_signature(sig, headers, body)
+                    if detected and sig["name"] not in self.results[category]:
+                        self.results[category].append(sig["name"])
 
         return self.results
 
@@ -1281,6 +1287,7 @@ def finding(
     request: Optional[str] = None,
     response_excerpt: Optional[str] = None,
     steps_to_reproduce: Optional[List[str]] = None,
+    confidence_reasons: Optional[list[str]] = None,
 ) -> Optional[Finding]:
     """
     Build a standardized Finding object with CVSS metadata, fingerprint, and timestamp.
@@ -1322,6 +1329,26 @@ def finding(
     if false_positive_risk is None:
         false_positive_risk = false_positive_risk_from_score(confidence_score).value
 
+    # Build confidence reasons from stage if not provided
+    if confidence_reasons is None:
+        confidence_reasons = []
+        stage = (verification_stage or "detected").lower()
+        if stage == "detected":
+            confidence_reasons.append("+ Detection signal present")
+            confidence_reasons.append("- Not yet validated (no secondary confirmation)")
+        elif stage == "validated":
+            confidence_reasons.append("+ Detection signal present")
+            confidence_reasons.append("+ Secondary validation confirmed")
+        elif stage == "exploitable":
+            confidence_reasons.append("+ Detection signal present")
+            confidence_reasons.append("+ Secondary validation confirmed")
+            confidence_reasons.append("+ Exploitation proof demonstrated")
+        elif stage == "verified":
+            confidence_reasons.append("+ Detection signal present")
+            confidence_reasons.append("+ Secondary validation confirmed")
+            confidence_reasons.append("+ Exploitation proof demonstrated")
+            confidence_reasons.append("+ Independently verified (OOB/browser/evidence)")
+
     f = Finding(
         title=vuln_type,
         vuln_type=vuln_type,
@@ -1338,6 +1365,7 @@ def finding(
         response_excerpt=response_excerpt or "",
         reproduction_steps=steps_to_reproduce or validation_steps or [],
         exploitability_rating=exploitability_rating or "unknown",
+        confidence_reasons=confidence_reasons,
     )
 
     # Set dynamically-accessed legacy fields
@@ -1435,14 +1463,17 @@ class RateLimiter:
     def wait(self) -> None:
         with self._lock:
             now = time.time()
+            total_sleep = 0.0
             if now < self._backoff_until:
-                time.sleep(self._backoff_until - now)
-                now = time.time()
+                total_sleep = self._backoff_until - now
+                now = self._backoff_until
             min_interval = 1.0 / self.current_rps
             elapsed = now - self._last_request
             if elapsed < min_interval:
-                time.sleep(min_interval - elapsed)
-            self._last_request = time.time()
+                total_sleep += min_interval - elapsed
+            self._last_request = time.time() + total_sleep
+        if total_sleep > 0:
+            time.sleep(total_sleep)
 
     def report_429(self) -> None:
         with self._lock:
@@ -1817,7 +1848,11 @@ def progress_bar(total: int, description: str = "Processing"):
             task = progress.add_task(description, total=total)
             progress.update(task, advance=1)
     """
-    if _use_rich and RICH_AVAILABLE:
+    if _use_rich and _rich_available():
+        from rich.progress import (
+            BarColumn, Progress, SpinnerColumn,
+            TextColumn, TimeElapsedColumn, TimeRemainingColumn,
+        )
         return Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -1841,6 +1876,7 @@ def _severity_style(severity: str) -> str:
 
 
 def _build_findings_table(rows: List[Dict[str, Any]]) -> "Table":
+    from rich.table import Table
     table = Table(title="Live Findings", expand=True)
     table.add_column("Severity", style="bold", width=10)
     table.add_column("Type", width=28)
@@ -1854,7 +1890,7 @@ def _build_findings_table(rows: List[Dict[str, Any]]) -> "Table":
         cvss_txt = f"{cvss:.1f}" if isinstance(cvss, (int, float)) else "-"
         table.add_row(
             sev.upper(),
-            str(row.get("type", ""))[:28],
+            str(row.get("vuln_type", ""))[:28],
             str(row.get("url", ""))[:80],
             str(row.get("confidence", "")),
             cvss_txt,
@@ -1887,7 +1923,8 @@ def live_table():
     handle = LiveFindingsHandle()
     console = _get_console()
 
-    if console is not None and RICH_AVAILABLE:
+    if console is not None and _rich_available():
+        from rich.live import Live
         table = _build_findings_table(rows)
         with Live(table, console=console, refresh_per_second=4) as live:
             live_ref["live"] = live
@@ -1898,8 +1935,9 @@ def live_table():
 
 def get_rich_table(title: str, columns: List[str]) -> Optional["Table"]:
     """Create a Rich Table when Rich is enabled."""
-    if not _use_rich or not RICH_AVAILABLE:
+    if not _use_rich or not _rich_available():
         return None
+    from rich.table import Table
     table = Table(title=title)
     for col in columns:
         table.add_column(col)

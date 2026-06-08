@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Any, Dict
@@ -7,6 +8,19 @@ from reporting.base import ReporterBase
 
 
 class MarkdownReporter(ReporterBase):
+    def _get_root_cause_md(self, finding: Any) -> str:
+        rc = finding.get("root_cause", "")
+        if not rc:
+            return ""
+        return f"**Root Cause:** {rc}\n\n"
+
+    @staticmethod
+    def _get_confidence_reasons_md(finding: Any) -> str:
+        reasons = finding.get("confidence_reasons")
+        if not reasons or not isinstance(reasons, list) or len(reasons) == 0:
+            return ""
+        return "; ".join(reasons)
+
     def _get_evidence_markdown(self, finding: Any) -> str:
         """Render evidence as markdown blocks, handling both list and string formats."""
         evidence = finding.get("evidence", "")
@@ -58,7 +72,7 @@ class MarkdownReporter(ReporterBase):
 
             score = finding.get('confidence_score')
             score_str = f"{score:.0f}/100" if score is not None else "—"
-            stage = finding.get('verification_stage', '').title() or "—"
+            stage = finding.get('verification_stage', '').replace('_', ' ').title() or "—"
             fpr = finding.get('false_positive_risk', '')
             evidence_strength = finding.get('evidence_strength', '')
             validation_steps = finding.get('validation_steps', [])
@@ -75,12 +89,15 @@ class MarkdownReporter(ReporterBase):
 **Verification Stage:** {stage}
 **Evidence Strength:** {evidence_strength or '—'}
 **False Positive Risk:** {fpr or '—'}
+**Confidence Reasons:** {self._get_confidence_reasons_md(finding) or '—'}
 
 ---
 
 ## Summary
 
 {finding.get('what_is_it') or details}
+
+{self._get_root_cause_md(finding)}
 
 ## Steps to Reproduce
 
@@ -101,9 +118,11 @@ class MarkdownReporter(ReporterBase):
 
 {evidence_md}
 
-## Request
+"""
+            if request:
+                content += f"""## Request
 
-```\n{request}\n```\n""" if request else ""
+```\n{request}\n```\n"""
 
             if response_excerpt:
                 content += f"## Response Excerpt\n\n```\n{response_excerpt}\n```\n\n"
@@ -111,6 +130,8 @@ class MarkdownReporter(ReporterBase):
             content += f"""## Impact
 
 {impact}
+
+{self._format_structured_impact(finding)}
 
 ## Recommended Fix
 

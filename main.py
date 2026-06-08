@@ -23,6 +23,7 @@ from modules.js_intelligence import JSIntelligence
 from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score, prioritize_findings, reset_seen_findings, _build_curl, set_mask_sensitive_default, ScanProgress
 from models.finding import Finding
 from app.bootstrap import bootstrap, auto_upgrade_config, print_startup_summary
+from engines.history import correlate_findings
 
 
 def parse_args():
@@ -34,7 +35,7 @@ def parse_args():
     parser.add_argument("--config", "-C", help="Path to YAML configuration file")
     parser.add_argument("--target", "-t", help="Target URL (e.g. https://example.com)")
     parser.add_argument("--modules", "-m", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "all"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization", "all"],
         default=["all"])
     parser.add_argument("--output", "-o", default="reports")
     parser.add_argument("--format", "-f", choices=["json", "html", "txt", "markdown-report", "hackerone", "bugcrowd", "chatgpt"], default="html")
@@ -57,7 +58,7 @@ def parse_args():
         help="Out-of-band callback host for SSRF and SQLi OOB verification (e.g. Burp Collaborator or interactsh URL)")
     parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
     parser.add_argument("--disable-modules", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization"],
         default=[], help="Disable specific modules when scanning all or default modules")
     parser.add_argument("--module-param", action="append", default=[],
         help="Override module settings using module.key=value")
@@ -91,6 +92,10 @@ def parse_args():
         help="Maximum number of JS files to scan for secrets/endpoints (default: 50)")
     parser.add_argument("--no-mask-curl", action="store_true",
         help="Disable sensitive header masking in curl commands within reports (shows Authorization, Cookie, etc.)")
+    parser.add_argument("--no-history", action="store_true",
+        help="Disable historical finding correlation (scan history tracking)")
+    parser.add_argument("--history-file", default="scan_history.json",
+        help="Path to scan history file for finding correlation (default: scan_history.json in output dir)")
     parser.add_argument("--auto", action="store_true",
         help="Auto mode: sensible defaults for a quick scan (rps=3, threads=5, autosave=60s, format=chatgpt)")
     parser.add_argument("--dry-run", action="store_true",
@@ -173,10 +178,14 @@ def _apply_scalar_config(cli_args, config_file: dict) -> None:
 
 
 def _apply_list_config(cli_args, config_file: dict) -> None:
-    if isinstance(config_file.get('modules'), list):
-        cli_args.modules = config_file['modules']
-    if isinstance(config_file.get('disable_modules'), list):
-        cli_args.disable_modules = config_file['disable_modules']
+    if isinstance(config_file.get('modules'), list) and config_file['modules']:
+        existing = set(cli_args.modules or [])
+        merged = existing | set(config_file['modules'])
+        cli_args.modules = list(merged)
+    if isinstance(config_file.get('disable_modules'), list) and config_file['disable_modules']:
+        existing = set(cli_args.disable_modules or [])
+        merged = existing | set(config_file['disable_modules'])
+        cli_args.disable_modules = list(merged)
 
 
 def _apply_header_config(cli_args, config_file: dict) -> None:
@@ -287,6 +296,8 @@ def build_config(args):
         "use_new_scanners": getattr(args, "new_scanners", True),
         "dry_run": getattr(args, "dry_run", False),
         "no_mask_curl": getattr(args, "no_mask_curl", False),
+        "no_history": getattr(args, "no_history", False),
+        "history_file": getattr(args, "history_file", "scan_history.json"),
         "rps": args.rps,
         "stealth": args.stealth,
         "max_js_files": args.max_js_files,
@@ -324,6 +335,8 @@ def _log_startup(config: dict) -> None:
 
 
 def _should_run_recon(config: dict, run_all: bool, disabled_modules: set) -> bool:
+    if "recon" in disabled_modules:
+        return False
     return (
         (run_all and "recon" not in disabled_modules)
         or "recon" in config["modules"]
@@ -396,12 +409,12 @@ def _collect_module_findings(modules, config, run_all, disabled_modules, all_fin
             log(f"[+] {mod_name.upper()} — nothing found", Colors.GREEN)
 
 
-def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, lock, container=None):
+def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, lock, container=None, capabilities=None):
     # ── TARGET_LEVEL: modules that run once per target, not per URL ──
     TARGET_LEVEL: set[str] = {
         "headers", "dirb", "exposed_files", "clickjacking",
         "subdomain_takeover", "graphql", "blind_xss", "api", "openapi",
-        "http_methods",
+        "http_methods", "authorization",
     }
 
     if config["passive"]:
@@ -449,6 +462,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     _api_scanner = ApiScanner(scanner.config, scanner.recon, container=container)
     module_map["api"] = _api_scanner.run_all
     module_map["idor"] = scanner.scan_idor
+    module_map["authorization"] = scanner.scan_authorization
 
     # ── Step 2: Run TARGET_LEVEL modules first ───────────────────────────
     target_modules = {k: v for k, v in module_map.items() if k in TARGET_LEVEL}
@@ -550,7 +564,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     # by fingerprint to avoid duplicating VulnScanner entries already in dedup.
     seen_fingerprints = {f.get("fingerprint") for f in updated if f.get("fingerprint")}
     seen_urls_types: set[tuple] = {
-        (f.get("url", ""), f.get("type", "")) for f in updated
+        (f.get("url", ""), f.get("vuln_type", "")) for f in updated
     }
     for f in all_findings_local:
         fp = f.get("fingerprint")
@@ -559,7 +573,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
                 seen_fingerprints.add(fp)
                 updated.append(f)
         else:
-            key = (f.get("url", ""), f.get("type", ""))
+            key = (f.get("url", ""), f.get("vuln_type", ""))
             if key not in seen_urls_types:
                 seen_urls_types.add(key)
                 updated.append(f)
@@ -706,7 +720,7 @@ def main():
     js_urls = recon_data.get("js_urls", [])
     run_js = (
         "all" in config["modules"] or "js_secrets" in config["modules"]
-    ) and bool(js_urls) and not config.get("passive", False)
+    ) and "js_secrets" not in disabled_modules and bool(js_urls) and not config.get("passive", False)
 
     js_findings: list[dict] = []
     if run_js:
@@ -727,6 +741,32 @@ def main():
             for key in ("secrets", "endpoints", "hidden_endpoints", "routes", "env_vars", "hardcoded_values"):
                 js_data.setdefault(key, []).extend(result.get(key, []))
 
+            # Generate findings from secrets found in this URL immediately
+            for entry in result.get("secrets", []):
+                if entry.get("confidence") == "none":
+                    continue
+                sev = entry.get("severity", "high")
+                validated = entry.get("validated")
+                if validated:
+                    sev = "critical"
+                f = finding(
+                    vuln_type=f"Exposed JS Secret ({entry['type']})",
+                    url=url,
+                    severity=sev,
+                    details=f"Secret type '{entry['type']}' found in JS file",
+                    evidence=f"Match: {entry['value'][:40]}... Source: {url}",
+                    verification_stage="verified" if validated else "detected",
+                    request=_build_curl("GET", url, dict(js_session.headers), cookies=dict(js_session.cookies)),
+                    response_excerpt=resp.text[:1000],
+                    steps_to_reproduce=[
+                        f"Fetch the JS file at {url}",
+                        f"Search the response for '{entry['type']}' patterns",
+                        "Observe the exposed secret value",
+                    ],
+                )
+                if f:
+                    js_findings.append(f)
+
         # Add discovered same-domain URLs to scan target list
         for ep in js_data.get("endpoints", []):
             ep_url = ep.get("url", "")
@@ -738,33 +778,6 @@ def main():
             if ep_url and same_domain(config["target"], ep_url):
                 if ep_url not in recon_data["urls"]:
                     recon_data["urls"].append(ep_url)
-
-        # Generate findings from secrets (collected in js_findings, merged after _run_scans)
-        for entry in js_data.get("secrets", []):
-            if entry.get("confidence") == "none":
-                continue
-            sev = entry.get("severity", "high")
-            validated = entry.get("validated")
-            if validated:
-                sev = "critical"
-            source_url = entry.get("source_url", "")
-            f = finding(
-                vuln_type=f"Exposed JS Secret ({entry['type']})",
-                url=source_url,
-                severity=sev,
-                details=f"Secret type '{entry['type']}' found in JS file",
-                evidence=f"Match: {entry['value'][:40]}... Source: {source_url}",
-                verification_stage="verified" if validated else "detected",
-                request=_build_curl("GET", source_url, dict(js_session.headers), cookies=dict(js_session.cookies)),
-                response_excerpt=resp.text[:1000] if resp is not None else "",
-                steps_to_reproduce=[
-                    f"Fetch the JS file at {source_url}",
-                    f"Search the response for '{entry['type']}' patterns",
-                    "Observe the exposed secret value",
-                ],
-            )
-            if f:
-                js_findings.append(f)
 
         secret_count = len(js_data.get("secrets", []))
         endpoint_count = len(js_data.get("endpoints", [])) + len(js_data.get("hidden_endpoints", []))
@@ -793,12 +806,22 @@ def main():
         config, recon_data, all_findings, all_findings_lock, js_data=js_data, container=container
     )
     try:
-        _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, all_findings_lock, container=container)
+        _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, all_findings_lock, container=container, capabilities=capabilities)
     except KeyboardInterrupt:
         log("\n[!] Scan interrupted — saving partial report...", Colors.YELLOW)
 
     # Merge JS secret findings AFTER _run_scans (so they appear after scanner findings)
     all_findings.extend(js_findings)
+
+    # ── Historical finding correlation ───────────────────────────────────
+    if not config.get("no_history", False) and all_findings:
+        try:
+            log("[*] Correlating findings against scan history...", Colors.CYAN)
+            container_ev = container.evidence_engine if container else None
+            correlate_findings(all_findings, config, evidence_engine=container_ev)
+            log(f"[+] Historical correlation complete", Colors.GREEN)
+        except Exception as e:
+            log(f"[!] Historical correlation failed: {e}", Colors.YELLOW)
 
     if autosave_thread:
         stop_autosave.set()

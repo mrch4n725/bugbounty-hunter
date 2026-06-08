@@ -7,16 +7,17 @@ Lifecycle:
   EXPLOITABLE: (not applicable)
   VERIFIED:   (not applicable)
 
-Maturity: Level 2 (Detect + Validate)
+Maturity: Level 3 (Detect + Validate + typed evidence + reproduction)
 """
 
 from urllib.parse import urlparse, parse_qs
 
+from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
 from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
 )
-from scanners.base import ScannerBase, DetectionResult
+from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
 REDIRECT_PARAMS = [
     "redirect", "redirect_to", "redirect_url", "return", "return_to",
@@ -33,8 +34,20 @@ OPEN_REDIRECT_PAYLOADS = [
 
 class OpenRedirectScanner(ScannerBase):
     SCANNER_NAME = "open_redirect"
-    SCANNER_MATURITY = 2
+    SCANNER_MATURITY = 3
     TARGET_LEVEL = False
+
+    @staticmethod
+    def _is_evil_redirect(loc: str) -> bool:
+        """Check if a Location header points to an external/open redirect target."""
+        if not loc:
+            return False
+        if loc.lower().startswith("javascript:"):
+            return True
+        parsed = urlparse(loc)
+        if not parsed.netloc:
+            return False
+        return parsed.netloc == "evil.com" or parsed.netloc.endswith(".evil.com")
 
     @staticmethod
     def _inject_param(url: str, param: str, value: str) -> str:
@@ -53,7 +66,7 @@ class OpenRedirectScanner(ScannerBase):
                 if not resp:
                     continue
                 loc = resp.headers.get("Location", "")
-                if "evil.com" in loc:
+                if self._is_evil_redirect(loc):
                     return DetectionResult(
                         url=test_url,
                         parameter=parameter,
@@ -73,6 +86,7 @@ class OpenRedirectScanner(ScannerBase):
         ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+        self._prepare_scan()
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
         for url in urls:
             if not self._in_scope(url):
@@ -100,7 +114,25 @@ class OpenRedirectScanner(ScannerBase):
                         verification_stage=VerificationStage.VALIDATED.value,
                     )
                     if f:
+                        fp = f.get("fingerprint", "")
+                        if fp and self.evidence_engine is not None:
+                            req_ev = HttpRequestEvidence(
+                                method="GET",
+                                url=detection.url,
+                                curl_command=_build_curl("GET", detection.url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                            )
+                            self.evidence_engine.store(req_ev)
+                            self.evidence_engine.link_to_finding(req_ev, fp)
                         self._add_finding(f)
+                        if fp and self.evidence_engine is not None and resp is not None:
+                            resp_ev = ResponseExcerptEvidence(
+                                excerpt=resp.text[:500],
+                                length=len(resp.text),
+                                context="open_redirect",
+                                description=f"Open redirect probe response at {detection.url}",
+                            )
+                            self.evidence_engine.store(resp_ev)
+                            self.evidence_engine.link_to_finding(resp_ev, fp)
                     log(f"  [REDIRECT] {detection.url[:80]}", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
                     break
             except Exception:

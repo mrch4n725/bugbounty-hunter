@@ -18,7 +18,7 @@ from modules.utils import (
     finding, log, Colors, _build_curl,
     VerificationStage,
 )
-from scanners.base import ScannerBase, DetectionResult
+from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
 XSS_PAYLOADS = [
     '<svg/onload=alert(1)>',
@@ -106,7 +106,7 @@ class XSSScanner(ScannerBase):
             parsed = urlparse(url)
             qs = parse_qs(parsed.query, keep_blank_values=True)
             qs[parameter] = [payload]
-            new_qs = "&".join(f"{k}={v[0]}" for k, v in qs.items())
+            new_qs = urlencode(qs, doseq=True)
             test_url = urlunparse(parsed._replace(query=new_qs))
 
             resp = self._safe_get(test_url)
@@ -154,11 +154,11 @@ class XSSScanner(ScannerBase):
         url = detection.url
         parameter = detection.parameter
 
-        from urllib.parse import urlparse, urlunparse, parse_qs
+        from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
         parsed = urlparse(url)
         qs = parse_qs(parsed.query, keep_blank_values=True)
         qs[parameter] = [payload]
-        new_qs = "&".join(f"{k}={v[0]}" for k, v in qs.items())
+        new_qs = urlencode(qs, doseq=True)
         test_url = urlunparse(parsed._replace(query=new_qs))
 
         screenshot_dir = self.config.get("output", "reports") + "/screenshots"
@@ -210,12 +210,20 @@ class XSSScanner(ScannerBase):
 
     # ── Reproduction steps ──────────────────────────────────────────────
 
-    def generate_reproduction(self, detection: DetectionResult) -> list[str]:
+    def generate_reproduction(self, detection: DetectionResult, verified: bool = False) -> list[str]:
+        if verified:
+            return [
+                f"Visit {detection.url}",
+                f"Submit payload '{detection.payload}' in parameter '{detection.parameter}'",
+                f"Observe that the payload is reflected in a {detection.context} context",
+                "Payload was executed in a headless Chromium browser — alert() or DOM mutation confirmed",
+                "In a real attack, this payload would execute in any victim's browser visiting the affected URL",
+            ]
         return [
             f"Visit {detection.url}",
             f"Submit payload '{detection.payload}' in parameter '{detection.parameter}'",
             f"Observe that the payload is reflected in a {detection.context} context",
-            "If browser-validated: confirm alert() execution or DOM mutation",
+            "Manually verify by pasting the payload into the parameter in a browser and checking for script execution",
         ]
 
     # ── Scan entry point ────────────────────────────────────────────────
@@ -250,7 +258,7 @@ class XSSScanner(ScannerBase):
                         parameter=param,
                         request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
                         response_excerpt=detection.raw_response.text[:500] if detection.raw_response else "",
-                        steps_to_reproduce=self.generate_reproduction(detection),
+                        steps_to_reproduce=self.generate_reproduction(detection, verified=confirmed),
                     )
                     if f:
                         for ev in evidence:

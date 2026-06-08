@@ -124,9 +124,9 @@ class OpenAPIScanner(ScannerBase):
             request=curl_cmd,
             response_excerpt=resp_excerpt,
             steps_to_reproduce=[
-                f"Send GET request to {url}",
-                f"Observe OpenAPI/Swagger spec in response",
-                f"Parse paths to discover {len(paths)} endpoint(s)",
+                f"Send GET request to {url} — the server returns an OpenAPI/Swagger specification document",
+                f"Parse the spec to discover {len(paths)} API endpoint(s) with request/response schemas",
+                "Use the exposed spec to craft targeted attacks against all documented API endpoints without manual reverse engineering",
             ],
             verification_stage=VerificationStage.VALIDATED.value,
         )

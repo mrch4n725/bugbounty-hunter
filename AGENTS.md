@@ -319,7 +319,7 @@ Every HTML report includes a `<script type="application/ld+json">` block with al
 | Scan state JSON | Uses `.scan_state.json` in CWD for `--resume` |
 | `_build_curl_command` fallback | Calls `_build_curl(method, url, {})` when no request field is on finding |
 | TARGET_LEVEL not on VulnScanner | `module_map` and `TARGET_LEVEL` are local variables in `main.py`'s `run()`, not class attributes |
-| Playwright availability | Checked via `PLAYWRIGHT_AVAILABLE` in scanner.py (not utils.py) |
+| Playwright availability | Checked via `CapabilityRegistry.get_global().has("playwright")` — not module-level `try` imports |
 | html.escape timing | Done at render time in reporter.py (not at storage time) — finding dicts remain unescaped for JSON/txt |
 | SecretValidator | Uses `@classmethod validate(cls, secret_type, value)` — no instance needed |
 | OOBDetectionFramework init | Requires `config: Dict[str, Any]` with optional `oob_host` key |
@@ -349,7 +349,39 @@ Every HTML report includes a `<script type="application/ld+json">` block with al
 
 ---
 
-## 9. Git Workflow
+## 9. Capability-Aware Scanning
+
+Every scanner should adjust its behaviour based on available runtime capabilities detected by `CapabilityRegistry`. The `ValidationEngine` (accessible as `self.validation` on any `ScannerBase` subclass) already gates OOB polling, browser validation, and screenshot capture behind capability checks.
+
+### 9a. Current capability influence on scanners
+
+| Capability | Affects | Behaviour when absent |
+|---|---|---|
+| `playwright` / `chromium` | XSS browser validation, screenshots, DOM XSS | `_ensure_browser()` returns `None`; browser-based checks silently skip |
+| `oob_validation` | SSRF, BlindXSS, XXE, CMDI, SQLi OOB | OOB probes are skipped; findings stop at VALIDATED (not promoted to VERIFIED) |
+| `esprima` | JS intelligence, DOM XSS AST analysis | AST-based features skip; fall back to regex-only detection |
+| `rich` | `ScanProgress` bar, terminal formatting | Falls back to no-op progress tracking |
+| `screenshots` | ScreenshotEvidence in reports | Screenshots are omitted from evidence; `--auto` still enables but no file is generated |
+
+### 9b. Guidelines for adding capability checks to scanners
+
+1. **Never use module-level `try: import` blocks** — always query `CapabilityRegistry.get_global().has("name")`.
+2. **OOB scanners** (SSRF, BlindXSS, XXE, CMDI, SQLi) must guard every OOB registration with `if self.validation and self.config.get("oob_host"):`.
+3. **Browser-dependent scanners** (XSS, DOM XSS) must call `self.validation.confirm_browser_xss()` which internally gates on Playwright availability.
+4. **Capability-backed confidence reasons** are auto-added by `ScannerBase._add_capability_confidence_reasons()`. Override in your scanner if you need custom capability-reason logic.
+5. **When a capability is absent**, the scanner must degrade gracefully — produce lower-confidence (DETECTED) findings instead of skipping entirely.
+6. **Never hardcode capability names** — use the constants in `app/capabilities.py:CapabilityRegistry.DETECTORS` keys.
+
+### 9c. Adding a new capability detector
+
+1. Add an entry to `CapabilityRegistry.DETECTORS` in `app/capabilities.py` with a `_detect_*` method.
+2. The method must return `(bool, str)` — a pass/fail flag and a human-readable detail string.
+3. The capability name is automatically available via `CapabilityRegistry.get_global().has("name")` across the codebase.
+4. Update the bootstrap's `_print_capabilities_summary()` to include the new capability if it should appear in the startup banner.
+
+---
+
+## 10. Git Workflow
 
 - Branch: `main`
 - Commits use conventional commits: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`

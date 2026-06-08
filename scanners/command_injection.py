@@ -18,7 +18,7 @@ from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
 )
-from scanners.base import ScannerBase
+from scanners.base import ScannerBase, DetectionResult, ValidationResult
 from models.evidence import TimingEvidence, HttpRequestEvidence, ResponseExcerptEvidence
 
 CMD_INJECTION_PAYLOADS = {
@@ -62,6 +62,20 @@ CMD_INJECTION_OUTPUT_SIGNATURES_WIN = [
 ]
 
 
+class CmdInjectionResult:
+    """Detection result carrying multi-signal data for command injection."""
+    def __init__(self, url: str, param: str, signals: dict,
+                 triggering_response: str | None = None,
+                 timing_evidence: TimingEvidence | None = None,
+                 evidence_parts: list[str] | None = None):
+        self.url = url
+        self.param = param
+        self.signals = signals
+        self.triggering_response = triggering_response
+        self.timing_evidence = timing_evidence
+        self.evidence_parts = evidence_parts or []
+
+
 class CommandInjectionScanner(ScannerBase):
     SCANNER_NAME = "cmd_injection"
     SCANNER_MATURITY = 4
@@ -71,16 +85,104 @@ class CommandInjectionScanner(ScannerBase):
         super().__init__(config, recon, container=container)
         self._oob_registrations: list[tuple[str, str, str]] = []
 
-    @staticmethod
-    def _inject_param(url: str, param: str, value: str) -> str:
-        from urllib.parse import urlencode, urlunparse
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query, keep_blank_values=True)
-        params[param] = [value]
-        new_query = urlencode(params, doseq=True)
-        return urlunparse(parsed._replace(query=new_query))
+    # ── Detection phase ─────────────────────────────────────────────────
 
-    def _test_parameter(self, url: str, param: str) -> tuple[dict, Optional[str], Optional[TimingEvidence]]:
+    def detect(self, url: str, parameter: str | None = None) -> CmdInjectionResult | None:
+        if parameter is None:
+            params = list(parse_qs(urlparse(url).query).keys())
+            if not params:
+                return None
+            parameter = params[0]
+        signals, trigger_resp, timing_ev, evidence_parts = self._test_parameter_signals(url, parameter)
+        if not any(signals.values()):
+            return None
+        return CmdInjectionResult(
+            url=url,
+            param=parameter,
+            signals=signals,
+            triggering_response=trigger_resp,
+            timing_evidence=timing_ev,
+            evidence_parts=evidence_parts,
+        )
+
+    def validate(self, detection: CmdInjectionResult) -> ValidationResult | None:
+        signal_count = sum(1 for v in detection.signals.values() if v)
+        evidence_parts = [k for k, v in detection.signals.items() if v]
+        if signal_count >= 2:
+            return ValidationResult(confirmed=True, signals=evidence_parts, method="multi_signal", detail=f"{signal_count} CMDi signals")
+        if signal_count >= 1:
+            return ValidationResult(confirmed=False, signals=evidence_parts, method="single_signal", detail="Single CMDi signal")
+        return None
+
+    def collect_evidence(self, detection: CmdInjectionResult,
+                         validation: ValidationResult | None = None) -> list:
+        ev_list = []
+        if detection.timing_evidence:
+            ev_list.append(detection.timing_evidence)
+        return ev_list
+
+    def generate_reproduction(self, detection: CmdInjectionResult,
+                              validation: ValidationResult | None = None) -> list[str]:
+        return [
+            f"Send request to {detection.url} with command injection payload (;, |, ||, &&) in parameter '{detection.param}'",
+            f"Observe signal: {', '.join(detection.evidence_parts)} — command output in response or timing delay confirms execution",
+        ]
+
+    # ── Scan entry point ────────────────────────────────────────────────
+
+    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+        self._prepare_scan()
+        urls = self.recon.get("urls", []) if target_urls is None else target_urls
+        for url in urls:
+            if not self._in_scope(url):
+                continue
+            try:
+                params = list(parse_qs(urlparse(url).query).keys())
+                for param in params:
+                    detection_result = self.detect(url, param)
+                    if detection_result is None:
+                        continue
+
+                    validation_result = self.validate(detection_result)
+                    evidence_list = self.collect_evidence(detection_result, validation_result)
+
+                    signal_count = sum(1 for v in detection_result.signals.values() if v)
+                    evidence_parts = [k for k, v in detection_result.signals.items() if v]
+
+                    if signal_count >= 2:
+                        title = "Command Injection"
+                        severity = "critical"
+                        stage = VerificationStage.VALIDATED.value
+                    elif signal_count >= 1:
+                        title = "Potential Command Injection"
+                        severity = "high"
+                        stage = VerificationStage.DETECTED.value
+                    else:
+                        continue
+
+                    f = finding(
+                        vuln_type=title,
+                        url=url,
+                        severity=severity,
+                        details=f"Parameter '{param}': {signal_count} signal(s) ({', '.join(evidence_parts)})",
+                        evidence=" | ".join(evidence_parts),
+                        request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                        response_excerpt=detection_result.triggering_response or "",
+                        verification_stage=stage,
+                        parameter=param,
+                        steps_to_reproduce=self.generate_reproduction(detection_result, validation_result),
+                    )
+                    if f:
+                        for ev in evidence_list:
+                            if self.evidence_engine:
+                                self.evidence_engine.store(ev)
+                                self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
+                        self._add_finding(f)
+            except Exception as e:
+                log(f"  [CMD] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
+        return self._get_findings()
+
+    def _test_parameter_signals(self, url: str, param: str) -> tuple[dict, Optional[str], Optional[TimingEvidence], list[str]]:
         signals: dict[str, bool] = {"output": False, "time": False, "oob": False}
         evidence_parts: list[str] = []
         triggering_response: Optional[str] = None
@@ -158,14 +260,18 @@ class CommandInjectionScanner(ScannerBase):
         if oob_host:
             for payload_template in cmdi_payloads.get("oob", CMD_INJECTION_PAYLOADS.get("oob", [])):
                 oob_payload_str = self.validation.generate_oob_payload() if hasattr(self.validation, "generate_oob_payload") else f"x.{oob_host}"
-                payload = payload_template.replace("{oob}", f"{oob_payload_str}.{oob_host}")
+                payload = payload_template.replace("{oob}", oob_payload_str)
                 test_url = self._inject_param(url, param, payload)
                 safe_get(self.session, test_url, self.timeout, raise_for_status=False)
                 self.validation.register_oob("cmd_injection", payload, test_url)
                 self._oob_registrations.append(("cmd_injection", payload, test_url))
                 break
 
-        return signals, triggering_response, timing_ev
+        return signals, triggering_response, timing_ev, evidence_parts
+
+    def _test_parameter(self, url: str, param: str) -> tuple[dict, Optional[str], Optional[TimingEvidence]]:
+        signals, trigger_resp, timing_ev, _ = self._test_parameter_signals(url, param)
+        return signals, trigger_resp, timing_ev
 
     def _build_finding(self, url: str, param: str, signals: dict,
                        request_str: str = "", response_excerpt_str: str = "",
@@ -194,32 +300,15 @@ class CommandInjectionScanner(ScannerBase):
             response_excerpt=response_excerpt_str,
             verification_stage=stage,
             parameter=param,
-            steps_to_reproduce=[f"Send request to {url} with payload in {param}", f"Observe output/timing signal"],
+            steps_to_reproduce=[
+                f"Send request to {url} with command injection payload (;, |, ||, &&) in parameter '{param}'",
+                f"Observe signal: {', '.join(evidence_parts)} — command output in response or timing delay confirms execution",
+            ],
         )
         if f and timing_ev:
             self.evidence_engine.store(timing_ev)
             self.evidence_engine.link_to_finding(timing_ev, f.get("fingerprint", ""))
         return f
-
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
-        urls = self.recon.get("urls", []) if target_urls is None else target_urls
-        for url in urls:
-            if not self._in_scope(url):
-                continue
-            try:
-                params = list(parse_qs(urlparse(url).query).keys())
-                for param in params:
-                    signals, trigger_resp, timing_ev = self._test_parameter(url, param)
-                    if signals and any(signals.values()):
-                        f = self._build_finding(url, param, signals,
-                            request_str=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
-                            response_excerpt_str=trigger_resp or "",
-                            timing_ev=timing_ev)
-                        if f:
-                            self._add_finding(f)
-            except Exception as e:
-                log(f"  [CMD] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
-        return self._get_findings()
 
     def finalize(self) -> list[dict]:
         extra: list[dict] = []
@@ -243,9 +332,9 @@ class CommandInjectionScanner(ScannerBase):
                 verification_stage=VerificationStage.VERIFIED.value,
                 response_excerpt="(Command injection confirmed via out-of-band callback — server executed injected command)",
                 steps_to_reproduce=[
-                    f"Send command injection payload to {url_str}",
-                    "Observe OOB callback — confirms command execution on server",
-                    "Use access for remote code execution or data exfiltration",
+                    f"Send request to {url_str} with command injection OOB payload (e.g. nslookup <oob-host> or curl <oob-host>) in vulnerable parameter",
+                    "Observe OOB callback — the server executed the injected command, confirming remote command execution",
+                    "Escalate: use full RCE for data exfiltration, lateral movement, or persistent access",
                 ],
             )
             if f:
@@ -255,3 +344,12 @@ class CommandInjectionScanner(ScannerBase):
                 extra.append(f)
             log(f"  [CMD OOB] {url_str}", Colors.RED, verbose_only=True, verbose=self.verbose)
         return extra
+
+    @staticmethod
+    def _inject_param(url: str, param: str, value: str) -> str:
+        from urllib.parse import urlencode, urlunparse
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        params[param] = [value]
+        new_query = urlencode(params, doseq=True)
+        return urlunparse(parsed._replace(query=new_query))

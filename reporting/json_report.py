@@ -41,6 +41,7 @@ class JSONReporter(ReporterBase):
                 'confirmed': confirm_counts.get('confirmed', 0),
                 'total': len(self.findings),
             },
+            'root_cause_groups': self.root_cause_groups_to_dicts(),
             'findings': self._findings_as_dicts(sorted_findings),
             'recon_data': {
                 'subdomains': self.recon_data.get('subdomains', []),

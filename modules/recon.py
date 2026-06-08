@@ -10,12 +10,10 @@ from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 
 from modules.utils import make_session, safe_get, same_domain, log, Colors, url_in_scope, finding
-
 try:
     from playwright.sync_api import sync_playwright
-    _PLAYWRIGHT_AVAILABLE = True
 except ImportError:
-    _PLAYWRIGHT_AVAILABLE = False
+    sync_playwright = None
 
 # Regex patterns to discover API endpoints inside JavaScript source code
 JS_API_PATTERNS = [
@@ -76,11 +74,11 @@ class Recon:
         self.max_urls = config.get('max_urls', 250)
         self.headless = config.get('headless', False)
 
-        # Query capabilities from container or fall back to module-level flag
+        # Query capabilities from container
         if container and container.capabilities:
             self._playwright_available = container.capabilities.has("playwright")
         else:
-            self._playwright_available = _PLAYWRIGHT_AVAILABLE
+            self._playwright_available = False
 
         if self.headless and not self._playwright_available:
             log("--headless requires playwright. Install: pip install playwright && python -m playwright install chromium", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
@@ -109,15 +107,28 @@ class Recon:
         self.subdomains_lock = threading.Lock()
         self.js_endpoints_lock = threading.Lock()
         self.crawl_lock = threading.Lock()  # Shared lock for visited and depth data
-        self._fingerprint_shell()
-        self._validate_auth()
+        if not config.get("dry_run"):
+            self._fingerprint_shell()
+            self._validate_auth()
         
     def run(self):
         """
         Execute the reconnaissance process.
         """
         log(f"Starting reconnaissance on {self.target}", Colors.CYAN, self.verbose)
-        
+
+        if self.config.get("dry_run"):
+            self.urls.add(self.target)
+            return {
+                'urls': sorted(list(self.urls)),
+                'forms': self.forms,
+                'params': sorted(list(self.params)),
+                'subdomains': sorted(list(self.subdomains)),
+                'js_urls': sorted(list(self.js_urls)),
+                'js_endpoints': sorted(list(self._js_endpoints)),
+                'authenticated': self.authenticated,
+            }
+
         # Start with subdomain enumeration and discover additional endpoints
         self._enumerate_subdomains()
         self._crt_sh_lookup()
@@ -190,8 +201,9 @@ class Recon:
 
     def _add_discovered_url(self, url, response=None):
         """Add a crawled page only after SPA-shell filtering has accepted it."""
-        if self.max_urls and len(self.urls) >= self.max_urls:
-            return False
+        with self.urls_lock:
+            if self.max_urls and len(self.urls) >= self.max_urls:
+                return False
         if urlparse(url).path.lower().endswith(".js"):
             with self.js_urls_lock:
                 self.js_urls.add(url)
@@ -200,7 +212,8 @@ class Recon:
             response = safe_get(self.session, url, self.timeout, raise_for_status=False)
         if response is None or not self._is_real_page(response):
             return False
-        self.urls.add(url)
+        with self.urls_lock:
+            self.urls.add(url)
         return True
 
     def _extract_scripts(self, url, soup):
@@ -398,8 +411,7 @@ class Recon:
                         if path and path != "/":
                             candidate = urljoin(self.base_url, path)
                             if same_domain(self.base_url, candidate) and not self._should_skip_link(candidate):
-                                with self.urls_lock:
-                                    self._add_discovered_url(candidate)
+                                self._add_discovered_url(candidate)
                 if self.verbose:
                     log(f"Discovered robots.txt entries from {robots_url}", Colors.GREEN, self.verbose)
         except Exception as e:
@@ -419,8 +431,7 @@ class Recon:
                     for loc in soup.find_all('loc'):
                         candidate = loc.text.strip()
                         if same_domain(self.base_url, candidate) and url_in_scope(candidate, self.config):
-                            with self.urls_lock:
-                                self._add_discovered_url(candidate)
+                            self._add_discovered_url(candidate)
                     if self.verbose:
                         log(f"Discovered sitemap entries from {sitemap_url}", Colors.GREEN, self.verbose)
             except Exception as e:
@@ -525,7 +536,7 @@ class Recon:
     def _crawl_headless(self) -> None:
         """Crawl with Playwright: intercept XHR/fetch, click interactive
         elements, and extract JS endpoints from bundled source."""
-        if not self._playwright_available:
+        if not self._playwright_available or sync_playwright is None:
             return
         log("[*] Headless crawl started (Playwright) …", Colors.CYAN, verbose_only=True, verbose=self.verbose)
         visited = set()

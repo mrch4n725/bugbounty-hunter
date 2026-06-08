@@ -76,7 +76,7 @@ check("All utils symbols import cleanly", True)
 # ═══════════════════════════════════════════════════════════
 section("2. Enums")
 for enum_, members in [
-    (VerificationStage, ("DETECTED", "VALIDATED", "EXPLOITABLE", "VERIFIED")),
+    (VerificationStage, ("DETECTED", "PARTIALLY_VALIDATED", "VALIDATED", "EXPLOITABLE", "VERIFIED")),
     (EvidenceStrength,  ("WEAK", "MODERATE", "STRONG", "VERIFIED")),
     (ConfidenceLevel,   ("UNVERIFIED", "LIKELY", "HIGH_CONFIDENCE", "CONFIRMED")),
     (FalsePositiveRisk, ("HIGH", "MEDIUM", "LOW")),
@@ -416,6 +416,316 @@ dangerous = "<script>alert('xss')</script>"
 escaped_str = html_module.escape(dangerous)
 check("html.escape produces no raw tags",      "<script>" not in escaped_str)
 check("html.escape includes lt entity",        "&lt;" in escaped_str)
+
+# ═══════════════════════════════════════════════════════════
+# AuthorizationEngine
+# ═══════════════════════════════════════════════════════════
+section("18. AuthorizationEngine")
+from engines.authorization import (
+    AuthorizationEngine, _is_auth_candidate, _find_id_param, _role_level,
+)
+from models.evidence import AuthorizationComparisonEvidence, EvidenceStatus
+
+check("AuthorizationEngine importable", True)
+
+# Test _role_level
+check_eq("_role_level admin", _role_level("admin"), 4)
+check_eq("_role_level user", _role_level("user"), 2)
+check_eq("_role_level guest", _role_level("guest"), 1)
+check_eq("_role_level unknown", _role_level("custom_user"), 2)
+
+# Test _is_auth_candidate
+check("auth candidate: user ID in path",
+    _is_auth_candidate("https://ex.com/api/users/123"))
+check("auth candidate: ID param",
+    _is_auth_candidate("https://ex.com/profile?user_id=456"))
+check("auth candidate: API path",
+    _is_auth_candidate("https://ex.com/api/v1/orders"))
+check("not auth candidate: static page",
+    not _is_auth_candidate("https://ex.com/about"))
+check("not auth candidate: homepage",
+    not _is_auth_candidate("https://ex.com/index.html"))
+
+# Test _find_id_param
+check_eq("find id param: user_id",
+    _find_id_param("https://ex.com/data?user_id=123"), "user_id")
+check_eq("find id param: __path__",
+    _find_id_param("https://ex.com/users/123"), "__path__")
+check_eq("find id param: none",
+    _find_id_param("https://ex.com/about"), "")
+
+# Test engine creation with < 2 roles returns no findings
+engine = AuthorizationEngine({"target": "https://ex.com"})
+findings = engine.run_scans(["https://ex.com/api/users/1"])
+check("engine: <2 roles returns empty",
+    len(findings) == 0)
+
+# Test engine with mock role sessions
+class MockResponse:
+    def __init__(self, text, status_code=200):
+        self.text = text
+        self.status_code = status_code
+        self.headers = {"Content-Type": "text/html"}
+    def __bool__(self):
+        return True
+
+mock_session_a = type("MockSession", (), {
+    "headers": {"Authorization": "Bearer tok_a"},
+    "cookies": {},
+    "get": lambda self, url, **kw: MockResponse("data for user_a", 200),
+})()
+mock_session_b = type("MockSession", (), {
+    "headers": {"Authorization": "Bearer tok_b"},
+    "cookies": {},
+    "get": lambda self, url, **kw: MockResponse("data for user_b", 200),
+})()
+
+engine2 = AuthorizationEngine(
+    {"target": "https://ex.com", "timeout": 5},
+    role_sessions={"user_a": mock_session_a, "user_b": mock_session_b},
+)
+
+# Monkey-patch safe_get to use our mock sessions
+import modules.utils as mu
+_orig_safe_get = mu.safe_get
+def _mock_safe_get(session, url, **kw):
+    return session.get(url)
+mu.safe_get = _mock_safe_get
+
+try:
+    findings2 = engine2.run_scans(["https://ex.com/api/users/1"])
+    check("engine: 2 roles produces findings",
+        len(findings2) > 0)
+    for f in findings2:
+        check("engine: finding has root_cause",
+            f.get("root_cause") == "Missing Authorization Check")
+        check("engine: finding has evidence list",
+            isinstance(f.get("evidence"), list))
+        check("engine: finding has AuthorizationComparisonEvidence",
+            any(isinstance(e, AuthorizationComparisonEvidence)
+                for e in f["evidence"]))
+        check("engine: finding has fingerprint",
+            bool(f.get("fingerprint")))
+        check("engine: finding has steps_to_reproduce",
+            bool(f.get("steps_to_reproduce")))
+        check("engine: finding has request",
+            bool(f.get("request")))
+    # Test ownership verification
+    ev = engine2.test_endpoint(
+        "https://ex.com/api/users/1", "user_a", "user_b"
+    )
+    check("engine: test_endpoint returns evidence", ev is not None)
+    check("engine: ownership violated (different data)",
+        ev.ownership_violated is True)
+    f2 = engine2._build_finding(ev, "https://ex.com/api/users/1")
+    check("engine: _build_finding returns finding", f2 is not None)
+    if f2:
+        check("engine: finding severity critical",
+            f2.get("severity") == "critical")
+        check("engine: finding verified",
+            f2.get("verification_stage") == "verified")
+        check("engine: vuln_type ownership violation",
+            f2.get("vuln_type") == "Authorization - Ownership Violation")
+finally:
+    mu.safe_get = _orig_safe_get
+
+# Reset global dedup to avoid duplicate collisions from prior test
+reset_seen_findings()
+
+# Test isolate methods (horizontal, vertical)
+engine3 = AuthorizationEngine(
+    {"target": "https://ex.com"},
+    role_sessions={"user_a": mock_session_a, "user_b": mock_session_b},
+)
+# Use same mock
+mu.safe_get = _mock_safe_get
+try:
+    h_findings = engine3.run_horizontal(["https://ex.com/api/users/1"])
+    check("engine: horizontal returns findings",
+        len(h_findings) > 0)
+    v_findings = engine3.run_vertical(["https://ex.com/api/users/1"])
+    check("engine: vertical returns zero (same level)",
+        len(v_findings) == 0)
+    reset_seen_findings()
+    own = engine3.verify_ownership(
+        "https://ex.com/api/users/1", "user_a", "user_b"
+    )
+    check("engine: verify_ownership returns finding",
+        own is not None)
+finally:
+    mu.safe_get = _orig_safe_get
+
+# Test AuthorizationScanner is discoverable
+from scanners import discover_scanner_classes
+cls_map = discover_scanner_classes()
+check("auth scanner discoverable",
+    "authorization" in cls_map)
+check("auth scanner is ScannerBase subclass",
+    cls_map["authorization"].SCANNER_NAME == "authorization")
+check("auth scanner maturity >= 4",
+    cls_map["authorization"].SCANNER_MATURITY >= 4)
+check("auth scanner is target-level",
+    cls_map["authorization"].TARGET_LEVEL is True)
+
+# Test that scan_authorization method exists on VulnScanner
+check("scan_authorization on VulnScanner",
+    hasattr(scanner.VulnScanner, "scan_authorization"))
+
+# Test that authorization is in module_map choices
+a4 = p.parse_args(["--target", "https://x.com", "--modules", "authorization"])
+check("authorization module flag parsed",
+    "authorization" in a4.modules)
+a5 = p.parse_args(["--target", "https://x.com", "--disable-modules", "authorization"])
+check("authorization disable flag parsed",
+    "authorization" in a5.disable_modules)
+
+# ═══════════════════════════════════════════════════════════
+# Scanner maturity levels
+# ═══════════════════════════════════════════════════════════
+section("19. Scanner Maturity Levels")
+expected_maturity = {
+    "xss": 4, "sqli": 4, "ssrf": 4, "blind_xss": 4, "cmd_injection": 4,
+    "xxe": 4, "authorization": 4, "ssti": 4, "headers": 4, "sensitive": 4,
+    "lfi": 3, "open_redirect": 3, "exposed_files": 3, "graphql": 3,
+    "idor": 3, "clickjacking": 1, "csrf": 1, "http_methods": 1,
+    "insecure_forms": 1, "dirb": 1, "subdomain_takeover": 1,
+    "rate_limiting": 1, "openapi": 2,
+}
+for scanner_name, expected in expected_maturity.items():
+    cls = cls_map.get(scanner_name)
+    if cls is None:
+        check(f"{scanner_name} maturity: scanner not found", False)
+    else:
+        actual = cls.SCANNER_MATURITY
+        check(f"{scanner_name} maturity == {expected}",
+              actual == expected,
+              detail=f"got {actual}")
+
+# ═══════════════════════════════════════════════════════════
+# Evidence Completeness Validator
+# ═══════════════════════════════════════════════════════════
+section("20. Evidence Completeness Validator")
+from engines.evidence_validator import EvidenceCompletenessValidator
+from models.finding import Finding
+from models.evidence import (
+    HttpRequestEvidence, OOBCallbackEvidence, TimingEvidence,
+    BrowserExecutionEvidence, ResponseExcerptEvidence,
+    AuthorizationComparisonEvidence, GraphQLSchemaEvidence,
+    SecretValidationEvidence,
+)
+
+# ── Complete finding passes validation ──
+f_ok = Finding(
+    vuln_type="XSS", title="Reflected XSS", url="https://ex.com/x",
+    evidence=[
+        HttpRequestEvidence(method="GET", url="https://ex.com/x"),
+        BrowserExecutionEvidence(alert_fired=True, execution_context="alert(1)"),
+    ],
+    confidence_score=100, verification_stage="verified",
+)
+result = EvidenceCompletenessValidator.validate(f_ok)
+check("complete XSS keeps confidence", result.confidence_score == 100)
+check("complete XSS keeps stage", result.verification_stage == "verified")
+check("complete XSS no penalty reason", all("incomplete" not in r for r in result.confidence_reasons))
+
+# ── Incomplete SSRF (missing OOB callback) gets penalised ──
+f_no_oob = Finding(
+    vuln_type="SSRF", title="SSRF", url="https://ex.com/ssrf",
+    evidence=[
+        HttpRequestEvidence(method="GET", url="https://ex.com/ssrf?url=http://169.254.169.254"),
+    ],
+    confidence_score=100, verification_stage="verified",
+)
+result = EvidenceCompletenessValidator.validate(f_no_oob)
+check("incomplete SSRF confidence reduced", result.confidence_score == 85)
+check("incomplete SSRF stage = partially_validated", result.verification_stage == "partially_validated")
+check("incomplete SSRF has penalty reason", any("incomplete" in r for r in result.confidence_reasons))
+
+# ── Missing HTTP request but has callback ──
+f_no_req = Finding(
+    vuln_type="Blind XSS", title="Blind XSS (Stored)", url="https://ex.com/contact",
+    evidence=[OOBCallbackEvidence(callback_type="dns", callback_host="oob.example.com")],
+    confidence_score=100, verification_stage="verified",
+)
+result = EvidenceCompletenessValidator.validate(f_no_req)
+check("blind xss with callback keeps confidence", result.confidence_score == 100)
+check("blind xss with callback keeps stage", result.verification_stage == "verified")
+
+# ── SQLi missing timing evidence ──
+f_no_timing = Finding(
+    vuln_type="SQL Injection", title="SQL Injection", url="https://ex.com/sqli",
+    evidence=[HttpRequestEvidence(method="GET", url="https://ex.com/sqli?id=1'")],
+    confidence_score=60, verification_stage="validated",
+)
+result = EvidenceCompletenessValidator.validate(f_no_timing)
+check("sqli missing timing confidence reduced", result.confidence_score == 45)
+check("sqli missing timing stage", result.verification_stage == "partially_validated")
+
+# ── Finding with all required evidence passes ──
+f_sqli_ok = Finding(
+    vuln_type="SQL Injection", title="SQL Injection", url="https://ex.com/sqli",
+    evidence=[
+        HttpRequestEvidence(method="GET", url="https://ex.com/sqli?id=1'"),
+        TimingEvidence(baseline_time_ms=50.0, triggered_time_ms=2500.0),
+    ],
+    confidence_score=80, verification_stage="validated",
+)
+result = EvidenceCompletenessValidator.validate(f_sqli_ok)
+check("complete sqli keeps confidence", result.confidence_score == 80)
+check("complete sqli keeps stage", result.verification_stage == "validated")
+
+# ── IDOR missing auth comparison evidence ──
+f_idor = Finding(
+    vuln_type="IDOR", title="IDOR - Insecure Direct Object Reference", url="https://ex.com/user/123",
+    evidence=[
+        HttpRequestEvidence(method="GET", url="https://ex.com/user/123"),
+        ResponseExcerptEvidence(excerpt="email: other@user.com"),
+    ],
+    confidence_score=90, verification_stage="verified",
+)
+result = EvidenceCompletenessValidator.validate(f_idor)
+check("idor missing auth comparison confidence reduced", result.confidence_score == 75)
+check("idor missing auth comparison stage", result.verification_stage == "partially_validated")
+
+# ── IDOR with all evidence passes ──
+f_idor_ok = Finding(
+    vuln_type="IDOR", title="IDOR", url="https://ex.com/user/123",
+    evidence=[
+        HttpRequestEvidence(method="GET", url="https://ex.com/user/123"),
+        AuthorizationComparisonEvidence(original_user="user_a", target_user="user_b",
+                                         ownership_violated=True, content_different=True),
+        ResponseExcerptEvidence(excerpt="email: other@user.com"),
+    ],
+    confidence_score=95, verification_stage="verified",
+)
+result = EvidenceCompletenessValidator.validate(f_idor_ok)
+check("complete idor keeps confidence", result.confidence_score == 95)
+
+# ── Exempt type not penalised ──
+f_exempt = Finding(
+    vuln_type="Forbidden Path", title="Forbidden Path (Access Control Exists)",
+    url="https://ex.com/admin", evidence=[], confidence_score=25,
+)
+result = EvidenceCompletenessValidator.validate(f_exempt)
+check("exempt type not penalised", result.confidence_score == 25)
+
+# ── Unknown vuln_type not penalised ──
+f_unknown = Finding(
+    vuln_type="Unknown Thing", title="Foo", url="https://ex.com/foo",
+    evidence=[], confidence_score=50,
+)
+result = EvidenceCompletenessValidator.validate(f_unknown)
+check("unknown type not penalised", result.confidence_score == 50)
+
+# ── Legacy evidence (strings) does not crash ──
+f_legacy = Finding(
+    vuln_type="XSS", title="XSS", url="https://ex.com/x",
+    evidence=["alert(1)"], confidence_score=75, verification_stage="validated",
+)
+result = EvidenceCompletenessValidator.validate(f_legacy)
+# Legacy string evidence does not count as HTTP_REQUEST, so it should fail
+check("legacy evidence still validated", result.confidence_score == 60)
+check("legacy evidence stage", result.verification_stage == "partially_validated")
 
 # ═══════════════════════════════════════════════════════════
 # Summary

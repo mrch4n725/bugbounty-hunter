@@ -25,6 +25,7 @@ def _uuid7() -> str:
 
 class VerificationStage(str, enum.Enum):
     DETECTED = "detected"
+    PARTIALLY_VALIDATED = "partially_validated"
     VALIDATED = "validated"
     EXPLOITABLE = "exploitable"
     VERIFIED = "verified"
@@ -234,6 +235,8 @@ class Finding:
     timestamp: str = ""
     scanner_version: str = ""
 
+    confidence_reasons: list[str] = field(default_factory=list)
+
     def __post_init__(self):
         if not self.id:
             self.id = _uuid7()
@@ -243,12 +246,13 @@ class Finding:
             self.fingerprint = compute_fingerprint(self.vuln_type, self.url, self.parameter)
         if not self.root_cause_fingerprint and self.root_cause:
             self.root_cause_fingerprint = compute_root_cause_fingerprint(self.vuln_type, self.root_cause)
-        if not self.confidence_label:
-            self.confidence_label = ConfidenceLevel.from_score(self.confidence_score).value
-        if not self.evidence_strength:
-            self.evidence_strength = evidence_strength_from_score(self.confidence_score).value
-        if not self.false_positive_risk:
-            self.false_positive_risk = false_positive_risk_from_score(self.confidence_score).value
+        if self.confidence_score != 25:
+            if self.confidence_label == "Unverified":
+                self.confidence_label = ConfidenceLevel.from_score(self.confidence_score).value
+            if self.evidence_strength == "weak":
+                self.evidence_strength = evidence_strength_from_score(self.confidence_score).value
+            if self.false_positive_risk == "high":
+                self.false_positive_risk = false_positive_risk_from_score(self.confidence_score).value
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -275,6 +279,7 @@ class Finding:
             "validation_signals": self.validation_signals,
             "root_cause": self.root_cause,
             "exploitability_rating": self.exploitability_rating,
+            "confidence_reasons": list(self.confidence_reasons),
         }
         if self.grouped_urls:
             result["grouped_urls"] = self.grouped_urls
@@ -334,6 +339,7 @@ class Finding:
             request=d.get("request", ""),
             response_excerpt=d.get("response_excerpt", ""),
             timestamp=d.get("timestamp", ""),
+            confidence_reasons=d.get("confidence_reasons", []),
         )
         f.evidence = evidence_list
         # Preserve legacy keys as dynamic attributes for backward compat

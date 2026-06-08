@@ -27,11 +27,20 @@ class TXTReporter(ReporterBase):
         prefix = " " * spaces
         return "\n".join(f"{prefix}{line}" for line in text.splitlines())
 
+    @staticmethod
+    def _get_confidence_reasons_txt(f: Any) -> str:
+        reasons = f.get("confidence_reasons")
+        if not reasons or not isinstance(reasons, list) or len(reasons) == 0:
+            return "—"
+        return "; ".join(reasons)
+
     def render(self) -> str:
         sorted_findings = self._sort_findings()
         severity_counts = self._get_severity_counts()
         subdomains = self.recon_data.get('subdomains', [])
         urls = self.recon_data.get('urls', [])
+
+        exec_summary = self._build_executive_summary()
 
         lines = [
             '=' * 80,
@@ -49,18 +58,9 @@ class TXTReporter(ReporterBase):
             f'Max URLs: {self.config.get("max_urls")}',
             f'Passive Mode: {self.config.get("passive")}',
             '',
-            '=' * 80,
-            'SUMMARY',
-            '=' * 80,
+            exec_summary,
             '',
-            f'Critical: {severity_counts["critical"]}',
-            f'High: {severity_counts["high"]}',
-            f'Medium: {severity_counts["medium"]}',
-            f'Low: {severity_counts["low"]}',
-            f'Info: {severity_counts["info"]}',
-            '',
-            f'Total Findings: {len(self.findings)}',
-            '',
+            self._render_root_cause_sections_txt(),
             '=' * 80,
             'VULNERABILITY FINDINGS',
             '=' * 80,
@@ -72,7 +72,7 @@ class TXTReporter(ReporterBase):
             for i, f in enumerate(sorted_findings, 1):
                 score = f.get('confidence_score')
                 score_str = f"{score:.0f}/100" if score is not None else "—"
-                stage = f.get('verification_stage', '').title() or "—"
+                stage = f.get('verification_stage', '').replace('_', ' ').title() or "—"
                 fpr = f.get('false_positive_risk', '')
                 cvss_score = self._get_cvss_score(f)
                 cvss_rating = self._severity_rating(cvss_score)
@@ -88,6 +88,7 @@ class TXTReporter(ReporterBase):
                     f'    Verification: {stage}',
                     f'    CVSS        : {cvss_score:.1f} ({cvss_rating})',
                     f'    FP Risk     : {fpr or "—"}',
+                    f'    Confidence R: {self._get_confidence_reasons_txt(f)}',
                     f'    URL         : {f.get("url", "N/A")}',
                     f'    Parameter   : {f.get("parameter", "N/A")}',
                     f'    Details     : {f.get("details", "N/A")}',
@@ -105,7 +106,10 @@ class TXTReporter(ReporterBase):
                 if steps:
                     for s in steps[:5]:
                         lines.append(f"    ⬩ {s}")
+                structured_impact = self._format_structured_impact(f)
                 lines.append(f'    Impact      : {impact[:200]}...' if len(impact) > 200 else f'    Impact      : {impact}')
+                if structured_impact:
+                    lines.append(f'    Impact Detail: {structured_impact}')
                 lines.append(f'    Remediation : {remediation[:200]}...' if len(remediation) > 200 else f'    Remediation : {remediation}')
 
         if subdomains:

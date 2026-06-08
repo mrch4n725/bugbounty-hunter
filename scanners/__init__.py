@@ -21,6 +21,7 @@ from scanners.command_injection import CommandInjectionScanner
 from scanners.graphql import GraphQLScanner
 from scanners.idor import IdorScannerAdapter
 from scanners.openapi import OpenAPIScanner
+from scanners.authorization import AuthorizationScanner
 
 __all__ = [
     "ScannerBase",
@@ -46,6 +47,7 @@ __all__ = [
     "GraphQLScanner",
     "IdorScannerAdapter",
     "OpenAPIScanner",
+    "AuthorizationScanner",
 ]
 
 

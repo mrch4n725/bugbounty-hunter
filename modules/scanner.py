@@ -521,8 +521,12 @@ class VulnScanner:
     def _dispatch_to_scanner(self, name: str, target_urls: list[str] | None = None) -> list[dict] | None:
         """Dispatch to a ScannerBase subclass if available.
 
-        Returns findings list if the scanner was found and ran,
-        or None to signal that the caller should fall back to legacy logic.
+        New scanner findings are ALWAYS added to dedup regardless of maturity.
+
+        Returns findings list if the scanner was found, ran,
+        AND its SCANNER_MATURITY >= 4 (mature enough to replace legacy).
+        Returns None to signal that the caller should fall back to legacy logic
+        (either no scanner available, or SCANNER_MATURITY < 4).
         """
         if not self._use_new_scanners:
             return None
@@ -537,11 +541,18 @@ class VulnScanner:
         results = inst.scan(target_urls)
         extra   = inst.finalize()
         new_findings = results + extra
+        deduped = []
         for f in new_findings:
             if f:
                 with self._lock:
-                    self.dedup.add_legacy(f)
-        return new_findings
+                    if self.dedup.add_legacy(f):
+                        deduped.append(f)
+        new_findings = deduped
+        # Phase 3: maturity gate — only skip legacy for mature scanners (>=4)
+        maturity = getattr(inst, 'SCANNER_MATURITY', 1)
+        if maturity >= 4:
+            return new_findings
+        return None
 
     # ── Re-verification Loop (DEPRECATED) ─────────────────────────────
 
@@ -556,7 +567,7 @@ class VulnScanner:
             stage = f.get("verification_stage", "").lower()
             if stage not in ("detected",):
                 continue
-            vuln_type = f.get("type", "").lower()
+            vuln_type = f.get("vuln_type", "").lower()
             url = f.get("url", "")
             param = f.get("parameter", "")
             signal_count = len(f.get("validation_steps", []))
@@ -640,8 +651,8 @@ class VulnScanner:
         exploitable = [f for f in findings if VulnScanner._is_exploitable(f)]
 
         # CSRF + XSS (same origin) → ATO
-        csrf = [f for f in exploitable if "csrf" in f.get("type", "").lower() and f.get("url")]
-        xss = [f for f in exploitable if "xss" in f.get("type", "").lower() and f.get("url")]
+        csrf = [f for f in exploitable if "csrf" in f.get("vuln_type", "").lower() and f.get("url")]
+        xss = [f for f in exploitable if "xss" in f.get("vuln_type", "").lower() and f.get("url")]
         for c in csrf:
             c_origin = VulnScanner._origin(c["url"])
             match = next((x for x in xss if VulnScanner._origin(x["url"]) == c_origin), None)
@@ -668,7 +679,7 @@ class VulnScanner:
                 break
 
         # SSRF (exploitable only) → RCE potential
-        ssrf = [f for f in exploitable if "ssrf" in f.get("type", "").lower()]
+        ssrf = [f for f in exploitable if "ssrf" in f.get("vuln_type", "").lower()]
         if ssrf:
             cf = finding(
                 vuln_type="Chained: SSRF → Internal Service Enumeration / RCE",
@@ -691,8 +702,8 @@ class VulnScanner:
                 chains_found.append(cf)
 
         # IDOR + sensitive data (same origin) → PII breach
-        idor = [f for f in exploitable if "idor" in f.get("type", "").lower() or "id" in f.get("parameter", "").lower()]
-        sensitive = [f for f in exploitable if "sensitive" in f.get("type", "").lower()]
+        idor = [f for f in exploitable if "idor" in f.get("vuln_type", "").lower() or "id" in f.get("parameter", "").lower()]
+        sensitive = [f for f in exploitable if "sensitive" in f.get("vuln_type", "").lower()]
         for i in idor:
             i_origin = VulnScanner._origin(i["url"])
             match = next((s for s in sensitive if VulnScanner._origin(s["url"]) == i_origin), None)
@@ -732,7 +743,7 @@ class VulnScanner:
         """Check for dangerous findings that should halt active testing and flag for human review."""
         halted = []
         for f in findings:
-            vuln_type = f.get("type", "").lower()
+            vuln_type = f.get("vuln_type", "").lower()
             severity = f.get("severity", "").lower()
             stage = f.get("verification_stage", "").lower()
 
@@ -1165,7 +1176,8 @@ class VulnScanner:
         Args:
             target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
         """
-        if result := self._dispatch_to_scanner("sqli", target_urls):
+        result = self._dispatch_to_scanner("sqli", target_urls)
+        if result is not None:
             return result
 
         self._prepare_scan()
@@ -1522,7 +1534,8 @@ class VulnScanner:
         Args:
             target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
         """
-        if result := self._dispatch_to_scanner("ssrf", target_urls):
+        result = self._dispatch_to_scanner("ssrf", target_urls)
+        if result is not None:
             return result
 
         oob_host = self.config.get("oob_host")
@@ -1576,7 +1589,7 @@ class VulnScanner:
                             safe_get(self.session, oob_url, self.timeout, raise_for_status=False)
                             self.oob.register_interaction("ssrf", oob_url, test_url)
 
-                if vulnerable_params:
+                if vulnerable_params and resp:
                     resp_hash = hashlib.md5(resp.text.encode()).hexdigest()
                     baseline_diff = baseline_hash is not None and resp_hash != baseline_hash
                     confidence_score = self._calculate_ssrf_confidence(
@@ -1651,7 +1664,8 @@ class VulnScanner:
         Args:
             target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
         """
-        if result := self._dispatch_to_scanner("xxe", target_urls):
+        result = self._dispatch_to_scanner("xxe", target_urls)
+        if result is not None:
             return result
         findings: list[dict] = []
         oob_host = self.config.get("oob_host")
@@ -1785,7 +1799,8 @@ class VulnScanner:
         Args:
             target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
         """
-        if result := self._dispatch_to_scanner("cmd_injection", target_urls):
+        result = self._dispatch_to_scanner("cmd_injection", target_urls)
+        if result is not None:
             return result
         oob_host = self.config.get("oob_host")
         findings: list[dict] = []
@@ -1972,7 +1987,8 @@ class VulnScanner:
         self._prepare_scan()
 
         # Phase 3: delegate to XSSScanner when enabled
-        if result := self._dispatch_to_scanner("xss", target_urls):
+        result = self._dispatch_to_scanner("xss", target_urls)
+        if result is not None:
             return result
 
         self._prepare_scan()
@@ -2232,7 +2248,8 @@ class VulnScanner:
         Injects payloads that make outbound requests when executed by a
         victim (stored XSS) and waits for OOB callbacks to confirm execution.
         """
-        if result := self._dispatch_to_scanner("blind_xss"):
+        result = self._dispatch_to_scanner("blind_xss")
+        if result is not None:
             return result
         oob_host = self.config.get("oob_host")
         if not oob_host:
@@ -3548,6 +3565,16 @@ class VulnScanner:
         from modules.idor import IdorScanner
         idor = IdorScanner(self.config, self.recon, container=self._container)
         return idor.run_all()
+
+    def scan_authorization(self, target_urls: list[str] | None = None) -> list[dict]:
+        """Dispatch to AuthorizationScanner (ScannerBase).
+
+        Proves authorization failures with evidence-driven role comparison.
+        No legacy fallback — this is a pure ScannerBase module.
+        """
+        if result := self._dispatch_to_scanner("authorization", target_urls):
+            return result
+        return []
 
     # ═════════════════════════════════════════════════════════════════════
     # Verify-only mode

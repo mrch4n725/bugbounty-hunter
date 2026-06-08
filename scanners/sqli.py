@@ -21,7 +21,7 @@ from modules.utils import (
     finding, log, Colors, _build_curl, safe_get, safe_post,
     VerificationStage,
 )
-from scanners.base import ScannerBase, DetectionResult
+from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
 SQLI_ERRORS = [
     "sql syntax", "mysql", "ora-", "unclosed quotation mark",
@@ -95,6 +95,20 @@ POST_SQLI_PAYLOADS = {
 }
 
 
+class SQLiDetectionResult:
+    """Structured detection result for SQLi that carries multi-signal data."""
+    def __init__(self, url: str, param: str, signals: dict,
+                 triggering_response: str | None = None,
+                 timing_evidence: TimingEvidence | None = None,
+                 evidence_parts: list[str] | None = None):
+        self.url = url
+        self.param = param
+        self.signals = signals
+        self.triggering_response = triggering_response
+        self.timing_evidence = timing_evidence
+        self.evidence_parts = evidence_parts or []
+
+
 class SQLiScanner(ScannerBase):
     SCANNER_NAME = "sqli"
     SCANNER_MATURITY = 4
@@ -102,9 +116,100 @@ class SQLiScanner(ScannerBase):
     def __init__(self, config: dict, recon: dict, container=None):
         super().__init__(config, recon, container=container)
 
+    # ── Detection phase ─────────────────────────────────────────────────
+
+    def detect(self, url: str, parameter: str | None = None) -> SQLiDetectionResult | None:
+        oob_host = self.config.get("oob_host")
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if parameter is None:
+            params = list(query.keys())
+            if not params:
+                return None
+            parameter = params[0]
+        values = query.get(parameter, ["1"])
+        original_value = values[0] if values else "1"
+        signals, trigger_resp, timing_ev, evidence_parts = self._test_parameter_signals(
+            url, parameter, original_value, SQLI_PAYLOADS, oob_host
+        )
+        if not any(signals.values()):
+            return None
+        return SQLiDetectionResult(
+            url=url,
+            param=parameter,
+            signals=signals,
+            triggering_response=trigger_resp,
+            timing_evidence=timing_ev,
+            evidence_parts=evidence_parts,
+        )
+
+    # ── Validation phase ────────────────────────────────────────────────
+
+    def validate(self, detection: SQLiDetectionResult) -> ValidationResult | None:
+        signal_count = sum(1 for v in detection.signals.values() if v)
+        evidence_parts = [k for k, v in detection.signals.items() if v]
+        if detection.signals.get("oob"):
+            return ValidationResult(
+                confirmed=True,
+                signals=evidence_parts,
+                method="oob",
+                detail="OOB callback confirmed",
+            )
+        if signal_count >= 3:
+            return ValidationResult(
+                confirmed=True,
+                signals=evidence_parts,
+                method="multi_signal",
+                detail=f"{signal_count} SQLi signals detected",
+            )
+        if signal_count >= 2:
+            return ValidationResult(
+                confirmed=True,
+                signals=evidence_parts,
+                method="multi_signal",
+                detail=f"{signal_count} SQLi signals detected",
+            )
+        if signal_count >= 1:
+            return ValidationResult(
+                confirmed=False,
+                signals=evidence_parts,
+                method="single_signal",
+                detail="Single SQLi signal — needs secondary confirmation",
+            )
+        return None
+
+    # ── Evidence collection ─────────────────────────────────────────────
+
+    def collect_evidence(self, detection: SQLiDetectionResult,
+                         validation: ValidationResult | None = None) -> list:
+        ev_list = []
+        if detection.timing_evidence:
+            ev_list.append(detection.timing_evidence)
+        return ev_list
+
+    # ── Reproduction steps ──────────────────────────────────────────────
+
+    def generate_reproduction(self, detection: SQLiDetectionResult,
+                              validation: ValidationResult | None = None) -> list[str]:
+        signal_detail = "; ".join(detection.evidence_parts)
+        is_post = "POST" in detection.param.upper()
+        if is_post:
+            content_type = "JSON" if "JSON" in detection.param else "XML" if "XML" in detection.param else "form"
+            return [
+                f"Send POST request to {detection.url} with Content-Type: application/{content_type.lower()} and a SQL injection payload in the body",
+                f"Observe signal: {signal_detail}",
+                "Compare POST response against baseline — SQL error messages confirm injection",
+            ]
+        return [
+            f"Send GET request to {detection.url} with SQL injection payload in parameter '{detection.param}'",
+            f"Observe signal: {signal_detail}",
+            "Compare response against baseline — SQL error messages, timing delays, or boolean condition differences confirm injection",
+        ]
+
+    # ── Scan entry point ────────────────────────────────────────────────
+
     def scan(self, target_urls: list[str] | None = None) -> list[dict]:
         self._prepare_scan()
-        payloads = SQLI_PAYLOADS
         oob_host = self.config.get("oob_host")
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
 
@@ -114,21 +219,55 @@ class SQLiScanner(ScannerBase):
             try:
                 parsed = urlparse(url)
                 query = parse_qs(parsed.query, keep_blank_values=True)
-                for param, values in query.items():
-                    original_value = values[0] if values else "1"
-                    signals, trigger_resp, timing_ev = self._test_parameter(url, param, original_value, payloads, oob_host)
-                    if any(signals.values()):
-                        f = self._build_finding(url, param, signals,
-                            request_str=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
-                            response_excerpt_str=trigger_resp or "")
-                        if f:
-                            if timing_ev and self.evidence_engine:
-                                self.evidence_engine.store(timing_ev)
-                                self.evidence_engine.link_to_finding(timing_ev, f.get("fingerprint", ""))
-                                if not isinstance(f.get("evidence", []), list):
-                                    f["evidence"] = [str(f.get("evidence", ""))]
-                                f["evidence"].append(timing_ev)
-                            self._add_finding(f)
+                for param, _ in query.items():
+                    detection_result = self.detect(url, param)
+                    if detection_result is None:
+                        continue
+
+                    validation_result = self.validate(detection_result)
+                    evidence_list = self.collect_evidence(detection_result, validation_result)
+
+                    signal_count = sum(1 for v in detection_result.signals.values() if v)
+                    evidence_parts = [k for k, v in detection_result.signals.items() if v]
+
+                    if detection_result.signals.get("oob"):
+                        title = "Confirmed SQL Injection (OOB)"
+                        severity = "critical"
+                        stage = VerificationStage.VERIFIED.value
+                    elif signal_count >= 3:
+                        title = "SQL Injection"
+                        severity = "critical"
+                        stage = VerificationStage.VALIDATED.value
+                    elif signal_count >= 2:
+                        title = "Likely SQL Injection"
+                        severity = "high"
+                        stage = VerificationStage.VALIDATED.value
+                    elif signal_count >= 1:
+                        title = "Potential SQL Injection"
+                        severity = "medium"
+                        stage = VerificationStage.DETECTED.value
+                    else:
+                        continue
+
+                    f = finding(
+                        vuln_type=title,
+                        url=url,
+                        severity=severity,
+                        details=f"Parameter '{param}': {signal_count} signal(s) detected ({', '.join(evidence_parts)})",
+                        evidence=" | ".join(evidence_parts),
+                        request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                        response_excerpt=detection_result.triggering_response or "",
+                        verification_stage=stage,
+                        parameter=param,
+                        steps_to_reproduce=self.generate_reproduction(detection_result, validation_result),
+                        validation_steps=[f"Signal: {s}" for s in evidence_parts],
+                    )
+                    if f:
+                        for ev in evidence_list:
+                            if self.evidence_engine:
+                                self.evidence_engine.store(ev)
+                                self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
+                        self._add_finding(f)
             except Exception as e:
                 log(f"  [SQLi] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
 
@@ -136,14 +275,14 @@ class SQLiScanner(ScannerBase):
             if not self._in_scope(url):
                 continue
             try:
-                self._test_post_body(url, payloads, oob_host)
+                self._test_post_body(url, SQLI_PAYLOADS, oob_host)
             except Exception as e:
                 log(f"  [SQLi POST] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
 
         return self._get_findings()
 
-    def _test_parameter(self, url: str, param: str, original_value: str,
-                        payloads: dict, oob_host: Optional[str]) -> tuple[dict, Optional[str], Optional[TimingEvidence]]:
+    def _test_parameter_signals(self, url: str, param: str, original_value: str,
+                                 payloads: dict, oob_host: Optional[str]) -> tuple[dict, Optional[str], Optional[TimingEvidence], list[str]]:
         signals = {"error": False, "boolean": False, "time": False, "union": False, "oob": False}
         timing_evidence: Optional[TimingEvidence] = None
         evidence_parts: list[str] = []
@@ -248,7 +387,14 @@ class SQLiScanner(ScannerBase):
                         evidence_parts.append(f"oob:callback received from {oob_host}")
                     break
 
-        return signals, triggering_response, timing_evidence
+        return signals, triggering_response, timing_evidence, evidence_parts
+
+    def _test_parameter(self, url: str, param: str, original_value: str,
+                        payloads: dict, oob_host: Optional[str]) -> tuple[dict, Optional[str], Optional[TimingEvidence]]:
+        signals, trigger_resp, timing_ev, _ = self._test_parameter_signals(
+            url, param, original_value, payloads, oob_host
+        )
+        return signals, trigger_resp, timing_ev
 
     def _test_post_body(self, url: str, payloads: dict, oob_host: Optional[str]) -> None:
         baseline_errors: set[str] = set()
@@ -332,6 +478,21 @@ class SQLiScanner(ScannerBase):
         else:
             return None
 
+        signal_detail = "; ".join(evidence_parts)
+        is_post = "POST" in param.upper()
+        if is_post:
+            content_type = "JSON" if "JSON" in param else "XML" if "XML" in param else "form"
+            steps = [
+                f"Send POST request to {url} with Content-Type: application/{content_type.lower()} and a SQL injection payload in the body",
+                f"Observe signal: {signal_detail}",
+                "Compare POST response against baseline — SQL error messages confirm injection",
+            ]
+        else:
+            steps = [
+                f"Send GET request to {url} with SQL injection payload in parameter '{param}'",
+                f"Observe signal: {signal_detail}",
+                "Compare response against baseline — SQL error messages, timing delays, or boolean condition differences confirm injection",
+            ]
         return finding(
             vuln_type=title,
             url=url,
@@ -342,6 +503,7 @@ class SQLiScanner(ScannerBase):
             response_excerpt=response_excerpt_str,
             verification_stage=stage,
             parameter=param,
+            steps_to_reproduce=steps,
             validation_steps=[f"Signal: {s}" for s in evidence_parts],
         )
 
