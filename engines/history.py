@@ -532,7 +532,11 @@ def correlate_findings(
     """
     target = config.get("target", "")
     output_dir = config.get("output_dir", "reports")
-    history_path = os.path.join(output_dir, "scan_history.json")
+    history_filename = config.get("history_file", "scan_history.json")
+    if os.path.isabs(history_filename):
+        history_path = history_filename
+    else:
+        history_path = os.path.join(output_dir, history_filename)
 
     history = ScanHistory(history_path)
     engine = HistoricalCorrelationEngine(history)

@@ -728,9 +728,9 @@ class SecretValidator:
         if SecretValidator._has_long_run(body, 4):
             return {"valid": False, "type": "twilio_sid", "details": "Long repeated-char run detected — not a real SID"}
         unique_chars = len(set(body))
-        if unique_chars < 24:
-            return {"valid": False, "type": "twilio_sid", "details": f"Too few unique chars ({unique_chars}/24) — likely garbage"}
-        return {"valid": True, "type": "twilio_sid", "details": "Format and entropy pass"}
+        if unique_chars < 10:
+            return {"valid": False, "type": "twilio_sid", "details": f"Too few unique chars ({unique_chars}/10) — likely garbage"}
+        return {"valid": None, "type": "twilio_sid", "details": "Format and entropy pass — not API-verified"}
 
     @staticmethod
     def validate_twilio_token(token: str) -> Dict[str, Any]:
@@ -745,7 +745,23 @@ class SecretValidator:
         unique_chars = len(set(body))
         if unique_chars < 24:
             return {"valid": False, "type": "twilio_token", "details": f"Too few unique chars ({unique_chars}/24) — likely garbage"}
-        return {"valid": True, "type": "twilio_token", "details": "Format and entropy pass"}
+        return {"valid": None, "type": "twilio_token", "details": "Format and entropy pass — not API-verified"}
+
+    @staticmethod
+    def validate_firebase_api_key(key: str) -> Dict[str, Any]:
+        """Offline format and entropy check for Firebase FCM server keys."""
+        if not key.startswith("AAAA"):
+            return {"valid": False, "type": "firebase_api_key", "details": "Invalid prefix (expected AAAA)"}
+        if len(key) < 50:
+            return {"valid": False, "type": "firebase_api_key", "details": "Too short to be a valid Firebase key"}
+        if "=" in key:
+            return {"valid": False, "type": "firebase_api_key", "details": "Base64 padding detected — likely binary/codec data"}
+        if SecretValidator._has_long_run(key, 5):
+            return {"valid": False, "type": "firebase_api_key", "details": "Long repeated-char run — likely binary encoded data"}
+        unique_chars = len(set(key))
+        if unique_chars < 20:
+            return {"valid": False, "type": "firebase_api_key", "details": f"Low entropy ({unique_chars} unique chars) — likely not a real key"}
+        return {"valid": None, "type": "firebase_api_key", "details": "Format and entropy pass — not API-verified"}
 
     @classmethod
     def validate(cls, secret_type: str, value: str) -> Dict[str, Any]:
@@ -757,6 +773,7 @@ class SecretValidator:
             "slack_token": cls.validate_slack_token,
             "twilio_sid": cls.validate_twilio_sid,
             "twilio_token": cls.validate_twilio_token,
+            "firebase_api_key": cls.validate_firebase_api_key,
         }
         handler = mapping.get(secret_type)
         if not handler:

@@ -237,11 +237,17 @@ class SSRFScanner(ScannerBase):
                     for ev in evidence_list:
                         self.evidence_engine.store(ev)
 
+                    parsed_for_fp = urlparse(url)
+                    ssrf_url = f"{parsed_for_fp.scheme}://{parsed_for_fp.netloc}"
+
                     f = finding(
                         vuln_type="Confirmed SSRF",
-                        url=url,
+                        url=ssrf_url,
                         severity="critical",
-                        details=f"Vulnerable parameters ({len(vulnerable_params)}): {', '.join(vulnerable_params[:10])}",
+                        details=(
+                            f"Vulnerable parameters ({len(vulnerable_params)}): "
+                            f"{', '.join(vulnerable_params[:10])} — triggered at: {url}"
+                        ),
                         evidence=f"Signatures: {', '.join(list(all_matched_sigs)[:5])}",
                         request=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                         response_excerpt=matching_resp.text[:500],

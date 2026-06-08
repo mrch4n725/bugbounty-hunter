@@ -734,9 +734,12 @@ def main():
         args = merge_configs(args, load_config_file(args.config))
     if getattr(args, 'auto', False):
         log("[*] Auto mode: applying sensible defaults (rps=3, threads=5, autosave=60s)", Colors.CYAN)
-        args.rps = 3.0
-        args.threads = 5
-        args.autosave_interval = 60
+        if args.rps == 5.0:
+            args.rps = 3.0
+        if args.threads == 10:
+            args.threads = 5
+        if args.autosave_interval == 0:
+            args.autosave_interval = 60
         if args.format == "html":
             args.format = "chatgpt"
 

@@ -22,9 +22,9 @@ class EvidenceCompletenessValidator:
         # ── Critical/high-impact classes need strong evidence ──────────
         ("local file inclusion",   {EvidenceType.HTTP_REQUEST, EvidenceType.RESPONSE_EXCERPT}),
         ("missing rate limiting",  {EvidenceType.HTTP_REQUEST, EvidenceType.TIMING_PROOF}),
-        ("confirmed ssti",         {EvidenceType.HTTP_REQUEST, EvidenceType.TIMING_PROOF}),
+        ("confirmed ssti",         {EvidenceType.HTTP_REQUEST, EvidenceType.RESPONSE_EXCERPT}),
         ("confirmed sqli",         {EvidenceType.HTTP_REQUEST, EvidenceType.OOB_CALLBACK}),
-        ("confirmed ssrf",         {EvidenceType.HTTP_REQUEST, EvidenceType.OOB_CALLBACK}),
+        ("confirmed ssrf",         {EvidenceType.HTTP_REQUEST, EvidenceType.RESPONSE_EXCERPT}),
         ("command injection",      {EvidenceType.HTTP_REQUEST, EvidenceType.OOB_CALLBACK}),
         ("cmd_injection",          {EvidenceType.HTTP_REQUEST, EvidenceType.OOB_CALLBACK}),
         ("blind xss",              {EvidenceType.OOB_CALLBACK}),
@@ -52,8 +52,8 @@ class EvidenceCompletenessValidator:
         ("idor",                   {EvidenceType.HTTP_REQUEST, EvidenceType.AUTHORIZATION_COMPARISON, EvidenceType.RESPONSE_EXCERPT}),
         ("bola",                   {EvidenceType.HTTP_REQUEST, EvidenceType.AUTHORIZATION_COMPARISON}),
         # ── Server-side injection ──────────────────────────────────────
-        ("ssrf",                   {EvidenceType.HTTP_REQUEST, EvidenceType.OOB_CALLBACK}),
-        ("ssti",                   {EvidenceType.HTTP_REQUEST, EvidenceType.TIMING_PROOF}),
+        ("ssrf",                   {EvidenceType.HTTP_REQUEST, EvidenceType.RESPONSE_EXCERPT}),
+        ("ssti",                   {EvidenceType.HTTP_REQUEST, EvidenceType.RESPONSE_EXCERPT}),
         ("xxe",                    {EvidenceType.HTTP_REQUEST, EvidenceType.OOB_CALLBACK}),
         ("lfi",                    {EvidenceType.HTTP_REQUEST, EvidenceType.RESPONSE_EXCERPT}),
         ("sqli",                   {EvidenceType.HTTP_REQUEST, EvidenceType.TIMING_PROOF}),
