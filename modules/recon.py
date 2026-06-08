@@ -375,30 +375,38 @@ class Recon:
     
     def _enumerate_subdomains(self):
         """
-        Enumerate common subdomains via DNS resolution.
+        Enumerate common subdomains via DNS resolution with per-task timeout.
         """
         parsed = urlparse(self.target if '://' in self.target else f'http://{self.target}')
         domain = parsed.netloc.split(':')[0]
         
         log(f"Enumerating subdomains for {domain}", Colors.CYAN, self.verbose)
         
+        dns_timeout = max(self.timeout, 5) if self.timeout else 5
+        start = time.time()
         with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = [
-                executor.submit(self._resolve_subdomain, subdomain, domain)
+            futures = {
+                executor.submit(self._resolve_subdomain, subdomain, domain): subdomain
                 for subdomain in self.COMMON_SUBDOMAINS
-            ]
+            }
             
-            dns_timeout = max(self.timeout * 2, 10) if self.timeout else 10
-            from concurrent.futures import as_completed, TimeoutError as FuturesTimeout
-            for future in as_completed(futures, timeout=dns_timeout):
-                try:
-                    future.result()
-                except FuturesTimeout:
-                    log("Subdomain enumeration timed out — skipping remaining DNS lookups", Colors.YELLOW)
+            from concurrent.futures import wait, FIRST_COMPLETED
+            while futures:
+                done, _ = wait(futures.keys(), timeout=dns_timeout, return_when=FIRST_COMPLETED)
+                for future in done:
+                    subdomain = futures.pop(future)
+                    try:
+                        future.result()
+                    except Exception as e:
+                        if self.verbose:
+                            log(f"Subdomain resolution error for {subdomain}: {str(e)}", Colors.RED, self.verbose)
+                if not futures:
                     break
-                except Exception as e:
-                    if self.verbose:
-                        log(f"Subdomain resolution error: {str(e)}", Colors.RED, self.verbose)
+                if time.time() - start > 90:
+                    log("Subdomain enumeration exceeded 90s — cancelling remaining", Colors.YELLOW)
+                    for f in futures:
+                        f.cancel()
+                    break
 
     def _discover_robots(self):
         """
@@ -766,23 +774,28 @@ class Recon:
 
     def _resolve_subdomain(self, subdomain, domain):
         """
-        Attempt to resolve a subdomain via DNS with a 5-second timeout.
+        Attempt to resolve a subdomain via DNS with a per-thread timeout.
+        Runs gethostbyname in a daemon thread so a slow resolver cannot hang
+        the scanner.
         """
         full_domain = f"{subdomain}.{domain}"
+        resolved = []
         
-        try:
-            socket.setdefaulttimeout(self.timeout or 5)
-            socket.gethostbyname(full_domain)
+        def resolve():
+            try:
+                socket.setdefaulttimeout(6)
+                addr = socket.gethostbyname(full_domain)
+                if addr:
+                    resolved.append(addr)
+            except Exception:
+                pass
+        
+        t = threading.Thread(target=resolve, daemon=True)
+        t.start()
+        t.join(timeout=7)
+        
+        if resolved:
             with self.subdomains_lock:
                 self.subdomains.add(full_domain)
-            
             if self.verbose:
-                log(f"Found subdomain: {full_domain}", Colors.GREEN, self.verbose)
-        
-        except socket.gaierror:
-            pass
-        except OSError:
-            pass
-        except Exception as e:
-            if self.verbose:
-                log(f"Error resolving {full_domain}: {str(e)}", Colors.RED, self.verbose)
+                log(f"Found subdomain: {full_domain} ({resolved[0]})", Colors.GREEN, self.verbose)

@@ -66,6 +66,8 @@ def parse_args():
         help="HTTP retry attempts for transient failures")
     parser.add_argument("--autosave-interval", type=int, default=0,
         help="Autosave interim report every N seconds (0 = disabled)")
+    parser.add_argument("--module-timeout", type=int, default=120,
+        help="Per-module timeout in seconds (default: 120)")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--passive", action="store_true")
     parser.add_argument("--headless", action="store_true",
@@ -274,6 +276,7 @@ def build_config(args):
         "report_format": args.format,
         "threads": args.threads,
         "timeout": args.timeout,
+        "module_timeout": getattr(args, "module_timeout", 120),
         "cookies": cookies,
         "cookies_alt": args.cookies_alt or "",
         "headers": custom_headers,
@@ -391,7 +394,34 @@ def _start_autosave(config, recon_data, all_findings, all_findings_lock, js_data
     return stop_event, thread
 
 
+def _run_module_with_timeout(mod_fn, module_timeout):
+    """Run a module function with a wall-clock timeout using a watchdog thread."""
+    result = []
+    exception = []
+    done = threading.Event()
+
+    def worker():
+        try:
+            r = mod_fn()
+            if r is not None:
+                result.extend(r if isinstance(r, list) else [r])
+        except Exception as e:
+            exception.append(e)
+        finally:
+            done.set()
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    if not done.wait(timeout=module_timeout):
+        log(f"  [!] Module timed out after {module_timeout}s — skipping", Colors.RED)
+        return []
+    if exception:
+        raise exception[0]
+    return result
+
+
 def _collect_module_findings(modules, config, run_all, disabled_modules, all_findings, lock):
+    module_timeout = int(config.get("module_timeout", 120))
     total = len(modules)
     for i, (mod_name, mod_fn) in enumerate(modules.items(), 1):
         if mod_name in disabled_modules:
@@ -400,7 +430,7 @@ def _collect_module_findings(modules, config, run_all, disabled_modules, all_fin
         if not (run_all or mod_name in config["modules"]):
             continue
         log(f"[{i}/{total}] Running {mod_name.upper()}...", Colors.CYAN)
-        findings = mod_fn()
+        findings = _run_module_with_timeout(mod_fn, module_timeout)
         if findings:
             log(f"[!] {len(findings)} finding(s) from {mod_name.upper()}", Colors.RED)
             with lock:

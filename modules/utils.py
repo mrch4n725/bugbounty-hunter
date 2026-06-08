@@ -1487,10 +1487,11 @@ def make_session(config: Dict[str, Any]) -> requests.Session:
 
     # ── Connection pooling with retry adapters ─────────────────────
     retries = int(config.get("retries", 3))
+    # Inner urllib3 Retry set to total=0 to avoid double-retry cascade.
+    # The outer _wrap_jitter_retry layer handles all retry logic.
     retry_strategy = Retry(
-        total=retries,
+        total=0,
         backoff_factor=1.5,
-        status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
         raise_on_status=False,
     )
@@ -1507,7 +1508,7 @@ def make_session(config: Dict[str, Any]) -> requests.Session:
 
     pipeline = session.request
 
-    pipeline = _wrap_jitter_retry(pipeline, int(config.get("retries", 3)))
+    pipeline = _wrap_jitter_retry(pipeline, retries)
 
     if config.get("stealth", False):
         pipeline = _wrap_stealth(pipeline)
