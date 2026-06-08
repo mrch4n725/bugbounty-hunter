@@ -107,6 +107,7 @@ class Reporter:
                 file_path = reporter._get_report_path(file_extension, suffix)
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(result)
+            self.config["_last_report_path"] = file_path
 
             log(f"  [Report] {self.report_format.upper()} report written to {file_path}",
                 Colors.GREEN)
@@ -116,6 +117,7 @@ class Reporter:
                 self.output_dir,
                 f"{reporter._sanitize_target()}_{self.timestamp}_findings.json"
             )
+            self.config["_last_findings_path"] = findings_path
             try:
                 findings_export = []
                 for f in reporter.findings:

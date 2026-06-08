@@ -158,7 +158,8 @@ class ScannerBase:
         if self._prepared:
             return
         self._prepared = True
-        self._detect_waf()
+        if not (self.config.get("passive") or self.config.get("dry_run")):
+            self._detect_waf()
         self._fingerprint_baselines()
         self._fingerprint_tech()
 

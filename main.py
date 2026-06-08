@@ -409,6 +409,72 @@ def _collect_module_findings(modules, config, run_all, disabled_modules, all_fin
             log(f"[+] {mod_name.upper()} — nothing found", Colors.GREEN)
 
 
+def _selected_module_names(config: dict, run_all: bool, disabled_modules: set, candidates: list[str]) -> list[str]:
+    selected = []
+    requested = set(config.get("modules", []))
+    for name in candidates:
+        if name in disabled_modules:
+            continue
+        if run_all or name in requested:
+            selected.append(name)
+    return selected
+
+
+def _run_passive_scans(config, recon_data, run_all, disabled_modules, all_findings, lock, container=None):
+    """Run modules that do not send exploit/fuzz payloads.
+
+    Passive mode should still produce useful default reports. Keep this list
+    limited to GET/header/body analysis and already-collected form metadata.
+    """
+    scanner = VulnScanner(config, recon_data, container=container)
+    passive_modules: dict[str, Any] = {
+        "headers": scanner.scan_headers,
+        "clickjacking": scanner.scan_clickjacking,
+        "sensitive": scanner.scan_sensitive_data,
+        "insecure_forms": scanner.scan_insecure_forms,
+    }
+    passive_order = ["headers", "clickjacking", "sensitive", "insecure_forms"]
+    selected = _selected_module_names(config, run_all, disabled_modules, passive_order)
+
+    requested_active = [
+        name for name in config.get("modules", [])
+        if name not in ("all", *passive_order) and name not in disabled_modules
+    ]
+    if requested_active and not run_all:
+        log(
+            f"[-] Passive mode skipped active module(s): {', '.join(requested_active)}",
+            Colors.YELLOW,
+        )
+
+    if not selected:
+        log("[*] Passive mode selected no runnable passive modules.", Colors.YELLOW)
+        return
+
+    total = len(selected)
+    for i, mod_name in enumerate(selected, 1):
+        before = len(scanner._get_findings())
+        log(f"[{i}/{total}] Running {mod_name.upper()}...", Colors.CYAN)
+        try:
+            if mod_name in ("sensitive", "insecure_forms"):
+                passive_modules[mod_name](target_urls=recon_data.get("urls", []))
+            else:
+                passive_modules[mod_name]()
+        except Exception as e:
+            log(f"  [!] {mod_name} error: {e}", Colors.RED, verbose_only=True, verbose=config.get("verbose", False))
+            continue
+
+        after_findings = scanner._get_findings()
+        delta = len(after_findings) - before
+        if delta > 0:
+            log(f"[!] {delta} finding(s) from {mod_name.upper()}", Colors.RED)
+        else:
+            log(f"[+] {mod_name.upper()} — nothing found", Colors.GREEN)
+
+    with lock:
+        all_findings.clear()
+        all_findings.extend(scanner._get_findings())
+
+
 def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, lock, container=None, capabilities=None):
     # ── TARGET_LEVEL: modules that run once per target, not per URL ──
     TARGET_LEVEL: set[str] = {
@@ -419,9 +485,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
 
     if config["passive"]:
         log("[*] Passive mode — skipping active fuzzing.", Colors.YELLOW)
-        scanner = VulnScanner(config, recon_data, container=container)
-        modules = {"headers": scanner.scan_headers}
-        _collect_module_findings(modules, config, run_all, disabled_modules, all_findings, lock)
+        _run_passive_scans(config, recon_data, run_all, disabled_modules, all_findings, lock, container=container)
         return
 
     scanner = VulnScanner(config, recon_data, container=container)
@@ -615,18 +679,21 @@ def _write_report_and_summary(config, all_findings, recon_data, js_data=None, co
     log(f"  SCAN COMPLETE — {len(all_findings)} finding(s)", Colors.CYAN)
     log("=" * 60, Colors.CYAN)
     log(f"  Report:   {report_path}", Colors.WHITE)
-    json_files = sorted(glob.glob(
-        os.path.join(config["output_dir"], "*_findings.json")
-    ))
-    if json_files:
-        log(f"  JSON:     {json_files[-1]}", Colors.WHITE)
+    findings_json_path = config.get("_last_findings_path", "")
+    if not findings_json_path:
+        json_files = sorted(glob.glob(
+            os.path.join(config["output_dir"], f"*_{config.get('timestamp', '')}_findings.json")
+        ))
+        findings_json_path = json_files[-1] if json_files else ""
+    if findings_json_path:
+        log(f"  JSON:     {findings_json_path}", Colors.WHITE)
     log(f"  Folder:   {os.path.abspath(config['output_dir'])}", Colors.WHITE)
     log("", Colors.WHITE)
     if config.get("report_format") == "chatgpt":
         log(f"  ChatGPT:  {report_path} — paste this file directly into ChatGPT",
             Colors.WHITE)
     log("  To summarise with AI, open the report or run:", Colors.CYAN)
-    log(f"    cat {json_files[-1] if json_files else '<findings.json>'} | pbcopy",
+    log(f"    cat {findings_json_path if findings_json_path else '<findings.json>'} | pbcopy",
         Colors.WHITE)
     log("  Then paste into ChatGPT, Claude, or your preferred AI tool.", Colors.WHITE)
     log("=" * 60, Colors.CYAN)

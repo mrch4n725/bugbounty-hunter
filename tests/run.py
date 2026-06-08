@@ -580,9 +580,80 @@ check("authorization disable flag parsed",
     "authorization" in a5.disable_modules)
 
 # ═══════════════════════════════════════════════════════════
+# Passive scan dispatch
+# ═══════════════════════════════════════════════════════════
+section("19. Passive Scan Dispatch")
+
+_orig_main_vuln_scanner = main.VulnScanner
+created_scanners = []
+
+class FakePassiveScanner:
+    def __init__(self, config, recon_data, container=None):
+        self.calls = []
+        created_scanners.append(self)
+
+    def scan_headers(self, target_urls=None):
+        self.calls.append("headers")
+        return []
+
+    def scan_clickjacking(self, target_urls=None):
+        self.calls.append("clickjacking")
+        return []
+
+    def scan_sensitive_data(self, target_urls=None):
+        self.calls.append("sensitive")
+        return []
+
+    def scan_insecure_forms(self, target_urls=None):
+        self.calls.append("insecure_forms")
+        return []
+
+    def _get_findings(self):
+        return [
+            {"vuln_type": name, "url": "https://ex.com", "severity": "info", "fingerprint": name}
+            for name in self.calls
+        ]
+
+try:
+    main.VulnScanner = FakePassiveScanner
+    passive_config = {
+        "target": "https://ex.com",
+        "modules": ["all"],
+        "verbose": False,
+    }
+    passive_findings = []
+    passive_lock = threading.Lock()
+    main._run_passive_scans(
+        passive_config,
+        {"urls": ["https://ex.com"], "forms": []},
+        run_all=True,
+        disabled_modules=set(),
+        all_findings=passive_findings,
+        lock=passive_lock,
+    )
+    check("passive all runs safe modules",
+          created_scanners[-1].calls == ["headers", "clickjacking", "sensitive", "insecure_forms"])
+    check_eq("passive all findings copied", len(passive_findings), 4)
+
+    created_scanners.clear()
+    selected_findings = []
+    main._run_passive_scans(
+        {"target": "https://ex.com", "modules": ["headers", "xss"], "verbose": False},
+        {"urls": ["https://ex.com"], "forms": []},
+        run_all=False,
+        disabled_modules=set(),
+        all_findings=selected_findings,
+        lock=threading.Lock(),
+    )
+    check("passive explicit skips active modules",
+          created_scanners[-1].calls == ["headers"])
+finally:
+    main.VulnScanner = _orig_main_vuln_scanner
+
+# ═══════════════════════════════════════════════════════════
 # Scanner maturity levels
 # ═══════════════════════════════════════════════════════════
-section("19. Scanner Maturity Levels")
+section("20. Scanner Maturity Levels")
 expected_maturity = {
     "xss": 4, "sqli": 4, "ssrf": 4, "blind_xss": 4, "cmd_injection": 4,
     "xxe": 4, "authorization": 4, "ssti": 4, "headers": 4, "sensitive": 4,
@@ -604,7 +675,7 @@ for scanner_name, expected in expected_maturity.items():
 # ═══════════════════════════════════════════════════════════
 # Evidence Completeness Validator
 # ═══════════════════════════════════════════════════════════
-section("20. Evidence Completeness Validator")
+section("21. Evidence Completeness Validator")
 from engines.evidence_validator import EvidenceCompletenessValidator
 from models.finding import Finding
 from models.evidence import (
