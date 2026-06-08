@@ -38,8 +38,8 @@ def parse_args():
         choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization", "all"],
         default=["all"])
     parser.add_argument("--output", "-o", default="reports")
-    parser.add_argument("--format", "-f", choices=["json", "html", "txt", "markdown-report", "hackerone", "bugcrowd", "chatgpt"], default="html")
-    parser.add_argument("--threads", type=int, default=10)
+    parser.add_argument("--format", "-f", choices=["json", "html", "txt", "markdown-report", "hackerone", "bugcrowd", "chatgpt"], default="chatgpt")
+    parser.add_argument("--threads", type=int, default=5)
     parser.add_argument("--timeout", type=int, default=10)
     parser.add_argument("--cookies", "-c", default=None)
     parser.add_argument("--cookies-alt", default=None,
@@ -52,8 +52,8 @@ def parse_args():
     parser.add_argument("--crawl-depth", type=int, default=2)
     parser.add_argument("--max-urls", type=int, default=200,
         help="Maximum number of URLs to discover during reconnaissance")
-    parser.add_argument("--delay", type=float, default=0.0,
-        help="Delay between requests in seconds")
+    parser.add_argument("--delay", type=float, default=0.1,
+        help="Delay between requests in seconds (default: 0.1)")
     parser.add_argument("--oob-host", default=None,
         help="Out-of-band callback host for SSRF and SQLi OOB verification (e.g. Burp Collaborator or interactsh URL)")
     parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
@@ -64,7 +64,7 @@ def parse_args():
         help="Override module settings using module.key=value")
     parser.add_argument("--retries", type=int, default=3,
         help="HTTP retry attempts for transient failures")
-    parser.add_argument("--autosave-interval", type=int, default=0,
+    parser.add_argument("--autosave-interval", type=int, default=60,
         help="Autosave interim report every N seconds (0 = disabled)")
     parser.add_argument("--module-timeout", type=int, default=120,
         help="Per-module timeout in seconds (default: 120)")
@@ -76,8 +76,8 @@ def parse_args():
         help="Re-verify unconfirmed findings from a previous JSON report. Path to report file.")
     parser.add_argument("--resume", action="store_true",
         help="Resume a previous scan from .scan_state.json (skips completed URLs)")
-    parser.add_argument("--rps", type=float, default=5.0,
-        help="Requests per second (default: 5). Halved on 429, restored after 20 OK.")
+    parser.add_argument("--rps", type=float, default=3.0,
+        help="Requests per second (default: 3). Halved on 429, restored after 20 OK.")
     parser.add_argument("--legacy-scanners", action="store_false", dest="new_scanners",
         help="Use legacy inline scan methods instead of ScannerBase subclasses.")
     parser.add_argument("--stealth", action="store_true",
@@ -99,7 +99,7 @@ def parse_args():
     parser.add_argument("--history-file", default="scan_history.json",
         help="Path to scan history file for finding correlation (default: scan_history.json in output dir)")
     parser.add_argument("--auto", action="store_true",
-        help="Auto mode: sensible defaults for a quick scan (rps=3, threads=5, autosave=60s, format=chatgpt)")
+        help="Auto mode (default): sensible defaults for a quick scan.")
     parser.add_argument("--dry-run", action="store_true",
         help="Run recon and JS intelligence only, then print attack-surface summary and exit. Skips all active fuzzing.")
     parser.add_argument("--role", default=None,
@@ -763,15 +763,8 @@ def main():
         log(f"Loading configuration from {args.config}", Colors.CYAN)
         args = merge_configs(args, load_config_file(args.config))
     if getattr(args, 'auto', False):
-        log("[*] Auto mode: applying sensible defaults (rps=3, threads=5, autosave=60s)", Colors.CYAN)
-        if args.rps == 5.0:
-            args.rps = 3.0
-        if args.threads == 10:
-            args.threads = 5
-        if args.autosave_interval == 0:
-            args.autosave_interval = 60
-        if args.format == "html":
-            args.format = "chatgpt"
+        log("[*] Auto mode: sensible defaults are now the default (rps=3, threads=5, autosave=60s, format=chatgpt)",
+            Colors.CYAN)
 
     if not args.target:
         log("[!] Error: --target is required (or specify via --config file)", Colors.RED)

@@ -13,6 +13,7 @@ Also supports the traditional::
 Both routes through the same code path.
 """
 
+import os
 import sys
 
 
@@ -22,6 +23,7 @@ def main() -> int:
     Delegates to ``main.main()`` so both entry points share the same
     implementation.
     """
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from main import main as _main
     return _main()
 

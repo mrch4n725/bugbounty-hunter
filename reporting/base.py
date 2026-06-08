@@ -420,14 +420,28 @@ class ReporterBase:
         score = finding.get("cvss_score")
         if score is not None:
             return float(score)
-        return CVSS_BY_SEVERITY.get(finding.get("severity", "info").lower(), 0.0)
+        base = CVSS_BY_SEVERITY.get(finding.get("severity", "info").lower(), 0.0)
+        # Adjust by verification stage: more confidence = higher score
+        stage = str(finding.get("verification_stage", "detected")).lower()
+        multipliers = {
+            "verified": 1.0,
+            "exploitable": 1.0,
+            "validated": 0.85,
+            "detected": 0.7,
+            "partially_validated": 0.8,
+        }
+        return round(base * multipliers.get(stage, 0.7), 1)
 
     def _get_cvss_vector(self, finding: Dict[str, Any]) -> str:
         vec = finding.get("cvss_vector")
         if vec:
             return str(vec)
-        return CVSS_VECTORS.get(finding.get("severity", "info").lower(),
-                                "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N")
+        base_vec = CVSS_VECTORS.get(finding.get("severity", "info").lower(),
+                                    "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N")
+        # Adjust PR (Privileges Required) based on authentication context
+        if finding.get("auth_header") or finding.get("cookies"):
+            base_vec = base_vec.replace("/PR:N/", "/PR:L/")
+        return base_vec
 
     def _severity_rating(self, score: float) -> str:
         if score >= 9.0:
