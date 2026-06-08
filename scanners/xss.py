@@ -14,9 +14,11 @@ import re
 from typing import Any
 from urllib.parse import urlparse, parse_qs
 
+from models.finding import Finding
 from modules.utils import (
     finding, log, Colors, _build_curl,
     VerificationStage,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
@@ -192,7 +194,7 @@ class XSSScanner(ScannerBase):
                 method="GET",
                 url=detection.url,
                 curl_command=_build_curl("GET", detection.url, dict(self.session.headers),
-                                         cookies=dict(self.session.cookies)),
+                                         cookies=safe_cookies_dict(self.session.cookies)),
             ))
             ev_list.append(HttpResponseEvidence(
                 status_code=resp.status_code,
@@ -228,7 +230,7 @@ class XSSScanner(ScannerBase):
 
     # ── Scan entry point ────────────────────────────────────────────────
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
 
@@ -256,7 +258,7 @@ class XSSScanner(ScannerBase):
                         evidence=f"Payload: {detection.payload} | Context: {detection.context} | Executed: {confirmed}",
                         verification_stage=stage,
                         parameter=param,
-                        request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                        request=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                         response_excerpt=detection.raw_response.text[:500] if detection.raw_response else "",
                         steps_to_reproduce=self.generate_reproduction(detection, verified=confirmed),
                     )

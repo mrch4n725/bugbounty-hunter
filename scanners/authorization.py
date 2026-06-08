@@ -10,6 +10,7 @@ Maturity: Level 4 (Verified — produces VERIFIED evidence via ownership compari
 
 from typing import Any
 
+from models.finding import Finding
 from scanners.base import ScannerBase
 from engines.authorization import AuthorizationEngine
 from modules.utils import log, Colors, build_role_sessions
@@ -31,7 +32,7 @@ class AuthorizationScanner(ScannerBase):
         super().__init__(config, recon, container=container)
         self._engine = None
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         """Run authorization scans across all discovered URLs.
 
         Discovers auth-relevant URLs from recon data, then tests

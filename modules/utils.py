@@ -51,6 +51,22 @@ def reset_seen_findings() -> None:
 
 SENSITIVE_HEADER_NAMES = {"authorization", "cookie", "x-api-key", "x-auth-token"}
 
+
+def safe_cookies_dict(cookie_jar) -> dict[str, str]:
+    """Safely convert a RequestsCookieJar to a plain dict.
+
+    ``dict(jar)`` raises ``KeyError`` when multiple cookies share a name
+    across different domains/paths.  This helper picks the *last* value
+    for each cookie name, which is the correct behaviour for curl -b.
+    """
+    out: dict[str, str] = {}
+    try:
+        for c in cookie_jar:
+            out[c.name] = c.value
+    except Exception:
+        pass
+    return out
+
 # Module-level default; main.py flips via set_mask_sensitive_default()
 _MASK_SENSITIVE_DEFAULT: bool = True
 
@@ -76,6 +92,9 @@ class ScanProgress:
         no_rich = self._config.get("no_rich", False) or not _rich_available()
         if no_rich:
             return self
+        from rich.progress import (
+            BarColumn, Progress, TextColumn, TimeRemainingColumn,
+        )
         self._progress = Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -320,46 +339,6 @@ class OOBDetectionFramework:
 
 
 # ── Deduplication Engine ─────────────────────────────────────────────────
-
-class DeduplicationEngine:
-    """Deduplicate findings by fingerprint.
-    Groups findings that share the same fingerprint across URLs.
-    Stores Finding objects directly.
-    """
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._groups: Dict[str, Finding] = {}
-
-    def add(self, finding: Finding) -> Optional[Finding]:
-        fp = finding.fingerprint
-        with self._lock:
-            if fp in self._groups:
-                existing = self._groups[fp]
-                existing.grouped_urls.append(finding.url)
-                return None
-            self._groups[fp] = finding
-            return finding
-
-    def add_legacy(self, f: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if isinstance(f, Finding):
-            return f if self.add(f) else None
-        finding = Finding.from_dict(f)
-        return f if self.add(finding) else None
-
-    def get_findings(self) -> List[Finding]:
-        with self._lock:
-            results = []
-            for f in self._groups.values():
-                if len(f.grouped_urls) >= 5:
-                    f.details = f"{f.details} — Found on {len(f.grouped_urls)} URLs"
-                results.append(f)
-            return results
-
-    def clear(self) -> None:
-        with self._lock:
-            self._groups.clear()
-
 
 # ── Browser Validation Layer ─────────────────────────────────────────────
 
@@ -786,122 +765,6 @@ class SecretValidator:
 
 
 # ── Technology Fingerprinter ───────────────────────────────────────────────
-
-TECH_SIGNATURES: Dict[str, List[Dict[str, Any]]] = {
-    "framework": [
-        {"name": "Django", "headers": {"x-frame-options": "DENY"}, "body": re.compile(r"django\.wsgi|csrfmiddlewaretoken|__admin_media_prefix__")},
-        {"name": "Laravel", "headers": {"x-powered-by": "Laravel"}, "body": re.compile(r"laravel_session|csrf_token|Livewire|__livewire")},
-        {"name": "Rails", "headers": {"x-powered-by": "Phusion|Passenger"}, "body": re.compile(r"csrf-token|rails-ujs|data-remote|data-method")},
-        {"name": "Spring", "headers": {"x-application-context": ""}, "body": re.compile(r"spring|_csrf|XSRF-TOKEN")},
-        {"name": "ASP.NET", "headers": {"x-aspnet-version": "", "x-powered-by": "ASP.NET"}, "body": re.compile(r"__viewstate|__eventvalidation|aspnetForm")},
-        {"name": "Express", "headers": {"x-powered-by": "Express"}, "body": re.compile(r"express|connect\.sid")},
-        {"name": "Flask", "headers": {}, "body": re.compile(r"flask|__debug__|secret_key")},
-        {"name": "FastAPI", "headers": {}, "body": re.compile(r"fastapi|openapi\.json|docs|redoc")},
-        {"name": "Next.js", "headers": {"x-powered-by": "Next.js"}, "body": re.compile(r"__NEXT_DATA__|/_next/static")},
-        {"name": "Nuxt.js", "headers": {}, "body": re.compile(r"nuxt\.config|__NUXT__")},
-        {"name": "Gatsby", "headers": {}, "body": re.compile(r"gatsby|___gatsby")},
-    ],
-    "cms": [
-        {"name": "WordPress", "headers": {}, "body": re.compile(r"/wp-content/|/wp-includes/|wp-json|wordpress_[a-f0-9]{32}")},
-        {"name": "Drupal", "headers": {}, "body": re.compile(r"drupal\.js|sites/default|/drupal|Drupal\.settings")},
-        {"name": "Joomla", "headers": {}, "body": re.compile(r"joomla|/components/|/modules/|/templates/")},
-        {"name": "Shopify", "headers": {"x-shopid": ""}, "body": re.compile(r"shopify|myshopify\.com|Shopify\.sdk")},
-        {"name": "Magento", "headers": {}, "body": re.compile(r"mage\.|Magento|/static/version")},
-    ],
-    "language": [
-        {"name": "PHP", "headers": {"x-powered-by": "PHP"}, "body": re.compile(r"php")},
-        {"name": "Python", "headers": {}, "body": re.compile(r"django|flask|python|bottle|tornado")},
-        {"name": "Ruby", "headers": {"x-powered-by": "Phusion|Passenger"}, "body": re.compile(r"ruby|\.erb")},
-        {"name": "Java", "headers": {}, "body": re.compile(r"servlet|jsp|java|spring|tomcat")},
-        {"name": "Node.js", "headers": {"x-powered-by": "Express"}, "body": re.compile(r"node|express|next\.js")},
-        {"name": "Go", "headers": {}, "body": re.compile(r"go\.(min\.)?js|gorilla")},
-    ],
-    "proxy": [
-        {"name": "Cloudflare", "headers": {"server": "cloudflare", "cf-ray": ""}, "body": re.compile(r"cloudflare|__cfduid")},
-        {"name": "Akamai", "headers": {}, "body": re.compile(r"akamai|akamaized")},
-        {"name": "Fastly", "headers": {"x-served-by": "", "x-cache": ""}, "body": re.compile(r"fastly")},
-        {"name": "CloudFront", "headers": {"x-amz-cf-id": "", "x-amz-cf-pop": ""}, "body": re.compile(r"cloudfront")},
-        {"name": "Varnish", "headers": {"x-varnish": "", "via": "varnish"}, "body": re.compile(r"varnish")},
-        {"name": "Nginx", "headers": {"server": "nginx"}, "body": re.compile(r"nginx")},
-        {"name": "Apache", "headers": {"server": "apache"}, "body": re.compile(r"apache")},
-        {"name": "IIS", "headers": {"server": "iis", "x-powered-by": "ASP.NET"}, "body": re.compile(r"iis")},
-    ],
-    "waf": [
-        {"name": "Cloudflare (WAF)", "headers": {"server": "cloudflare"}, "body": re.compile(r"cloudflare-nginx|attention: required|ray id:")},
-        {"name": "AWS WAF", "headers": {}, "body": re.compile(r"Request blocked|waf|AWS WAF")},
-        {"name": "ModSecurity", "headers": {}, "body": re.compile(r"ModSecurity|This error was generated by Mod_Security")},
-        {"name": "Akamai WAF", "headers": {}, "body": re.compile(r"akamai|reference number|#ref_")},
-        {"name": "F5 BIG-IP", "headers": {}, "body": re.compile(r"big-ip|F5|TS[0-9a-f]+")},
-        {"name": "Sucuri", "headers": {"x-sucuri-id": ""}, "body": re.compile(r"sucuri|cloudproxy")},
-    ],
-    "template_engine": [
-        {"name": "Jinja2", "body": re.compile(r"\{\{.*\}\}|jinja2")},
-        {"name": "Twig", "body": re.compile(r"twig|\.twig")},
-        {"name": "Smarty", "body": re.compile(r"smarty|\{\$.*\}")},
-        {"name": "FreeMarker", "body": re.compile(r"\$\{.*\}")},
-        {"name": "Velocity", "body": re.compile(r"velocity|#set\(|#if\(")},
-        {"name": "Mustache", "body": re.compile(r"mustache|\{\{.*\}\}")},
-        {"name": "Handlebars", "body": re.compile(r"handlebars|Handlebars\.")},
-        {"name": "EJS", "body": re.compile(r"<%|%=|ejs")},
-        {"name": "Pug/Jade", "body": re.compile(r"pug|jade")},
-    ],
-}
-
-
-class TechnologyFingerprinter:
-    """Identify web technologies (frameworks, CMS, languages, proxies, WAFs) from HTTP responses."""
-
-    def __init__(self, session: Any, timeout: int):
-        self.session = session
-        self.timeout = timeout
-        self.results: Dict[str, List[str]] = {}
-        self._lock = threading.Lock()
-
-    def fingerprint(self, url: str) -> Dict[str, List[str]]:
-        """Fingerprint a URL by analyzing response headers and body."""
-        try:
-            resp = safe_get(self.session, url, self.timeout)
-            if not resp:
-                return {}
-        except Exception:
-            return {}
-
-        headers = {k.lower(): v.lower() for k, v in resp.headers.items()}
-        body = resp.text.lower()
-
-        with self._lock:
-            for category, signatures in TECH_SIGNATURES.items():
-                if category not in self.results:
-                    self.results[category] = []
-                for sig in signatures:
-                    detected = self._match_signature(sig, headers, body)
-                    if detected and sig["name"] not in self.results[category]:
-                        self.results[category].append(sig["name"])
-
-        return self.results
-
-    def _match_signature(self, sig: Dict[str, Any], headers: Dict[str, str], body: str) -> bool:
-        header_match = all(
-            key in headers and (not val or val in headers[key])
-            for key, val in sig.get("headers", {}).items()
-        )
-        body_pattern = sig.get("body")
-        body_match = body_pattern.search(body) if body_pattern else False
-        return header_match or bool(body_match)
-
-    def get(self, category: str, default: Optional[List[str]] = None) -> List[str]:
-        return self.results.get(category, default or [])
-
-    def all(self) -> Dict[str, List[str]]:
-        return self.results
-
-    def summary(self) -> str:
-        parts = []
-        for category, items in self.results.items():
-            if items:
-                parts.append(f"{category}: {', '.join(items)}")
-        return " | ".join(parts) if parts else "Unknown"
-
 
 # ── CVSS v3 metadata keyed by vuln type strings used in scanner.py ────────
 VULN_METADATA: Dict[str, Dict[str, Any]] = {
@@ -1389,57 +1252,6 @@ def finding(
 
 
 # ── Baseline Fingerprinting ───────────────────────────────────────────
-
-class BaselineFingerprinter:
-    """Record a known-safe response baseline per (method, base_url) and
-    flag deviations >15% length, different status code, or error patterns."""
-
-    def __init__(self, session: requests.Session, timeout: int = 10):
-        self.session = session
-        self.timeout = timeout
-        self._baselines: dict[tuple[str, str], dict] = {}
-        self._lock = threading.Lock()
-
-    def _base_key(self, url: str, method: str = "GET") -> tuple[str, str]:
-        parsed = urlparse(url)
-        base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
-        return (method, base)
-
-    def fingerprint(self, url: str, method: str = "GET") -> dict:
-        """Fetch a URL and store its baseline.  Returns the baseline dict."""
-        key = self._base_key(url, method)
-        with self._lock:
-            if key in self._baselines:
-                return self._baselines[key]
-        try:
-            r = self.session.get(url, timeout=self.timeout) if method == "GET" else self.session.post(url, timeout=self.timeout)
-        except Exception:
-            r = None
-        baseline = {
-            "status": r.status_code if r else 0,
-            "length": len(r.text) if r else 0,
-            "hash": hashlib.md5(r.text.encode()).hexdigest() if r else "",
-        }
-        with self._lock:
-            self._baselines[key] = baseline
-        return baseline
-
-    def is_anomalous(self, url: str, response, method: str = "GET") -> bool:
-        """Return True if the response meaningfully deviates from the baseline."""
-        key = self._base_key(url, method)
-        bl = self._baselines.get(key)
-        if bl is None:
-            return True
-        if response is None:
-            return False
-        length = len(response.text)
-        length_diff = abs(length - bl["length"])
-        if bl["length"] > 0 and length_diff / max(bl["length"], 1) > 0.15:
-            return True
-        if response.status_code != bl["status"] and response.status_code not in (0,):
-            return True
-        return False
-
 
 def parse_auth(auth_string: str):
     """Parse username:password basic auth string."""
@@ -2252,3 +2064,134 @@ def build_role_sessions(config: dict, base_session=None) -> dict[str, Any]:
 def get_role_session(role_sessions: dict, role: str = "default"):
     """Get a session for a given role, falling back to default."""
     return role_sessions.get(role, role_sessions.get("default"))
+
+
+# ── Shared evidence / confidence utilities ──────────────────────────────
+# Used by both VulnScanner (modules/scanner.py) and ScannerBase (scanners/base.py)
+# to prevent drift between legacy and new scanner paths.
+
+def enrich_finding_confidence(f: Finding) -> None:
+    """Recalculate confidence score if below threshold; populate reasons."""
+    from models.finding import calculate_confidence as calc_conf
+    from models.finding import evidence_strength_from_score, false_positive_risk_from_score
+    stage = f.get("verification_stage", "").lower()
+    score = f.get("confidence_score", 0)
+    if score < 25:
+        new_score = calc_conf(
+            detection=True,
+            validation=stage in ("validated", "exploitable", "verified"),
+            exploitation=stage in ("exploitable", "verified"),
+        )
+        f["confidence_score"] = new_score
+        f["evidence_strength"] = evidence_strength_from_score(new_score).value
+        f["false_positive_risk"] = false_positive_risk_from_score(new_score).value
+    reasons = f.get("confidence_reasons")
+    if not reasons or not isinstance(reasons, list) or len(reasons) == 0:
+        reasons = []
+        if stage == "detected":
+            reasons.append("+ Detection signal present")
+            reasons.append("- Not yet validated (no secondary confirmation)")
+        elif stage == "validated":
+            reasons.append("+ Detection signal present")
+            reasons.append("+ Secondary validation confirmed")
+        elif stage == "exploitable":
+            reasons.append("+ Detection signal present")
+            reasons.append("+ Secondary validation confirmed")
+            reasons.append("+ Exploitation proof demonstrated")
+        elif stage == "verified":
+            reasons.append("+ Detection signal present")
+            reasons.append("+ Secondary validation confirmed")
+            reasons.append("+ Exploitation proof demonstrated")
+            reasons.append("+ Independently verified (OOB/browser/evidence)")
+        f["confidence_reasons"] = reasons
+
+
+def add_capability_confidence_reasons(f: Finding) -> None:
+    """Add capability-aware confidence reasons (browser, OOB, JS parser)."""
+    try:
+        from app.capabilities import CapabilityRegistry
+        caps = CapabilityRegistry.get_global()
+    except Exception:
+        return
+    reasons = f.get("confidence_reasons")
+    if not isinstance(reasons, list):
+        reasons = []
+    score = f.get("confidence_score", 0)
+    has_browser = caps.has("playwright") and caps.has("chromium")
+    has_oob = caps.has("oob_validation")
+    has_esprima = caps.has("esprima")
+
+    if has_browser and score < 80:
+        if not any("browser" in r for r in reasons):
+            reasons.append("+ Browser validation available (can increase confidence)")
+    if not has_browser:
+        if not any("No browser" in r for r in reasons):
+            reasons.append("- No browser validation (XSS/JS findings unverifiable via Playwright)")
+            if f.get("vuln_type", "").lower() in ("xss", "dom xss", "blind xss"):
+                reasons.append("- XSS confidence limited without browser execution")
+    if has_oob and score < 80:
+        if not any("OOB" in r for r in reasons):
+            reasons.append("+ OOB callback validation available (can increase confidence)")
+    if not has_oob:
+        if not any("No OOB" in r for r in reasons):
+            reasons.append("- No OOB callback service (SSRF/XXE/CMDI unverifiable out-of-band)")
+    if not has_esprima:
+        if not any("No JS parser" in r for r in reasons):
+            reasons.append("- No JS parser (limited DOM/JS analysis)")
+    if score >= 80 and not any("high confidence" in r for r in reasons):
+        reasons.append("+ High confidence score achieved (score >= 80)")
+    if score >= 25 and not any("score >= 25" in r for r in reasons):
+        reasons.append("+ Base confidence threshold met (score >= 25)")
+    f["confidence_reasons"] = reasons
+
+
+def link_finding_evidence(finding: Finding, evidence_engine: Any,
+                          session: Any = None) -> None:
+    """Auto-create and link HttpRequestEvidence from finding request data."""
+    fp = finding.get("fingerprint", "")
+    url = finding.get("url", "")
+    request_str = finding.get("request", "")
+    if not fp or not request_str or evidence_engine is None:
+        return
+    try:
+        from models.evidence import HttpRequestEvidence
+        method = "GET"
+        if request_str.startswith("curl"):
+            parts = request_str.split()
+            for i, p in enumerate(parts):
+                if p == "-X" and i + 1 < len(parts):
+                    method = parts[i + 1]
+                    break
+        req_ev = HttpRequestEvidence(
+            method=method,
+            url=url,
+            curl_command=request_str,
+        )
+        evidence_engine.store(req_ev)
+        evidence_engine.link_to_finding(req_ev, fp)
+    except Exception:
+        pass
+
+
+def collect_and_link_evidence(finding: Finding, evidence_list: list,
+                              evidence_engine: Any) -> None:
+    """Store and link typed evidence objects for a finding."""
+    if evidence_engine is None:
+        return
+    fp = finding.get("fingerprint", "")
+    if not fp:
+        return
+    for ev in evidence_list:
+        try:
+            evidence_engine.store(ev)
+            evidence_engine.link_to_finding(ev, fp)
+        except Exception:
+            continue
+
+
+# ── Backward-compatible re-exports ──────────────────────────────────────
+from engines.dedup import DeduplicationEngine  # noqa: E402, F401
+from engines.baseline import BaselineFingerprinter  # noqa: E402, F401
+# NOTE: TechnologyFingerprinter / TECH_SIGNATURES not re-exported here
+# because engines/tech_fingerprint.py imports safe_get from this module,
+# which would create a circular import at load time.

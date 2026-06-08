@@ -12,10 +12,12 @@ Maturity: Level 4 (Full lifecycle — typed evidence, reproduction, confidence, 
 
 from typing import Any
 
+from models.finding import Finding
 from models.evidence import ResponseExcerptEvidence
 from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
@@ -172,7 +174,7 @@ class HeadersScanner(ScannerBase):
             "Inspect response headers for security misconfigurations",
         ]
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         target = self.config.get("target", "")
         if not target or not self._in_scope(target):
@@ -201,7 +203,7 @@ class HeadersScanner(ScannerBase):
                 )
                 stage = VerificationStage.VALIDATED.value if is_cors else VerificationStage.DETECTED.value
 
-                curl_cmd = _build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies))
+                curl_cmd = _build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies))
                 resp_text = resp.text[:500] if resp else ""
                 f = finding(
                     vuln_type=f"Missing Security Header: {d.parameter}" if d.context == "missing_header"

@@ -16,10 +16,12 @@ import time
 from typing import Any, Optional
 from urllib.parse import urlparse, parse_qs
 
+from models.finding import Finding
 from models.evidence import TimingEvidence
 from modules.utils import (
     finding, log, Colors, _build_curl, safe_get, safe_post,
     VerificationStage,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
@@ -208,7 +210,7 @@ class SQLiScanner(ScannerBase):
 
     # ── Scan entry point ────────────────────────────────────────────────
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         oob_host = self.config.get("oob_host")
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
@@ -255,7 +257,7 @@ class SQLiScanner(ScannerBase):
                         severity=severity,
                         details=f"Parameter '{param}': {signal_count} signal(s) detected ({', '.join(evidence_parts)})",
                         evidence=" | ".join(evidence_parts),
-                        request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                        request=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                         response_excerpt=detection_result.triggering_response or "",
                         verification_stage=stage,
                         parameter=param,
@@ -414,7 +416,7 @@ class SQLiScanner(ScannerBase):
                 if new_errors:
                     signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
                     f = self._build_finding(url, "POST JSON body", signals,
-                        request_str=_build_curl("POST", url, dict(self.session.headers), data=payload, cookies=dict(self.session.cookies)),
+                        request_str=_build_curl("POST", url, dict(self.session.headers), data=payload, cookies=safe_cookies_dict(self.session.cookies)),
                         response_excerpt_str=resp.text[:500] if resp else "")
                     if f:
                         self._add_finding(f)
@@ -428,7 +430,7 @@ class SQLiScanner(ScannerBase):
                 if new_errors:
                     signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
                     f = self._build_finding(url, "POST XML body", signals,
-                        request_str=_build_curl("POST", url, dict(self.session.headers), data=payload, cookies=dict(self.session.cookies)),
+                        request_str=_build_curl("POST", url, dict(self.session.headers), data=payload, cookies=safe_cookies_dict(self.session.cookies)),
                         response_excerpt_str=resp.text[:500] if resp else "")
                     if f:
                         self._add_finding(f)
@@ -445,7 +447,7 @@ class SQLiScanner(ScannerBase):
                     if new_errors:
                         signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
                         f = self._build_finding(url, f"POST form body ({field_name})", signals,
-                            request_str=_build_curl("POST", url, dict(self.session.headers), data=post_data, cookies=dict(self.session.cookies)),
+                            request_str=_build_curl("POST", url, dict(self.session.headers), data=post_data, cookies=safe_cookies_dict(self.session.cookies)),
                             response_excerpt_str=resp.text[:500] if resp else "")
                         if f:
                             self._add_finding(f)
@@ -499,7 +501,7 @@ class SQLiScanner(ScannerBase):
             severity=severity,
             details=f"Parameter '{param}': {signal_count} signal(s) detected ({', '.join(evidence_parts)})",
             evidence=" | ".join(evidence_parts),
-            request=request_str or _build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+            request=request_str or _build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
             response_excerpt=response_excerpt_str,
             verification_stage=stage,
             parameter=param,

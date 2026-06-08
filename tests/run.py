@@ -67,8 +67,8 @@ from modules.utils import (
     classify_endpoint, compute_endpoint_score,
     RateLimiter, OOBDetectionFramework, SecretValidator,
     BrowserValidator, safe_get, safe_post,
-    DeduplicationEngine,
 )
+from engines.dedup import DeduplicationEngine
 check("All utils symbols import cleanly", True)
 
 # ═══════════════════════════════════════════════════════════

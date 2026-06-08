@@ -17,8 +17,10 @@ from urllib.parse import urlparse, parse_qs
 from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
+from models.finding import Finding
 from models.evidence import TimingEvidence, HttpRequestEvidence, ResponseExcerptEvidence
 
 CMD_INJECTION_PAYLOADS = {
@@ -130,7 +132,7 @@ class CommandInjectionScanner(ScannerBase):
 
     # ── Scan entry point ────────────────────────────────────────────────
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
         for url in urls:
@@ -166,7 +168,7 @@ class CommandInjectionScanner(ScannerBase):
                         severity=severity,
                         details=f"Parameter '{param}': {signal_count} signal(s) ({', '.join(evidence_parts)})",
                         evidence=" | ".join(evidence_parts),
-                        request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                        request=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                         response_excerpt=detection_result.triggering_response or "",
                         verification_stage=stage,
                         parameter=param,
@@ -296,7 +298,7 @@ class CommandInjectionScanner(ScannerBase):
             severity=severity,
             details=f"Parameter '{param}': {signal_count} signal(s) ({', '.join(evidence_parts)})",
             evidence=" | ".join(evidence_parts),
-            request=request_str or _build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+            request=request_str or _build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
             response_excerpt=response_excerpt_str,
             verification_stage=stage,
             parameter=param,
@@ -310,7 +312,7 @@ class CommandInjectionScanner(ScannerBase):
             self.evidence_engine.link_to_finding(timing_ev, f.get("fingerprint", ""))
         return f
 
-    def finalize(self) -> list[dict]:
+    def finalize(self) -> list[Finding]:
         extra: list[dict] = []
         if not self.validation:
             return extra
@@ -328,7 +330,7 @@ class CommandInjectionScanner(ScannerBase):
                 severity="critical",
                 details="Command injection confirmed via OOB callback — injected command executed on server",
                 evidence=f"Callback: {(ev.raw_data or '')[:200]}",
-                request=_build_curl("GET", url_str, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                request=_build_curl("GET", url_str, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                 verification_stage=VerificationStage.VERIFIED.value,
                 response_excerpt="(Command injection confirmed via out-of-band callback — server executed injected command)",
                 steps_to_reproduce=[

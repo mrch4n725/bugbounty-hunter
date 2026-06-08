@@ -13,11 +13,11 @@ import threading
 import time
 from typing import Any
 
+from models.finding import Finding, calculate_confidence
 from modules.utils import (
     log, Colors, VerificationStage, EvidenceStrength, FalsePositiveRisk,
     safe_get, make_session,
 )
-from models.finding import calculate_confidence
 
 
 class VerificationEngine:
@@ -50,7 +50,7 @@ class VerificationEngine:
 
         self.browser_available = bool(self.browser)
 
-    def verify_all(self, findings: list[dict]) -> list[dict]:
+    def verify_all(self, findings: list[Finding]) -> list[Finding]:
         """Run verification on all findings below 60 confidence."""
         for f in findings:
             if f.get("confidence_score", 0) >= 60:
@@ -64,7 +64,7 @@ class VerificationEngine:
                     verbose_only=True, verbose=self.config.get("verbose", False))
         return findings
 
-    def verify(self, finding: dict) -> dict:
+    def verify(self, finding: Finding) -> Finding:
         """Run appropriate verification checks for this finding type."""
         vuln_type = (finding.get("vuln_type") or finding.get("type", "")).lower()
         if "sqli" in vuln_type:
@@ -85,7 +85,7 @@ class VerificationEngine:
             self._verify_open_redirect(finding)
         return finding
 
-    def _promote(self, f, stage: str, evidence_parts: list[str] | None = None) -> None:
+    def _promote(self, f: Finding, stage: str, evidence_parts: list[str] | None = None) -> None:
         stage = stage.lower()
         f["verification_stage"] = stage
         f["confidence_score"] = calculate_confidence(
@@ -123,7 +123,7 @@ class VerificationEngine:
         log(f"  [Verify] {f.get('vuln_type', '')} @ {f.get('url', '')} promoted to {stage.upper()} (score={f['confidence_score']})",
             Colors.GREEN)
 
-    def _verify_sqli(self, f: dict) -> None:
+    def _verify_sqli(self, f: Finding) -> None:
         if f.get("verification_stage") in ("verified", "exploitable"):
             return
         url = f.get("url", "")
@@ -177,7 +177,7 @@ class VerificationEngine:
                             self._promote(f, "validated", ["boolean:AND 1=1 vs AND 1=2"])
                             break
 
-    def _verify_xss(self, f: dict) -> None:
+    def _verify_xss(self, f: Finding) -> None:
         if not self.browser_available:
             return
         if f.get("verification_stage") in ("verified", "exploitable"):
@@ -195,7 +195,7 @@ class VerificationEngine:
                 self._promote(f, "verified", [f"browser:alert_fired"])
                 return
 
-    def _verify_cmdi(self, f: dict) -> None:
+    def _verify_cmdi(self, f: Finding) -> None:
         url = f.get("url", "")
         param = f.get("parameter", "")
         if not param or not url:
@@ -216,7 +216,7 @@ class VerificationEngine:
         if self.oob_available and f.get("confidence_score", 0) < 100:
             self._try_oob(f, "cmdi")
 
-    def _verify_ssti(self, f: dict) -> None:
+    def _verify_ssti(self, f: Finding) -> None:
         url = f.get("url", "")
         param = f.get("parameter", "")
         if not param or not url:
@@ -235,7 +235,7 @@ class VerificationEngine:
         if self.oob_available and f.get("confidence_score", 0) < 100:
             self._try_oob(f, "ssti")
 
-    def _verify_lfi(self, f: dict) -> None:
+    def _verify_lfi(self, f: Finding) -> None:
         url = f.get("url", "")
         param = f.get("parameter", "")
         if not param or not url:
@@ -255,7 +255,7 @@ class VerificationEngine:
                 if len(resp.text) > 500:
                     self._promote(f, "validated", [f"lfi:large_response {path}"])
 
-    def _verify_open_redirect(self, f: dict) -> None:
+    def _verify_open_redirect(self, f: Finding) -> None:
         url = f.get("url", "")
         if not url:
             return
@@ -266,7 +266,7 @@ class VerificationEngine:
             if final_url != url and not final_url.startswith(target.rstrip("/")):
                 self._promote(f, "validated", [f"redirect:{final_url}"])
 
-    def _try_oob(self, f: dict, vuln_type: str) -> None:
+    def _try_oob(self, f: Finding, vuln_type: str) -> None:
         if not self.oob_available or not self.oob:
             return
         url = f.get("url", "")

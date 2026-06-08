@@ -16,6 +16,7 @@ from modules.scanner import VulnScanner
 from modules.utils import (
     make_session, safe_get, safe_post, finding, log, Colors, _build_curl,
     build_role_sessions, get_role_session,
+    safe_cookies_dict,
 )
 from models.evidence import AuthorizationComparisonEvidence, EvidenceStatus
 
@@ -254,7 +255,7 @@ class IdorScanner(VulnScanner):
                     f"Second user accessed: {resp_alt.text[:120]}",
                     verification_stage="validated",
                     parameter=c['param'],
-                    request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                    request=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                     response_excerpt=resp_alt.text[:500],
                     steps_to_reproduce=[
                         f"Authenticate as primary user and send GET request to {url}",
@@ -369,7 +370,7 @@ class IdorScanner(VulnScanner):
                 f"HTTP {resp.status_code} - Response length: {len(resp.text)}",
                 verification_stage="validated",
                 parameter=param,
-                request=_build_curl("GET", test_url, dict(self.session.headers), cookies=dict(self.session.cookies)) if hasattr(self, 'session') else f"GET {test_url}",
+                request=_build_curl("GET", test_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)) if hasattr(self, 'session') else f"GET {test_url}",
                 response_excerpt=resp.text[:500],
                 steps_to_reproduce=[
                     f"Send GET request to {test_url} with parameter '{param}'={new_val}",
@@ -408,7 +409,7 @@ class IdorScanner(VulnScanner):
                 f"HTTP {resp.status_code}",
                 verification_stage="validated",
                 parameter=field_name,
-                request=_build_curl(method, action, dict(self.session.headers), cookies=dict(self.session.cookies)) if hasattr(self, 'session') else f"{method} {action}",
+                request=_build_curl(method, action, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)) if hasattr(self, 'session') else f"{method} {action}",
                 response_excerpt=resp.text[:500],
                 steps_to_reproduce=[
                     f"Submit {method} request to {action} with form field '{field_name}'={new_val}",
@@ -547,7 +548,7 @@ class IdorScanner(VulnScanner):
                     f"Role B ({alt_role}): {len(resp_b.text)} chars",
                     verification_stage="verified",
                     parameter=param,
-                    request=_build_curl("GET", test_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                    request=_build_curl("GET", test_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                     response_excerpt=resp_b.text[:500],
                     steps_to_reproduce=[
                         f"Authenticate as '{alt_role}'",

@@ -13,8 +13,10 @@ Maturity: Level 3 (Detect + Validate + typed evidence + reproduction)
 from modules.utils import (
     finding, log, Colors, _build_curl,
     VerificationStage,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
+from models.finding import Finding
 from models.evidence import GraphQLSchemaEvidence, EvidenceStatus
 
 
@@ -194,7 +196,7 @@ class GraphQLScanner(ScannerBase):
             ]
         return [f"Send POST request to {detection.url}", "Inspect the response for GraphQL misconfigurations"]
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         endpoints = ["/graphql", "/api/graphql", "/nerdgraph/graphql", "/v1/graphql", "/query"]
         introspection_query = {"query": r"{ __schema { types { name } } }"}
@@ -244,7 +246,7 @@ class GraphQLScanner(ScannerBase):
                         severity=sev_map.get(detection.context, "medium"),
                         details=details,
                         evidence=detection.payload,
-                        request=_build_curl("POST", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                        request=_build_curl("POST", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                         response_excerpt=details[:500],
                         steps_to_reproduce=self.generate_reproduction(detection, validation_result),
                         verification_stage=stage_map.get(detection.context, VerificationStage.DETECTED.value),

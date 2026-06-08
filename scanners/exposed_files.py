@@ -13,8 +13,10 @@ Maturity: Level 3 (Detect + Validate + typed evidence + reproduction)
 from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
+from models.finding import Finding
 from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
 
 EXPOSED_FILES = [
@@ -102,7 +104,7 @@ class ExposedFilesScanner(ScannerBase):
             HttpRequestEvidence(
                 method="GET",
                 url=detection.url,
-                curl_command=_build_curl("GET", detection.url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                curl_command=_build_curl("GET", detection.url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
             ),
             ResponseExcerptEvidence(
                 excerpt=resp.text[:500],
@@ -125,7 +127,7 @@ class ExposedFilesScanner(ScannerBase):
             "Inspect the HTTP 200 response for exposed sensitive content",
         ]
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         target_base = self.base_url
         for exposed_path in EXPOSED_FILES:
@@ -156,7 +158,7 @@ class ExposedFilesScanner(ScannerBase):
                     severity=severity,
                     details=details,
                     evidence=f"HTTP {resp.status_code} — {len(resp.text)} bytes" if resp else "",
-                    request=_build_curl("GET", file_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                    request=_build_curl("GET", file_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                     response_excerpt=resp.text[:500] if resp else "",
                     steps_to_reproduce=self.generate_reproduction(detection, validation_result),
                     verification_stage=VerificationStage.VALIDATED.value if (validation_result and validation_result.confirmed) else VerificationStage.DETECTED.value,

@@ -9,7 +9,7 @@ from urllib.parse import urljoin, urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 
-from modules.utils import make_session, safe_get, same_domain, log, Colors, url_in_scope, finding
+from modules.utils import make_session, safe_get, same_domain, log, Colors, url_in_scope, finding, safe_cookies_dict
 try:
     from playwright.sync_api import sync_playwright
 except ImportError:
@@ -388,10 +388,14 @@ class Recon:
                 for subdomain in self.COMMON_SUBDOMAINS
             ]
             
-            from concurrent.futures import as_completed
-            for future in as_completed(futures):
+            dns_timeout = max(self.timeout * 2, 10) if self.timeout else 10
+            from concurrent.futures import as_completed, TimeoutError as FuturesTimeout
+            for future in as_completed(futures, timeout=dns_timeout):
                 try:
                     future.result()
+                except FuturesTimeout:
+                    log("Subdomain enumeration timed out — skipping remaining DNS lookups", Colors.YELLOW)
+                    break
                 except Exception as e:
                     if self.verbose:
                         log(f"Subdomain resolution error: {str(e)}", Colors.RED, self.verbose)
@@ -680,7 +684,7 @@ class Recon:
                     f"Live-API validated secret in JS bundle — {det}",
                     secret["value"],
                     verification_stage="verified",
-                    request=_build_curl("GET", js_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                    request=_build_curl("GET", js_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                     response_excerpt=r.text[:500],
                     steps_to_reproduce=[
                         f"Fetch the JS file at {js_url}",
@@ -704,7 +708,7 @@ class Recon:
                     f"Pattern '{secret['type']}' matched in JS bundle",
                     secret["value"],
                     verification_stage="detected",
-                    request=_build_curl("GET", js_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                    request=_build_curl("GET", js_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                     response_excerpt=r.text[:500],
                     steps_to_reproduce=[
                         f"Fetch the JS file at {js_url}",
@@ -724,7 +728,7 @@ class Recon:
                     f"Hidden endpoint discovered via JS analysis in {js_url}",
                     ep.get("match", "")[:120],
                     verification_stage="detected",
-                    request=_build_curl("GET", ep["url"], dict(self.session.headers), cookies=dict(self.session.cookies)),
+                    request=_build_curl("GET", ep["url"], dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                     response_excerpt=r.text[:500],
                     steps_to_reproduce=[
                         f"Analyze the JS file at {js_url}",
@@ -762,11 +766,12 @@ class Recon:
 
     def _resolve_subdomain(self, subdomain, domain):
         """
-        Attempt to resolve a subdomain via DNS.
+        Attempt to resolve a subdomain via DNS with a 5-second timeout.
         """
         full_domain = f"{subdomain}.{domain}"
         
         try:
+            socket.setdefaulttimeout(self.timeout or 5)
             socket.gethostbyname(full_domain)
             with self.subdomains_lock:
                 self.subdomains.add(full_domain)
@@ -775,6 +780,8 @@ class Recon:
                 log(f"Found subdomain: {full_domain}", Colors.GREEN, self.verbose)
         
         except socket.gaierror:
+            pass
+        except OSError:
             pass
         except Exception as e:
             if self.verbose:

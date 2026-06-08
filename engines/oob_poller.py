@@ -35,12 +35,12 @@ class OOBBackgroundPoller(threading.Thread):
         self.oob = oob_framework
         self.promote = promote_callback
         self.interval = interval
-        self._stop = threading.Event()
+        self._stopped = threading.Event()
 
     def run(self) -> None:
         if not self.oob or not self.oob.oob_host:
             return
-        while not self._stop.wait(self.interval):
+        while not self._stopped.wait(self.interval):
             try:
                 confirmed = self.oob.poll()
                 for entry in confirmed:
@@ -49,7 +49,7 @@ class OOBBackgroundPoller(threading.Thread):
                 continue
 
     def stop(self, timeout: float = 2.0) -> None:
-        self._stop.set()
+        self._stopped.set()
         if self.is_alive():
             self.join(timeout=timeout)
 

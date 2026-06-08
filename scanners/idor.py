@@ -7,6 +7,7 @@ Lifecycle:
 Maturity: Level 3 (Delegates to IdorScanner with ownership validation)
 """
 
+from models.finding import Finding
 from scanners.base import ScannerBase
 
 
@@ -19,7 +20,7 @@ class IdorScannerAdapter(ScannerBase):
         super().__init__(config, recon, container=container)
         self._impl = None
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         if self._impl is None:
             from modules.idor import IdorScanner as _Idor
             self._impl = _Idor(self.config, self.recon, container=self.container)

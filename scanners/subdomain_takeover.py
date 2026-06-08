@@ -10,10 +10,12 @@ Lifecycle:
 Maturity: Level 1 (Detection only)
 """
 
+from models.finding import Finding
 from models.evidence import ResponseExcerptEvidence
 from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
@@ -74,7 +76,7 @@ class SubdomainTakeoverScanner(ScannerBase):
             "The DNS CNAME points to an unclaimed or expired external service — register the external resource to claim the subdomain",
         ]
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         for subdomain in self.recon.get("subdomains", []):
             try:
                 for scheme in ("http://", "https://"):
@@ -98,7 +100,7 @@ class SubdomainTakeoverScanner(ScannerBase):
                         severity="high",
                         details=f"A known takeover fingerprint ({detection.payload!r}) was detected on the subdomain",
                         evidence=f"Signature: {detection.payload}",
-                        request=_build_curl("GET", target_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                        request=_build_curl("GET", target_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                         response_excerpt=detection.raw_response.text[:500] if detection.raw_response else "",
                         steps_to_reproduce=self.generate_reproduction(detection, validation_result),
                         verification_stage=VerificationStage.DETECTED.value,

@@ -14,6 +14,7 @@ import re
 from typing import Any
 from urllib.parse import urlparse, parse_qs
 
+from models.finding import Finding
 from models.evidence import (
     HttpRequestEvidence,
     ResponseExcerptEvidence,
@@ -21,6 +22,7 @@ from models.evidence import (
 from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
@@ -175,7 +177,7 @@ class SSTIScanner(ScannerBase):
                 method="GET",
                 url=detection.url,
                 curl_command=_build_curl("GET", detection.url, dict(self.session.headers),
-                                         cookies=dict(self.session.cookies)),
+                                         cookies=safe_cookies_dict(self.session.cookies)),
                 description=f"SSTI detection probe: {detection.payload}",
             ))
             ev_list.append(ResponseExcerptEvidence(
@@ -201,7 +203,7 @@ class SSTIScanner(ScannerBase):
             ))
         return ev_list
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
         for url in urls:
@@ -244,7 +246,7 @@ class SSTIScanner(ScannerBase):
                         severity=severity,
                         details=f"Parameter '{param}': {title.lower()} detected" + (f" (engine: {engine_str})" if engine_str else ""),
                         evidence=f"Context: {detection.context}" + (f", Engine: {engine_str}" if engine_str else "") + (f", Proof: {exploitation.get('proof', '')[:100]}" if read_proof else ""),
-                        request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                        request=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                         response_excerpt=resp.text[:500] if resp else "",
                         parameter=param,
                         steps_to_reproduce=self.generate_reproduction(detection, stage, engine_str, exploitation.get("proof", "")),

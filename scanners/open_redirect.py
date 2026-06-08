@@ -12,10 +12,12 @@ Maturity: Level 3 (Detect + Validate + typed evidence + reproduction)
 
 from urllib.parse import urlparse, parse_qs
 
+from models.finding import Finding
 from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
 from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
@@ -85,7 +87,7 @@ class OpenRedirectScanner(ScannerBase):
             f"Observe redirect to external domain: {detection.context}",
         ]
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
         for url in urls:
@@ -107,7 +109,7 @@ class OpenRedirectScanner(ScannerBase):
                         severity="medium",
                         details=f"Parameter '{param}' redirects to external domain",
                         evidence=f"Location: {resp.headers.get('Location', '')[:100] if resp else ''}",
-                        request=_build_curl("GET", detection.url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                        request=_build_curl("GET", detection.url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                         response_excerpt=resp.text[:500] if resp else "",
                         parameter=param,
                         steps_to_reproduce=self.generate_reproduction(detection),
@@ -119,7 +121,7 @@ class OpenRedirectScanner(ScannerBase):
                             req_ev = HttpRequestEvidence(
                                 method="GET",
                                 url=detection.url,
-                                curl_command=_build_curl("GET", detection.url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                                curl_command=_build_curl("GET", detection.url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                             )
                             self.evidence_engine.store(req_ev)
                             self.evidence_engine.link_to_finding(req_ev, fp)

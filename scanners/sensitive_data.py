@@ -16,8 +16,10 @@ from urllib.parse import urlparse
 from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage, SecretValidator,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
+from models.finding import Finding
 from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence, SecretValidationEvidence
 
 SENSITIVE_PATTERNS = [
@@ -88,7 +90,7 @@ class SensitiveDataScanner(ScannerBase):
             HttpRequestEvidence(
                 method="GET",
                 url=detection.url,
-                curl_command=_build_curl("GET", detection.url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                curl_command=_build_curl("GET", detection.url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
             ),
             ResponseExcerptEvidence(
                 excerpt=body[:500],
@@ -132,7 +134,7 @@ class SensitiveDataScanner(ScannerBase):
             f"Rotate exposed credentials immediately — they can be used for lateral attacks",
         ]
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
         for url in urls:
@@ -174,7 +176,7 @@ class SensitiveDataScanner(ScannerBase):
                     severity=severity,
                     details=f"Potential sensitive value detected in page content: {label}",
                     evidence=" | ".join(evidence_parts),
-                    request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                    request=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                     response_excerpt=detection.raw_response.text[:500] if detection.raw_response else "",
                     steps_to_reproduce=self.generate_reproduction(detection, validation_result),
                     verification_stage=stage,

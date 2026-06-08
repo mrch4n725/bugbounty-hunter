@@ -20,7 +20,7 @@ from modules.scanner import VulnScanner
 from modules.api_scanner import ApiScanner
 from modules.reporter import Reporter
 from modules.js_intelligence import JSIntelligence
-from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score, prioritize_findings, reset_seen_findings, _build_curl, set_mask_sensitive_default, ScanProgress
+from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score, prioritize_findings, reset_seen_findings, _build_curl, set_mask_sensitive_default, ScanProgress, safe_cookies_dict
 from models.finding import Finding
 from app.bootstrap import bootstrap, auto_upgrade_config, print_startup_summary
 from engines.history import correlate_findings
@@ -660,7 +660,7 @@ def main():
     banner()
     args = parse_args()
     if getattr(args, "no_rich", False):
-        from modules.utils import set_rich_enabled
+        from modules.utils import set_rich_enabled, safe_cookies_dict
         set_rich_enabled(False)
     if args.config:
         log(f"Loading configuration from {args.config}", Colors.CYAN)
@@ -756,7 +756,7 @@ def main():
                     details=f"Secret type '{entry['type']}' found in JS file",
                     evidence=f"Match: {entry['value'][:40]}... Source: {url}",
                     verification_stage="verified" if validated else "detected",
-                    request=_build_curl("GET", url, dict(js_session.headers), cookies=dict(js_session.cookies)),
+                    request=_build_curl("GET", url, dict(js_session.headers), cookies=safe_cookies_dict(js_session.cookies)),
                     response_excerpt=resp.text[:1000],
                     steps_to_reproduce=[
                         f"Fetch the JS file at {url}",

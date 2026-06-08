@@ -12,6 +12,7 @@ from engines.history import (
     correlate_findings,
     compute_asset_fingerprint,
 )
+from engines.dedup import DeduplicationEngine
 
 __all__ = [
     "ValidationEngine",
@@ -20,6 +21,7 @@ __all__ = [
     "RootCauseGroup",
     "normalize_endpoint",
     "AuthorizationEngine",
+    "DeduplicationEngine",
     "ScanHistory",
     "ScanSnapshot",
     "FindingHistoryRecord",

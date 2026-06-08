@@ -13,6 +13,7 @@ Maturity: Level 4 (OOB-confirmed)
 from urllib.parse import urlparse, parse_qs
 from urllib.parse import urlencode as _urlencode
 
+from models.finding import Finding
 from modules.utils import (
     safe_get, safe_post, finding, log, Colors, _build_curl,
     VerificationStage,
@@ -64,7 +65,7 @@ class BlindXSSScanner(ScannerBase):
             "Observe OOB callback on listener containing victim's cookies, session token, or page content — confirms stored XSS execution in victim's browser",
         ]
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         oob_host = self.validation.callback_host
         if not oob_host:
@@ -115,7 +116,7 @@ class BlindXSSScanner(ScannerBase):
 
         return self._get_findings()
 
-    def finalize(self) -> list[dict]:
+    def finalize(self) -> list[Finding]:
         extra: list[dict] = []
         confirmed = self.validation.poll_oob()
         for ev in confirmed:

@@ -19,8 +19,10 @@ from typing import Any
 from modules.utils import (
     finding, log, Colors, _build_curl,
     VerificationStage,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
+from models.finding import Finding
 from models.evidence import TimingEvidence
 
 HARDCODED_PATHS = [
@@ -115,7 +117,7 @@ class RateLimitingScanner(ScannerBase):
         except Exception:
             return None
 
-        _probe_cookies = dict(self.session.cookies)
+        _probe_cookies = safe_cookies_dict(self.session.cookies)
         _probe_headers = dict(self.session.headers)
 
         def _probe(_idx: int, _url=test_url, _data=probe_data, _timeout=self.timeout,
@@ -192,7 +194,7 @@ class RateLimitingScanner(ScannerBase):
             "Without rate limiting, an attacker can perform brute-force password guessing, credential stuffing, or OTP enumeration at full speed",
         ]
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         candidates = self._build_candidates(target_urls)
         for candidate in candidates:
             test_url = candidate["url"]

@@ -15,8 +15,10 @@ from urllib.parse import urlparse, parse_qs
 from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
+from models.finding import Finding
 from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
 
 LFI_SIGNATURES = [
@@ -92,7 +94,7 @@ class LFIScanner(ScannerBase):
             f"Observe file signature in response: {detection.context}",
         ]
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         raw_urls = self.recon.get("urls", []) if target_urls is None else target_urls
         for url in raw_urls:
@@ -107,7 +109,7 @@ class LFIScanner(ScannerBase):
                     req_ev = HttpRequestEvidence(
                         method="GET",
                         url=detection.url,
-                        curl_command=_build_curl("GET", detection.url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                        curl_command=_build_curl("GET", detection.url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                     )
                     resp = detection.raw_response
                     resp_ev = ResponseExcerptEvidence(
@@ -121,7 +123,7 @@ class LFIScanner(ScannerBase):
                         severity="critical",
                         details=f"Parameter '{detection.parameter}' includes local file (signature: {detection.context})",
                         evidence=f"Payload: {detection.payload}",
-                        request=_build_curl("GET", detection.url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                        request=_build_curl("GET", detection.url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                         response_excerpt=resp.text[:500] if resp else "",
                         parameter=detection.parameter,
                         steps_to_reproduce=self.generate_reproduction(detection),

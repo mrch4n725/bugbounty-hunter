@@ -12,6 +12,7 @@ Maturity: Level 1 (Detection only)
 
 from urllib.parse import urlparse
 
+from models.finding import Finding
 from models.evidence import ResponseExcerptEvidence
 from modules.utils import (
     finding, VerificationStage, log, Colors, _build_curl,
@@ -73,7 +74,7 @@ class CSRFScanner(ScannerBase):
             "Compare with legitimate request that includes a token — both succeed, confirming missing CSRF protection",
         ]
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         forms = self.recon.get("forms", [])
         if target_urls is not None:
             origins = {urlparse(u).scheme + "://" + urlparse(u).netloc for u in target_urls}

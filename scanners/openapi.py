@@ -17,8 +17,10 @@ from urllib.parse import urljoin
 from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase
+from models.finding import Finding
 from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
 
 
@@ -42,7 +44,7 @@ class OpenAPIScanner(ScannerBase):
     TARGET_LEVEL = True
     SCANNER_ORDER = 10
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         discovered: set[str] = set()
         for sp in SPEC_PATHS:
             url = self.base_url + sp
@@ -101,7 +103,7 @@ class OpenAPIScanner(ScannerBase):
         return []
 
     def _emit_finding(self, url: str, spec_path: str, resp, paths: list[str]) -> None:
-        curl_cmd = _build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies))
+        curl_cmd = _build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies))
         resp_excerpt = resp.text[:500]
 
         req_ev = HttpRequestEvidence(

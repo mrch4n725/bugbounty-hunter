@@ -12,10 +12,12 @@ Maturity: Level 1 (Detection only)
 
 from urllib.parse import urlparse
 
+from models.finding import Finding
 from models.evidence import ResponseExcerptEvidence
 from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
@@ -106,7 +108,7 @@ class DirectoryFuzzScanner(ScannerBase):
             "Try common credentials, default passwords, or check if the authentication can be bypassed",
         ]
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         urls = self.recon.get("urls", [])
         base = urlparse(self.base_url).netloc
         if not base:
@@ -167,7 +169,7 @@ class DirectoryFuzzScanner(ScannerBase):
                     severity=severity,
                     details=f"{'Index listing detected' if detection.context == 'directory_listing' else 'Accessible path found' if detection.context == 'accessible_path' else 'Path exists but is access-controlled'}: {target_url}",
                     evidence=f"HTTP {resp.status_code}" if resp else "",
-                    request=_build_curl("GET", target_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                    request=_build_curl("GET", target_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                     response_excerpt=resp.text[:500] if resp else "",
                     steps_to_reproduce=self.generate_reproduction(detection, validation_result),
                     verification_stage=stage,

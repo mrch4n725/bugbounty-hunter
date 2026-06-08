@@ -13,6 +13,7 @@ Maturity: Level 4 (OOB-confirmed)
 import hashlib
 from urllib.parse import urlparse, urlencode, parse_qs
 
+from models.finding import Finding
 from models.evidence import (
     HttpRequestEvidence,
     ResponseExcerptEvidence,
@@ -20,6 +21,7 @@ from models.evidence import (
 from modules.utils import (
     finding, log, Colors, _build_curl, safe_get,
     VerificationStage,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
@@ -120,7 +122,7 @@ class SSRFScanner(ScannerBase):
                 method="GET",
                 url=detection.url,
                 headers=dict(self.session.headers),
-                curl_command=_build_curl("GET", detection.url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                curl_command=_build_curl("GET", detection.url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                 description=f"SSRF probe to cloud metadata endpoint via {detection.url}",
             )
             resp_ev = ResponseExcerptEvidence(
@@ -163,7 +165,7 @@ class SSRFScanner(ScannerBase):
 
     # ── Scan entry point ────────────────────────────────────────────────
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         oob_host = self.config.get("oob_host")
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
@@ -241,7 +243,7 @@ class SSRFScanner(ScannerBase):
                         severity="critical",
                         details=f"Vulnerable parameters ({len(vulnerable_params)}): {', '.join(vulnerable_params[:10])}",
                         evidence=f"Signatures: {', '.join(list(all_matched_sigs)[:5])}",
-                        request=_build_curl("GET", url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                        request=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                         response_excerpt=matching_resp.text[:500],
                         steps_to_reproduce=self.generate_reproduction(detection, validation_result),
                         verification_stage=VerificationStage.VALIDATED.value,
@@ -270,7 +272,7 @@ class SSRFScanner(ScannerBase):
                     severity="critical",
                     details="OOB callback received for SSRF probe — DNS/HTTP interaction confirmed from target server",
                     evidence=f"Callback: {callback_raw[:200]}",
-                    request=_build_curl("GET", original_url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                    request=_build_curl("GET", original_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                     verification_stage=VerificationStage.VERIFIED.value,
                     validation_steps=["OOB callback verified: DNS/HTTP interaction confirmed from target infrastructure"],
                     response_excerpt="(SSRF confirmed via out-of-band callback — DNS/HTTP request received from target server)",

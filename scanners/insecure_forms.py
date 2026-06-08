@@ -12,6 +12,7 @@ Maturity: Level 1 (Detection only)
 
 from urllib.parse import urlparse, urljoin
 
+from models.finding import Finding
 from models.evidence import ResponseExcerptEvidence
 from modules.utils import (
     finding, VerificationStage, log, Colors, _build_curl,
@@ -92,7 +93,7 @@ class InsecureFormsScanner(ScannerBase):
             "Observe that credentials are sent to a third-party origin — the password may be harvested by an external service",
         ]
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         forms = self.recon.get("forms", [])
         if target_urls is not None:
             origins = {urlparse(u).scheme + "://" + urlparse(u).netloc for u in target_urls}

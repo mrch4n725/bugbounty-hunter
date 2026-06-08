@@ -13,8 +13,10 @@ Maturity: Level 4 (OOB-confirmed)
 from modules.utils import (
     safe_post, finding, log, Colors, _build_curl,
     VerificationStage,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
+from models.finding import Finding
 from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
 
 XXE_PAYLOADS = {
@@ -115,7 +117,7 @@ class XXEScanner(ScannerBase):
             req_ev = HttpRequestEvidence(
                 method="POST",
                 url=detection.url,
-                curl_command=_build_curl("POST", detection.url, dict(self.session.headers), data=detection.payload, cookies=dict(self.session.cookies)),
+                curl_command=_build_curl("POST", detection.url, dict(self.session.headers), data=detection.payload, cookies=safe_cookies_dict(self.session.cookies)),
             )
             resp_ev = ResponseExcerptEvidence(
                 excerpt=resp.text[:500],
@@ -136,7 +138,7 @@ class XXEScanner(ScannerBase):
 
     # ── Scan entry point ────────────────────────────────────────────────
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         oob_host = self.validation.callback_host if self.validation else ""
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
@@ -164,7 +166,7 @@ class XXEScanner(ScannerBase):
                     details="In-band XXE: file content returned in response via XML entity" if not is_error
                             else "Error-based XXE: file content leaked via parser error message",
                     evidence=f"Signature: {detection.evidence_signals[0] if detection.evidence_signals else ''}",
-                    request=_build_curl("POST", url, dict(self.session.headers), data=detection.payload, cookies=dict(self.session.cookies)),
+                    request=_build_curl("POST", url, dict(self.session.headers), data=detection.payload, cookies=safe_cookies_dict(self.session.cookies)),
                     response_excerpt=detection.raw_response.text[:500] if detection.raw_response else "",
                     steps_to_reproduce=self.generate_reproduction(detection, validation_result),
                     verification_stage=VerificationStage.VALIDATED.value,
@@ -187,7 +189,7 @@ class XXEScanner(ScannerBase):
 
         return self._get_findings()
 
-    def finalize(self) -> list[dict]:
+    def finalize(self) -> list[Finding]:
         extra: list[dict] = []
         if not self.validation:
             return extra
@@ -205,7 +207,7 @@ class XXEScanner(ScannerBase):
                 severity="critical",
                 details="Blind XXE confirmed via OOB callback — server parsed XML entity and made external request",
                 evidence=f"Callback: {(ev.raw_data or '')[:200]}",
-                request=_build_curl("POST", url_str, dict(self.session.headers), data="(XXE payload with OOB DTD)", cookies=dict(self.session.cookies)),
+                request=_build_curl("POST", url_str, dict(self.session.headers), data="(XXE payload with OOB DTD)", cookies=safe_cookies_dict(self.session.cookies)),
                 verification_stage=VerificationStage.VERIFIED.value,
                 response_excerpt="(XXE confirmed via out-of-band callback — XML parser made external request)",
                 steps_to_reproduce=[

@@ -12,8 +12,10 @@ Maturity: Level 1 (Detection only)
 
 from modules.utils import (
     safe_get, finding, VerificationStage, log, Colors, _build_curl,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
+from models.finding import Finding
 from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
 
 
@@ -60,7 +62,7 @@ class ClickjackingScanner(ScannerBase):
             HttpRequestEvidence(
                 method="GET",
                 url=detection.url,
-                curl_command=_build_curl("GET", detection.url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                curl_command=_build_curl("GET", detection.url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
             ),
             ResponseExcerptEvidence(
                 excerpt=resp.text[:500],
@@ -78,7 +80,7 @@ class ClickjackingScanner(ScannerBase):
             f"Create an HTML page with <iframe src='{detection.url}'> — the page loads inside the iframe",
         ]
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         target = self.base_url
         if not target or not self._in_scope(target):
             return self._get_findings()
@@ -102,7 +104,7 @@ class ClickjackingScanner(ScannerBase):
                 severity="medium",
                 details=f"The application does not enforce frame protection headers (X-Frame-Options: {x_frame or 'missing'}, CSP: {csp or 'missing'})",
                 evidence=f"X-Frame-Options: {x_frame or 'missing'}, CSP: {csp or 'missing'}",
-                request=_build_curl("GET", target, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                request=_build_curl("GET", target, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                 response_excerpt=resp.text[:500] if resp else "",
                 steps_to_reproduce=self.generate_reproduction(detection, validation_result),
                 verification_stage=VerificationStage.DETECTED.value,

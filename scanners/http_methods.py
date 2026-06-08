@@ -12,8 +12,10 @@ Maturity: Level 1 (Detection only)
 
 from modules.utils import (
     safe_get, finding, VerificationStage, log, Colors, _build_curl,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
+from models.finding import Finding
 from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
 
 
@@ -69,7 +71,7 @@ class HttpMethodsScanner(ScannerBase):
             HttpRequestEvidence(
                 method="OPTIONS",
                 url=detection.url,
-                curl_command=_build_curl("OPTIONS", detection.url, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                curl_command=_build_curl("OPTIONS", detection.url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
             ),
             ResponseExcerptEvidence(
                 excerpt=resp.text[:500],
@@ -86,7 +88,7 @@ class HttpMethodsScanner(ScannerBase):
             f"Test each method (e.g., curl -X PUT {detection.url}) to verify it is actually enabled, not just advertised",
         ]
 
-    def scan(self, target_urls: list[str] | None = None) -> list[dict]:
+    def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         targets = target_urls if target_urls else [self.base_url]
         for target in targets:
             if not target or not self._in_scope(target):
@@ -108,7 +110,7 @@ class HttpMethodsScanner(ScannerBase):
                     severity="medium",
                     details=f"The server supports non-safe HTTP methods: {detection.payload}",
                     evidence=f"Allowed methods: {detection.payload}",
-                    request=_build_curl("OPTIONS", target, dict(self.session.headers), cookies=dict(self.session.cookies)),
+                    request=_build_curl("OPTIONS", target, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                     response_excerpt=detection.raw_response.text[:500] if detection.raw_response else "",
                     steps_to_reproduce=self.generate_reproduction(detection, validation_result),
                     verification_stage=VerificationStage.DETECTED.value,
