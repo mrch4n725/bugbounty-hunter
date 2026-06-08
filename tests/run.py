@@ -106,7 +106,7 @@ section("4. finding() — Dedup Engine")
 reset_seen_findings()
 
 f1 = finding("XSS", "https://example.com/xss?q=1", "critical", "desc", "alert(1)")
-check("fresh finding returns dict", isinstance(f1, dict))
+check("fresh finding is not None", f1 is not None)
 check("fingerprint present", "fingerprint" in f1)
 check_eq("default confidence", f1["confidence_score"], 25)
 

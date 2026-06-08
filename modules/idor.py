@@ -278,8 +278,8 @@ class IdorScanner(VulnScanner):
                         description=f"Horizontal privilege escalation: secondary user accessed {url}",
                         status=EvidenceStatus.VERIFIED,
                     )
-                    legacy_ev = f_dict.get("evidence", "")
-                    f_dict["evidence"] = [legacy_ev] if legacy_ev else []
+                    if not isinstance(f_dict.get("evidence", []), list):
+                        f_dict["evidence"] = [str(f_dict.get("evidence", ""))]
                     f_dict["evidence"].append(ev)
                     if hasattr(self, '_container') and self._container and self._container.evidence_engine:
                         self._container.evidence_engine.store(ev)
@@ -557,9 +557,8 @@ class IdorScanner(VulnScanner):
                     ],
                 )
                 if f_dict:
-                    # Convert string evidence to list and append typed evidence
-                    legacy_ev = f_dict.get("evidence", "")
-                    f_dict["evidence"] = [legacy_ev] if legacy_ev else []
+                    if not isinstance(f_dict.get("evidence", []), list):
+                        f_dict["evidence"] = [str(f_dict.get("evidence", ""))]
                     f_dict["evidence"].append(auth_evidence)
                     # Update reproduction steps for submission readiness
                     f_dict["steps_to_reproduce"] = [

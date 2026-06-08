@@ -151,6 +151,7 @@ class Finding:
     _DICT_LEGACY_KEYS: ClassVar[set[str]] = {
         "screenshot_path", "confirmed", "priority_score", "component",
         "what_is_it", "request_response", "demonstrated_impact",
+        "chains", "self_halted",
     }
 
     def __getitem__(self, key: str) -> Any:
@@ -297,7 +298,11 @@ class Finding:
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> "Finding":
-        evidence_list = d.get("evidence", [])
+        evidence_raw = d.get("evidence", [])
+        if isinstance(evidence_raw, str):
+            evidence_list = [evidence_raw] if evidence_raw else []
+        else:
+            evidence_list = evidence_raw
         f = Finding(
             id=d.get("id", ""),
             title=d.get("title", d.get("type", "")),

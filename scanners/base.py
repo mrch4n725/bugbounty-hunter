@@ -247,7 +247,7 @@ class ScannerBase:
             t.join()
         return results
 
-    def _add_finding(self, f: dict | None) -> bool:
+    def _add_finding(self, f) -> bool:
         if not f:
             return False
         with self._lock:
@@ -267,8 +267,9 @@ class ScannerBase:
             if fp and request_str and self.evidence_engine is not None:
                 try:
                     from models.evidence import HttpRequestEvidence
+                    req_str = f.get("request", "")
                     req_ev = HttpRequestEvidence(
-                        method=f.get("request", "GET").split()[0] if " " in f.get("request", "") else "GET",
+                        method=req_str.split()[0] if " " in req_str else "GET",
                         url=url,
                         curl_command=request_str,
                     )
@@ -278,7 +279,7 @@ class ScannerBase:
                     pass
             return True
 
-    def _get_findings(self) -> list[dict]:
+    def _get_findings(self) -> list:
         from modules.utils import prioritize_findings
         raw = self.dedup.get_findings()
         return prioritize_findings(raw)

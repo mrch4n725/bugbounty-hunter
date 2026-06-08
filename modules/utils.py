@@ -18,7 +18,6 @@ import time
 import uuid
 import warnings
 from contextlib import contextmanager
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
@@ -205,14 +204,14 @@ from models.evidence import (
     GraphQLSchemaEvidence,
     AuthorizationComparisonEvidence,
 )
-from models.finding import Finding as _CanonicalFinding
+from models.finding import Finding
 
 # ── Prioritization Scoring Engine ────────────────────────────────────────────
 
 SEVERITY_PRIORITY = {"critical": 100, "high": 75, "medium": 50, "low": 25}
 STAGE_PRIORITY = {"verified": 100, "exploitable": 90, "validated": 60, "detected": 30}
 
-def compute_priority_score(finding: dict) -> int:
+def compute_priority_score(finding) -> int:
     """
     Compute a 0–100 priority score for a finding based on:
     - Severity (25 pts max)
@@ -230,7 +229,10 @@ def compute_priority_score(finding: dict) -> int:
     evidence_map = {"verified": 20, "strong": 15, "moderate": 10, "weak": 5}
     ev_score = evidence_map.get(evidence, 5)
 
-    oob_bonus = 15 if "oob" in finding.get("evidence", "").lower() else 0
+    ev_list = finding.get("evidence", [])
+    if not isinstance(ev_list, list):
+        ev_list = [str(ev_list)] if ev_list else []
+    oob_bonus = 15 if any("oob" in str(ev).lower() for ev in ev_list) else 0
     validation_steps = finding.get("validation_steps", [])
     signal_bonus = min(len(validation_steps) * 5, 10)
 
@@ -238,135 +240,11 @@ def compute_priority_score(finding: dict) -> int:
     return min(int(raw), 100)
 
 
-def prioritize_findings(findings: list[dict]) -> list[dict]:
+def prioritize_findings(findings) -> list:
     """Sort findings by computed priority score descending, adding priority_score key."""
     for f in findings:
         f["priority_score"] = compute_priority_score(f)
     return sorted(findings, key=lambda f: f.get("priority_score", 0), reverse=True)
-
-
-# ── Vulnerability Finding Model (Legacy Wrapper) ─────────────────────────────
-# Phase 1: backward-compat wrapper around models.Finding.
-# Will be removed in Phase 4 after all consumers migrate.
-
-@dataclass
-class VulnerabilityFinding:
-    title: str = ""
-    vuln_type: str = ""
-    url: str = ""
-    severity: str = "info"
-    details: str = ""
-    evidence: str = ""
-    confidence_score: int = 0
-    confidence_label: str = "Unverified"
-    verification_stage: str = "detected"
-    evidence_strength: str = "weak"
-    false_positive_risk: str = "high"
-    proof: List[str] = field(default_factory=list)
-    fingerprint: str = ""
-    grouped_urls: List[str] = field(default_factory=list)
-    cvss_score: Optional[float] = None
-    cvss_vector: Optional[str] = None
-    what_is_it: str = ""
-    impact: str = ""
-    remediation: str = ""
-    references: List[str] = field(default_factory=list)
-    timestamp: str = ""
-    validation_steps: List[str] = field(default_factory=list)
-    steps_to_reproduce: List[str] = field(default_factory=list)
-    exploitability_rating: str = "unknown"
-
-    def to_dict(self) -> Dict[str, Any]:
-        canonical = _CanonicalFinding(
-            title=self.title,
-            vuln_type=self.vuln_type,
-            url=self.url,
-            severity=self.severity,
-            details=self.details,
-            confidence_score=self.confidence_score or 25,
-            confidence_label=self.confidence_label,
-            verification_stage=self.verification_stage,
-            evidence_strength=self.evidence_strength,
-            false_positive_risk=self.false_positive_risk,
-            fingerprint=self.fingerprint,
-            impact=self.impact,
-            remediation=self.remediation,
-            references=self.references,
-            grouped_urls=self.grouped_urls,
-            timestamp=self.timestamp,
-            exploitability_rating=self.exploitability_rating,
-            cvss_score=self.cvss_score,
-            cvss_vector=self.cvss_vector,
-            request=self.what_is_it,
-        )
-        d = canonical.to_dict()
-        d["proof"] = self.proof
-        d["validation_steps"] = self.validation_steps
-        d["steps_to_reproduce"] = self.steps_to_reproduce
-        d["evidence"] = self.evidence
-        return d
-
-    @staticmethod
-    def from_legacy(f: Dict[str, Any]) -> "VulnerabilityFinding":
-        score = calculate_confidence(
-            detection=True,
-            validation=f.get("confirmed", False),
-            exploitation=False,
-        )
-        vf = VulnerabilityFinding(
-            title=f.get("title", f.get("type", "Unknown")),
-            vuln_type=f.get("type", "Unknown"),
-            url=f.get("url", ""),
-            severity=f.get("severity", "info"),
-            details=f.get("details", ""),
-            evidence=f.get("evidence", ""),
-            confidence_score=score,
-            confidence_label=ConfidenceLevel.from_score(score).value,
-            verification_stage=VerificationStage.VALIDATED.value if f.get("confirmed") else VerificationStage.DETECTED.value,
-            evidence_strength=evidence_strength_from_score(score).value,
-            false_positive_risk=false_positive_risk_from_score(score).value,
-            fingerprint=f.get("fingerprint", ""),
-            timestamp=f.get("timestamp", ""),
-            cvss_score=f.get("cvss_score"),
-            cvss_vector=f.get("cvss_vector"),
-            what_is_it=f.get("what_is_it", ""),
-            impact=f.get("impact", ""),
-            remediation=f.get("remediation", ""),
-            references=f.get("references", []),
-            grouped_urls=f.get("grouped_urls", []),
-            steps_to_reproduce=f.get("steps_to_reproduce", []),
-        )
-        if not vf.fingerprint:
-            vf.fingerprint = hashlib.sha256(
-                f"{vf.vuln_type}:{vf._legacy_extract_param()}:{vf.details[:80]}".encode()
-            ).hexdigest()
-        return vf
-
-    # ── Backward-compat methods used by DeduplicationEngine ────────────
-
-    def _extract_param_name(self) -> str:
-        return self._legacy_extract_param()
-
-    def _extract_root_cause(self) -> str:
-        return self.details[:80] if self.details else self.evidence[:80]
-
-    def _compute_fingerprint(self) -> str:
-        return hashlib.sha256(
-            f"{self.vuln_type}:{self._extract_param_name()}:{self._extract_root_cause()}".encode()
-        ).hexdigest()
-
-    def _legacy_extract_param(self) -> str:
-        for text in (self.details, self.evidence):
-            if "Parameter '" in text:
-                return text.split("Parameter '")[1].split("'")[0]
-            if "Form field '" in text:
-                return text.split("Form field '")[1].split("'")[0]
-        if "?" in self.url:
-            from urllib.parse import parse_qs, urlparse
-            params = parse_qs(urlparse(self.url).query)
-            if params:
-                return next(iter(params.keys()))
-        return ""
 
 
 # ── OOB Detection Framework ───────────────────────────────────────────────
@@ -449,47 +327,38 @@ class OOBDetectionFramework:
 # ── Deduplication Engine ─────────────────────────────────────────────────
 
 class DeduplicationEngine:
-    """Deduplicate findings by (vuln_type + parameter + root_cause) fingerprint.
-    Groups findings that share the same root cause across URLs.
+    """Deduplicate findings by fingerprint.
+    Groups findings that share the same fingerprint across URLs.
+    Stores Finding objects directly.
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._groups: Dict[str, Dict[str, Any]] = {}
+        self._groups: Dict[str, Finding] = {}
 
-    def _make_key(self, f: VulnerabilityFinding) -> str:
-        return hashlib.sha256(
-            f"{f.vuln_type}:{f._extract_param_name()}:{f._extract_root_cause()}".encode()
-        ).hexdigest()
-
-    def add(self, finding: VulnerabilityFinding) -> Optional[VulnerabilityFinding]:
-        key = finding._compute_fingerprint()
+    def add(self, finding: Finding) -> Optional[Finding]:
+        fp = finding.fingerprint
         with self._lock:
-            if key in self._groups:
-                existing = self._groups[key]
+            if fp in self._groups:
+                existing = self._groups[fp]
                 existing.grouped_urls.append(finding.url)
                 return None
-            self._groups[key] = finding
+            self._groups[fp] = finding
             return finding
 
     def add_legacy(self, f: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        vf = VulnerabilityFinding.from_legacy(f)
-        added = self.add(vf)
-        if added is None:
-            return None
-        return added.to_dict()
+        if isinstance(f, Finding):
+            return f if self.add(f) else None
+        finding = Finding.from_dict(f)
+        return f if self.add(finding) else None
 
-    def get_findings(self) -> List[Dict[str, Any]]:
+    def get_findings(self) -> List[Finding]:
         with self._lock:
             results = []
             for f in self._groups.values():
-                d = f.to_dict()
                 if len(f.grouped_urls) >= 5:
-                    d["grouped_urls"] = f.grouped_urls
-                    d["details"] = (
-                        f"{f.details} — Found on {len(f.grouped_urls)} URLs"
-                    )
-                results.append(d)
+                    f.details = f"{f.details} — Found on {len(f.grouped_urls)} URLs"
+                results.append(f)
             return results
 
     def clear(self) -> None:
@@ -1412,10 +1281,11 @@ def finding(
     request: Optional[str] = None,
     response_excerpt: Optional[str] = None,
     steps_to_reproduce: Optional[List[str]] = None,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[Finding]:
     """
-    Build a standardized finding dict with CVSS metadata, fingerprint, and timestamp.
+    Build a standardized Finding object with CVSS metadata, fingerprint, and timestamp.
     Supports both legacy confidence strings and new proof-based confidence fields.
+    Returns None if duplicate of an already-seen finding (process-wide dedup).
     """
     dedupe_key = (vuln_type, url, parameter or "")
     with _seen_findings_lock:
@@ -1429,11 +1299,13 @@ def finding(
     if confidence is None:
         confidence = meta.get("confidence", "probable")
 
-    evidence_str = evidence if isinstance(evidence, str) else str(evidence)
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    fingerprint = hashlib.sha256(
-        f"{vuln_type}:{url}:{evidence_str}".encode()
-    ).hexdigest()
+    # Normalize evidence to a list
+    if isinstance(evidence, str):
+        evidence_list = [evidence] if evidence else []
+    elif isinstance(evidence, list):
+        evidence_list = evidence
+    else:
+        evidence_list = [str(evidence)] if evidence else []
 
     # Calculate confidence score from stage if not provided
     if confidence_score is None:
@@ -1450,28 +1322,29 @@ def finding(
     if false_positive_risk is None:
         false_positive_risk = false_positive_risk_from_score(confidence_score).value
 
-    result: Dict[str, Any] = {
-        "title": vuln_type,
-        "type": vuln_type,
-        "url": url,
-        "severity": severity,
-        "details": details,
-        "evidence": evidence_str,
-        "confidence": confidence,
-        "fingerprint": fingerprint,
-        "timestamp": timestamp,
-        "confidence_score": confidence_score,
-        "verification_stage": verification_stage or VerificationStage.DETECTED.value,
-        "evidence_strength": evidence_strength,
-        "false_positive_risk": false_positive_risk,
-        "proof": proof or [],
-        "validation_steps": validation_steps or [],
-        "exploitability_rating": exploitability_rating or "unknown",
-        "parameter": parameter or "",
-        "request": request or "",
-        "response_excerpt": response_excerpt or "",
-        "steps_to_reproduce": steps_to_reproduce or validation_steps or [],
-    }
+    f = Finding(
+        title=vuln_type,
+        vuln_type=vuln_type,
+        url=url,
+        severity=severity,
+        details=details,
+        evidence=evidence_list,
+        confidence_score=confidence_score,
+        verification_stage=verification_stage or VerificationStage.DETECTED.value,
+        evidence_strength=evidence_strength,
+        false_positive_risk=false_positive_risk,
+        parameter=parameter or "",
+        request=request or "",
+        response_excerpt=response_excerpt or "",
+        reproduction_steps=steps_to_reproduce or validation_steps or [],
+        exploitability_rating=exploitability_rating or "unknown",
+    )
+
+    # Set dynamically-accessed legacy fields
+    # NOTE: "proof" maps to "evidence" and "validation_steps" maps to "reproduction_steps"
+    # via _DICT_ATTR_MAP — do NOT set them here as they'd overwrite the constructor values.
+    # Instead, code reading f["proof"] or f["validation_steps"] will get evidence/reproduction_steps.
+    f["confidence"] = confidence
 
     for key in (
         "cvss_score",
@@ -1482,53 +1355,9 @@ def finding(
         "references",
     ):
         if key in meta:
-            result[key] = meta[key]
+            f[key] = meta[key]
 
-    return result
-
-
-def finding_v2(
-    title: str,
-    vuln_type: str,
-    url: str,
-    severity: str,
-    details: str,
-    evidence: str = "",
-    detection: bool = True,
-    validation: bool = False,
-    exploitation: bool = False,
-    extra_confidence_points: int = 0,
-    proof: Optional[List[str]] = None,
-    validation_steps: Optional[List[str]] = None,
-) -> Optional[Dict[str, Any]]:
-    """New-style finding with explicit stage-based confidence scoring."""
-    score = calculate_confidence(
-        detection=detection,
-        validation=validation,
-        exploitation=exploitation,
-        extra_points=extra_confidence_points,
-    )
-    if exploitation:
-        stage = VerificationStage.EXPLOITABLE.value
-    elif validation:
-        stage = VerificationStage.VALIDATED.value
-    else:
-        stage = VerificationStage.DETECTED.value
-
-    return finding(
-        vuln_type=vuln_type,
-        url=url,
-        severity=severity,
-        details=details,
-        evidence=evidence,
-        confidence=ConfidenceLevel.from_score(score).value,
-        proof=proof,
-        validation_steps=validation_steps,
-        confidence_score=score,
-        verification_stage=stage,
-        evidence_strength=evidence_strength_from_score(score).value,
-        false_positive_risk=false_positive_risk_from_score(score).value,
-    )
+    return f
 
 
 # ── Baseline Fingerprinting ───────────────────────────────────────────

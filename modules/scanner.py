@@ -19,8 +19,8 @@ from bs4 import BeautifulSoup
 import yaml
 
 from modules.utils import (
-    make_session, safe_get, safe_post, finding, finding_v2, log, Colors, url_in_scope,
-    BaselineFingerprinter, VulnerabilityFinding, DeduplicationEngine,
+    make_session, safe_get, safe_post, finding, log, Colors, url_in_scope,
+    BaselineFingerprinter, DeduplicationEngine,
     OOBDetectionFramework, BrowserValidator, VerificationStage,
     EvidenceStrength, ConfidenceLevel, calculate_confidence,
     evidence_strength_from_score, false_positive_risk_from_score,
@@ -497,7 +497,7 @@ class VulnScanner:
 
     # ── Dedup Wrapper ────────────────────────────────────────────────────
 
-    def _add(self, f: Optional[dict]) -> bool:
+    def _add(self, f) -> bool:
         if not f:
             return False
         with self._lock:
@@ -512,7 +512,7 @@ class VulnScanner:
                 Colors.RED if sev in ("CRITICAL", "HIGH") else Colors.YELLOW)
             return True
 
-    def _get_findings(self) -> list[dict]:
+    def _get_findings(self) -> list:
         raw = self.dedup.get_findings()
         return prioritize_findings(raw)
 
@@ -594,9 +594,11 @@ class VulnScanner:
     def _promote_finding_by_oob(self, payload: str) -> bool:
         """Promote a finding to VERIFIED when an OOB callback matches its payload."""
         for f in self.dedup.get_findings():
-            evidence = f.get("evidence", "")
+            evidence_list = f.get("evidence", [])
+            if not isinstance(evidence_list, list):
+                evidence_list = [evidence_list] if evidence_list else []
             steps = str(f.get("validation_steps", []))
-            payload_in = payload in evidence or payload in steps
+            payload_in = payload in steps or any(payload in str(ev) for ev in evidence_list)
             if not payload_in:
                 for val in f.values():
                     if isinstance(val, str) and payload in val:
@@ -735,7 +737,11 @@ class VulnScanner:
             stage = f.get("verification_stage", "").lower()
 
             # Dangerous patterns: SQLi OOB confirmed + critical severity
-            if "sql" in vuln_type and stage in ("exploitable", "verified") and "oob" in f.get("evidence", "").lower():
+            ev_list = f.get("evidence", [])
+            if not isinstance(ev_list, list):
+                ev_list = [str(ev_list)] if ev_list else []
+            has_oob = any("oob" in str(ev).lower() for ev in ev_list)
+            if "sql" in vuln_type and stage in ("exploitable", "verified") and has_oob:
                 f["title"] = f["title"] + " — Identified: exploitation withheld pending human review"
                 f["details"] = f["details"] + " | ⚠ This finding was confirmed via OOB. Further exploitation (data extraction, writes) withheld pending human review per self-halting policy."
                 f["impact"] = "CRITICAL: SQL injection confirmed with out-of-band data exfiltration capability. Automated exploitation withheld — requires manual review."
@@ -787,13 +793,15 @@ class VulnScanner:
         )
         self._append_finding(findings_list, f)
 
-    def _deduplicate(self, findings_list: list[dict]) -> list[dict]:
+    def _deduplicate(self, findings_list: list) -> list:
         seen = set()
         result = []
         for f in findings_list:
-            key = (f.get("vuln_type", ""), f.get("url", ""), f.get("evidence", ""))
-            if key not in seen:
-                seen.add(key)
+            fp = f.get("fingerprint", "") or hashlib.sha256(
+                f"{f.get('vuln_type', '')}:{f.get('url', '')}:{f.get('parameter', '')}".encode()
+            ).hexdigest()
+            if fp not in seen:
+                seen.add(fp)
                 result.append(f)
         return result
 
@@ -882,8 +890,14 @@ class VulnScanner:
     def _in_scope(self, url: str) -> bool:
         return url_in_scope(url, self.config)
 
-    def _extract_param_name(self, f: dict) -> str:
-        for text in (f.get("details", ""), f.get("evidence", "")):
+    def _extract_param_name(self, f) -> str:
+        texts: list[str] = [f.get("details", "")]
+        ev = f.get("evidence", [])
+        if isinstance(ev, list):
+            texts.extend(str(e) for e in ev if isinstance(e, str))
+        else:
+            texts.append(str(ev))
+        for text in texts:
             if "Parameter '" in text:
                 return text.split("Parameter '")[1].split("'")[0]
             if "Form field '" in text:
@@ -3424,9 +3438,9 @@ class VulnScanner:
                                     "Introspection + writable mutations exposed — attacker can enumerate "
                                     "the full API schema and probe mutation endpoints for authorization flaws"
                                 )
-                        # Convert string evidence to list and append typed evidence
-                        legacy_ev = f.get("evidence", "")
-                        f["evidence"] = [legacy_ev] if legacy_ev else []
+                        # Append typed evidence (evidence is already a list from finding())
+                        if not isinstance(f.get("evidence", []), list):
+                            f["evidence"] = [str(f.get("evidence", ""))]
                         f["evidence"].append(schema_evidence)
                         if self._container and self._container.evidence_engine:
                             fp = self._container.evidence_engine.store(schema_evidence)
@@ -3562,12 +3576,15 @@ class VulnScanner:
 
         for f in old_findings:
             url = f.get("url", "")
-            evidence = f.get("evidence", "")
+            ev_list = f.get("evidence", [])
+            if not isinstance(ev_list, list):
+                ev_list = [str(ev_list)] if ev_list else []
+            evidence_str = ev_list[0] if ev_list else ""
             if not url:
                 continue
             try:
                 r = scanner.session.get(url, timeout=scanner.timeout)
-                confirmed = evidence in r.text if evidence else r.status_code < 500
+                confirmed = evidence_str in r.text if evidence_str else r.status_code < 500
                 f["confirmed"] = confirmed
                 f["last_verified"] = datetime.now(timezone.utc).isoformat()
                 verified.append(f)

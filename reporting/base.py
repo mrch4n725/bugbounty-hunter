@@ -336,10 +336,11 @@ class ReporterBase:
         seen = set()
         deduped = []
         for f in self.findings:
-            key = (f.get('title', ''), f.get('url', ''), f.get('severity', ''),
-                   f.get('details', ''), f.get('evidence', ''))
-            if key not in seen:
-                seen.add(key)
+            fp = f.get("fingerprint", "")
+            if not fp:
+                fp = str(hash((f.get('title', ''), f.get('url', ''), f.get('severity', ''))))
+            if fp not in seen:
+                seen.add(fp)
                 deduped.append(f)
         return deduped
 

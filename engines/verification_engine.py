@@ -85,7 +85,7 @@ class VerificationEngine:
             self._verify_open_redirect(finding)
         return finding
 
-    def _promote(self, f: dict, stage: str, evidence_parts: list[str] | None = None) -> None:
+    def _promote(self, f, stage: str, evidence_parts: list[str] | None = None) -> None:
         stage = stage.lower()
         f["verification_stage"] = stage
         f["confidence_score"] = calculate_confidence(
@@ -96,9 +96,11 @@ class VerificationEngine:
         f["evidence_strength"] = EvidenceStrength.from_score(f["confidence_score"]).value
         f["false_positive_risk"] = FalsePositiveRisk.from_score(f["confidence_score"]).value
         if evidence_parts:
-            existing = f.get("evidence", "")
-            f["evidence"] = (existing + " | " + " | ".join(evidence_parts)
-                             if existing else " | ".join(evidence_parts))
+            existing = f.get("evidence", [])
+            if not isinstance(existing, list):
+                existing = [str(existing)] if existing else []
+            existing.extend(evidence_parts)
+            f["evidence"] = existing
         log(f"  [Verify] {f.get('vuln_type', '')} @ {f.get('url', '')} promoted to {stage.upper()} (score={f['confidence_score']})",
             Colors.GREEN)
 

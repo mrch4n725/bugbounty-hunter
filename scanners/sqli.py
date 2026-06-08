@@ -125,8 +125,8 @@ class SQLiScanner(ScannerBase):
                             if timing_ev and self.evidence_engine:
                                 self.evidence_engine.store(timing_ev)
                                 self.evidence_engine.link_to_finding(timing_ev, f.get("fingerprint", ""))
-                                legacy_ev = f.get("evidence", "")
-                                f["evidence"] = [legacy_ev] if legacy_ev else []
+                                if not isinstance(f.get("evidence", []), list):
+                                    f["evidence"] = [str(f.get("evidence", ""))]
                                 f["evidence"].append(timing_ev)
                             self._add_finding(f)
             except Exception as e:
