@@ -174,7 +174,11 @@ class ChatGPTReporter(ReporterBase):
             if hist and isinstance(hist, dict) and hist.get("classification", "") not in ("", "new"):
                 content += f"Historical: {hist.get('label', hist.get('classification', ''))}\n"
             content += f"False Positive Risk: {fpr or 'N/A'}\n"
-            content += f"Confidence Reasons: {self._get_confidence_reasons_chat(f) or 'N/A'}\n\n"
+            content += f"Confidence Reasons: {self._get_confidence_reasons_chat(f) or 'N/A'}\n"
+            sub_ready = f.get("submission_ready", False)
+            bundle_strength = f.get("evidence_bundle_strength", "")
+            content += f"Submission Ready: {'YES' if sub_ready else 'No'}\n"
+            content += f"Evidence Bundle: {bundle_strength.replace('_', ' ').title() if bundle_strength else 'N/A'}\n\n"
 
             content += f"### Description\n\n{details}\n\n"
 

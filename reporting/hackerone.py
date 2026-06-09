@@ -160,6 +160,8 @@ class HackerOneReporter(ReporterBase):
 **Verification Stage:** {verification_stage}
 **False Positive Risk:** {fp_risk or '—'}
 **Confidence Reasons:** {self._get_confidence_reasons_h1(f) or '—'}
+**Submission Ready:** {'✅ YES' if f.get('submission_ready', False) else '—'}
+**Evidence Bundle:** {f.get('evidence_bundle_strength', '—').replace('_', ' ').title() or '—'}
 
 #### Summary
 {what}

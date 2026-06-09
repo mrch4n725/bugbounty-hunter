@@ -9,6 +9,7 @@ from models.evidence import (
     SecretValidationEvidence, BrowserExecutionEvidence,
     GraphQLSchemaEvidence, AuthorizationComparisonEvidence,
     ResponseDiffEvidence, CommandExecutionEvidence, CompositeEvidence,
+    OwnershipEvidence, ImpactEvidence,
     EvidenceQualityScore,
 )
 from models.config import ScanConfig
@@ -37,6 +38,7 @@ __all__ = [
     "SecretValidationEvidence", "BrowserExecutionEvidence",
     "GraphQLSchemaEvidence", "AuthorizationComparisonEvidence",
     "ResponseDiffEvidence", "CommandExecutionEvidence", "CompositeEvidence",
+    "OwnershipEvidence", "ImpactEvidence",
     "EvidenceQualityScore",
     "ScanConfig",
     "AttackNode", "AttackEdge", "AttackChain",

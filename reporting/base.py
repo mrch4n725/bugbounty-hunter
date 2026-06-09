@@ -11,6 +11,10 @@ from modules.utils import log, Colors, _build_curl
 from models.finding import Finding
 from engines.root_cause import RootCauseAggregator, RootCauseGroup
 from engines.evidence_validator import EvidenceCompletenessValidator
+from engines.submission_readiness import SubmissionReadinessEngine
+from engines.ownership_validator import OwnershipValidator
+from engines.impact_validator import ImpactValidator
+from models.evidence_bundle import EvidenceBundle
 
 
 CVSS_BY_SEVERITY: Dict[str, float] = {
@@ -306,6 +310,35 @@ class ReporterBase:
 
         # Evidence completeness validation — catches weak findings
         self.findings: list[Finding] = EvidenceCompletenessValidator.validate_all(enriched)
+
+        # Ownership and impact validation (guarded by disabled_engines)
+        if "ownership" not in disabled_engines:
+            for f in self.findings:
+                ownership_ev = OwnershipValidator.validate(f)
+                if ownership_ev:
+                    if isinstance(f.evidence, str):
+                        f.evidence = [f.evidence] if f.evidence else []
+                    f.evidence.append(ownership_ev)
+
+        if "impact" not in disabled_engines:
+            for f in self.findings:
+                impact_ev = ImpactValidator.validate(f)
+                if isinstance(f.evidence, str):
+                    f.evidence = [f.evidence] if f.evidence else []
+                f.evidence.append(impact_ev)
+
+        # Build evidence bundles for submission-ready packaging
+        for f in self.findings:
+            bundle = EvidenceBundle.from_finding(f)
+            object.__setattr__(f, "_evidence_bundle", bundle)
+            object.__setattr__(f, "submission_ready", bundle.submission_ready)
+            object.__setattr__(f, "evidence_bundle_strength", bundle.overall_strength)
+            object.__setattr__(f, "evidence_bundle_completeness", bundle.completeness_score)
+
+        # Submission readiness assessment — overrides mechanical state
+        if "submission_readiness" not in disabled_engines:
+            SubmissionReadinessEngine.assess_all(self.findings)
+
         # Root-cause aggregation
         aggregator = RootCauseAggregator(config)
         self.root_cause_groups: list[RootCauseGroup] = aggregator.aggregate(self.findings)
@@ -498,6 +531,13 @@ class ReporterBase:
                 val = getattr(f, attr)
                 if val is not None and val != "":
                     result[attr] = val
+        # Include evidence bundle (for reporters that render it)
+        bundle = getattr(f, "_evidence_bundle", None)
+        if bundle is not None and isinstance(bundle, EvidenceBundle):
+            result["_evidence_bundle"] = bundle.to_dict()
+            result["evidence_bundle_strength"] = bundle.overall_strength
+            result["evidence_bundle_completeness"] = bundle.completeness_score
+            result["submission_ready"] = bundle.submission_ready
         return result
 
     def _findings_as_dicts(self, findings: Optional[List] = None) -> List[Dict[str, Any]]:

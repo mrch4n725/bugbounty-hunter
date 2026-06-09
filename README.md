@@ -52,6 +52,10 @@ Key capabilities:
 
 - **27+ scan modules** — XSS, SQLi, SSTI, SSRF, XXE, Command Injection, Blind XSS, LFI, Open Redirect, CSRF, IDOR, GraphQL, API, JWT, CORS, and more
 - **Evidence chain** — every finding progresses through Detection → Validation → Exploitation → Verification with confidence scoring
+- **Ownership validation** — cross-user authorization violations confirmed via content-diff comparison, producing `OwnershipEvidence` with identity tracking
+- **Impact validation** — demonstrated vs. theoretical impact distinguished by examining exploitation-proof evidence (browser exec, OOB callbacks, command execution, secret validation)
+- **Evidence bundling** — all evidence per finding categorized into technical/validation/ownership/impact groups with quality scoring and submission-readiness assessment
+- **Consensus-based confidence** — pluggable validator engine (evidence completeness, verification stage, reproduction quality) produces weighted consensus scores
 - **Out-of-band (OOB) confirmation** — SSRF, XXE, Command Injection, Blind XSS, and SQLi confirmed via DNS/HTTP callbacks (Interactsh / Burp Collaborator)
 - **Browser-based XSS validation** — Playwright executes payloads in a headless Chromium instance and captures screenshots of successful execution
 - **Intelligence-led scanning** — each URL is classified by signals (query params, path patterns, forms) and only relevant modules run
@@ -84,6 +88,13 @@ Recon ──▶ Intelligence ──▶ Active Checks ──▶ Verification ─�
    - **Multi-signal analysis** — SQLi requires 2+ independent signals (error, boolean, time, OOB) before Confirmed
 
 5. **Post-Scan** — Findings pass through a pipeline: duplicate risk assessment, CVSS/impact narrative enrichment, pipeline metrics collection (funnel/bottleneck analysis), and regression comparison against previous scan outputs.
+
+6. **Validation Maturity** — Reports apply a multi-engine validation pipeline:
+   - **OwnershipValidator** — examines authorization comparison evidence to confirm identity-based access violations
+   - **ImpactValidator** — distinguishes demonstrated impact (browser execution, OOB callbacks) from theoretical risk
+   - **EvidenceBundle** — groups evidence by category (technical, validation, ownership, impact) with quality scores
+   - **SubmissionReadinessEngine** — overrides mechanical stage-to-state mapping when evidence quality or confidence is insufficient
+   - **ValidationConsensusEngine** — aggregates validator opinions into a weighted confidence score with consensus level (strong/moderate/weak)
 
 ---
 
@@ -456,6 +467,20 @@ Only validated secrets appear in findings. Invalid or unverifiable secrets are f
 
 Every report format now computes **CVSS score + vector**, **impact narrative**, and **remediation guidance** per finding — even for findings from the legacy scanner that lacked these fields. The canonical `Finding` dataclass supports structured evidence via `EvidenceBase` polymorphic subclasses, UUIDv7 identifiers, and SHA-256 root-cause fingerprints for deduplication.
 
+Reports also include **evidence bundle** metadata and **readiness badges** across all formats:
+
+| Format | Evidence Bundle & Readiness Badge |
+|--------|-----------------------------------|
+| **HTML** | Strength/completeness labels + READY badge in finding card header |
+| **HackerOne** | `Submission Ready: ✅ YES` and `Evidence Bundle` fields |
+| **Bugcrowd** | `Submission Ready` and `Evidence Bundle` table rows |
+| **ChatGPT** | `Submission Ready:` and `Evidence Bundle:` colon-delimited lines |
+
+The evidence bundle groups all evidence by category (technical, validation, ownership, impact, reproduction) and computes:
+- **Overall strength** — very_strong / strong / medium / weak
+- **Completeness score** — 0.0–1.0 weighted by category coverage and verified evidence ratio
+- **Submission ready flag** — true when strength >= strong, completeness >= 0.6, and both technical + validation categories populated
+
 | Format | Contents |
 |--------|----------|
 | **HTML** | Dark-themed dashboard with severity summary, verified badges, finding cards with collapsible evidence blocks, CVSS score + rating, impact narrative, remediation guidance, screenshot display, and one-click curl copy |
@@ -563,12 +588,18 @@ bugbounty-hunter/
 ├── models/
 │   ├── __init__.py
 │   ├── finding.py                   # Canonical Finding dataclass (UUIDv7, SHA-256 fingerprints, enums)
-│   ├── evidence.py                  # EvidenceBase + 10 polymorphic subclasses
+│   ├── evidence.py                  # EvidenceBase + 12 polymorphic subclasses
+│   ├── evidence_bundle.py           # EvidenceBundle with categorization, quality scoring, submission readiness
 │   └── config.py                    # ScanConfig typed dataclass
 ├── engines/
 │   ├── __init__.py
 │   ├── validation_engine.py         # Centralized OOB, browser, timing, secret, auth, GraphQL validation
 │   ├── evidence_engine.py           # Evidence storage, linking, SQLite persistence (WAL + batch inserts), snapshot/restore
+│   ├── evidence_validator.py        # EvidenceCompletenessValidator — penalty for missing required evidence types
+│   ├── ownership_validator.py       # OwnershipValidator — validates identity-based access violations
+│   ├── impact_validator.py          # ImpactValidator — validates demonstrated vs. theoretical impact
+│   ├── submission_readiness.py      # SubmissionReadinessEngine — evidence-aware stage→state assessment
+│   ├── consensus_engine.py          # ValidationConsensusEngine — pluggable validator consensus scoring
 │   ├── dedup.py                     # Finding deduplication with serialization (to_dict/from_dict) for resume
 │   └── outcome_feedback.py          # Outcome tracking (JSON Lines → thread-safe with Lock)
 ├── scanners/

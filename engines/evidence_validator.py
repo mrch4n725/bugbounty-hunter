@@ -154,6 +154,11 @@ class EvidenceCompletenessValidator:
 
         # Track penalty for confidence breakdown logging
         object.__setattr__(finding, "_confidence_validator_penalty", cls.CONFIDENCE_PENALTY)
+        import logging
+        logging.getLogger(__name__).debug(
+            "EvidenceCompletenessValidator: %s @ %s base=%d penalty=%d final=%d missing=%s",
+            finding.vuln_type, finding.url, base_score, cls.CONFIDENCE_PENALTY,
+            new_score, missing_names)
 
         # Mark as partially validated
         from models.finding import VerificationStage

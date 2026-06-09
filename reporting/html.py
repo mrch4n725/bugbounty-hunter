@@ -447,6 +447,18 @@ class HTMLReporter(ReporterBase):
 
             evidence_html = self._get_evidence_html(f)
 
+            # Evidence bundle / readiness
+            bundle_strength = f.get("evidence_bundle_strength", "")
+            bundle_completeness = f.get("evidence_bundle_completeness", 0)
+            sub_ready = f.get("submission_ready", False)
+            bundle_html = ""
+            if bundle_strength:
+                strength_color = {"very_strong": "#2ecc71", "strong": "#27ae60", "medium": "#f39c12", "weak": "#e74c3c"}.get(bundle_strength, "#95a5a6")
+                ready_badge = ""
+                if sub_ready:
+                    ready_badge = '<span style="background:#2ecc71;color:#fff;padding:2px 10px;border-radius:12px;font-size:.75em;font-weight:700;margin-left:8px">READY</span>'
+                bundle_html = f'<div class="row"><strong>Evidence Bundle:</strong> <span style="color:{strength_color};font-weight:600">{bundle_strength.replace("_"," ").title()}</span> ({bundle_completeness:.0%} completeness){ready_badge}</div>'
+
             request_html = ""
             if request:
                 request_html = f'<div class="row"><strong>Request:</strong><pre class="evidence">{e_request}</pre></div>'
@@ -542,6 +554,7 @@ class HTMLReporter(ReporterBase):
                     {steps_to_reproduce_html}
                     <div class="row"><strong>Details:</strong> {e_details}</div>
                     {evidence_html}
+                    {bundle_html}
                     {request_html}
                     {response_html}
                     {screenshot_html}

@@ -18,6 +18,8 @@ class EvidenceType(str, enum.Enum):
     RESPONSE_DIFF = "response_diff"
     COMMAND_EXECUTION = "command_execution"
     COMPOSITE = "composite"
+    OWNERSHIP_PROOF = "ownership_proof"
+    IMPACT_VALIDATION = "impact_validation"
 
 
 class EvidenceStatus(str, enum.Enum):
@@ -392,6 +394,84 @@ class CommandExecutionEvidence(EvidenceBase):
 
 
 @dataclass
+class OwnershipEvidence(EvidenceBase):
+    ownership_violated: bool = False
+    original_owner: str = ""
+    claiming_identity: str = ""
+    proof_type: str = "authorization_comparison"
+    user_context: str = ""
+    resource_identifier: str = ""
+    access_granted: bool = False
+
+    def __init__(self, ownership_violated: bool = False,
+                 original_owner: str = "",
+                 claiming_identity: str = "",
+                 proof_type: str = "authorization_comparison",
+                 user_context: str = "",
+                 resource_identifier: str = "",
+                 access_granted: bool = False,
+                 description: str = "",
+                 status: EvidenceStatus = EvidenceStatus.COLLECTED):
+        status_val = EvidenceStatus.VERIFIED if ownership_violated else status
+        super().__init__(
+            evidence_type=EvidenceType.OWNERSHIP_PROOF,
+            status=status_val,
+            description=description or (
+                f"Ownership violation: {original_owner} → {claiming_identity} "
+                f"accessed {resource_identifier}"
+                if ownership_violated
+                else f"Ownership check: {original_owner} vs {claiming_identity}"
+            ),
+        )
+        self.ownership_violated = ownership_violated
+        self.original_owner = original_owner
+        self.claiming_identity = claiming_identity
+        self.proof_type = proof_type
+        self.user_context = user_context
+        self.resource_identifier = resource_identifier
+        self.access_granted = access_granted
+
+
+@dataclass
+class ImpactEvidence(EvidenceBase):
+    impact_type: str = ""
+    severity_confirmed: bool = False
+    business_impact: str = ""
+    evidence_of_exploitation: str = ""
+    exploitation_proof: str = ""
+    attack_scenario: str = ""
+    demonstrated: bool = False
+
+    def __init__(self, impact_type: str = "",
+                 severity_confirmed: bool = False,
+                 business_impact: str = "",
+                 evidence_of_exploitation: str = "",
+                 exploitation_proof: str = "",
+                 attack_scenario: str = "",
+                 demonstrated: bool = False,
+                 description: str = "",
+                 status: EvidenceStatus = EvidenceStatus.COLLECTED):
+        status_val = EvidenceStatus.VERIFIED if demonstrated else (
+            EvidenceStatus.VERIFIED if severity_confirmed else status
+        )
+        super().__init__(
+            evidence_type=EvidenceType.IMPACT_VALIDATION,
+            status=status_val,
+            description=description or (
+                f"Impact validated: {impact_type}" if demonstrated
+                else f"Impact assessment: {impact_type}"
+            ),
+        )
+        self.impact_type = impact_type
+        self.severity_confirmed = severity_confirmed
+        self.business_impact = business_impact
+        self.evidence_of_exploitation = evidence_of_exploitation
+        self.exploitation_proof = exploitation_proof
+        self.attack_scenario = attack_scenario
+        self.demonstrated = demonstrated
+
+
+@dataclass
 class CompositeEvidence(EvidenceBase):
     child_descriptions: list[str] = None
     evidence_count: int = 0
@@ -423,6 +503,8 @@ EVIDENCE_CLASSES: dict[EvidenceType, type[EvidenceBase]] = {
     EvidenceType.RESPONSE_DIFF: ResponseDiffEvidence,
     EvidenceType.COMMAND_EXECUTION: CommandExecutionEvidence,
     EvidenceType.COMPOSITE: CompositeEvidence,
+    EvidenceType.OWNERSHIP_PROOF: OwnershipEvidence,
+    EvidenceType.IMPACT_VALIDATION: ImpactEvidence,
 }
 
 

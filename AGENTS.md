@@ -55,10 +55,16 @@ scanners/
 models/
   config.py                 — ScanConfig dataclass with use_new_scanners: bool
   finding.py                — Finding class with dict-compat shim, strict __getitem__, content-fingerprinted to_dict()
-  evidence.py               — EvidenceBase + 10 subclasses (HttpRequest, BrowserExecution, Screenshot, Timing,
-                               OOBCallback, AuthorizationComparison, GraphQLSchema, CommandExecution, ResponseDiff, Composite)
+  evidence.py               — EvidenceBase + 12 subclasses (HttpRequest, HttpResponse, ResponseExcerpt, Screenshot, Timing,
+                               OOBCallback, AuthorizationComparison, GraphQLSchema, CommandExecution, ResponseDiff,
+                               Composite, OwnershipEvidence, ImpactEvidence)
+  evidence_bundle.py        — EvidenceBundle: groups evidence by category, computes quality score, submission readiness
 engines/
   evidence_engine.py        — EvidenceEngine: SHA-256 content-based dedup store(), get_evidence() by finding_id
+  submission_readiness.py   — SubmissionReadinessEngine: overrides mechanical from_verification_stage() with evidence-aware assessment
+  consensus_engine.py       — ValidationConsensusEngine: pluggable validators, weighted consensus confidence scoring
+  ownership_validator.py    — OwnershipValidator: validates ownership claims from AuthorizationComparisonEvidence
+  impact_validator.py       — ImpactValidator: validates impact claims from exploitation-proof evidence
 reporting/
   base.py                   — ReporterBase, assess_finding_impact, group_by_root_cause
   html.py                   — HTMLReporter: type-specific evidence rendering (collapsible, thumbnails, side-by-side)
@@ -173,10 +179,15 @@ HTML reports use `html.escape()` on every user-provided field at render time. Co
 | `scanners/ssrf.py` | SSRF detection via ScannerBase | `SSRFScanner(ScannerBase)`: cloud metadata + OOB |
 | `models/config.py` | ScanConfig dataclass | `ScanConfig` with `use_new_scanners: bool = True` |
 | `models/finding.py` | Finding class with dict-compat shim | `Finding` with strict `__getitem__`, content-fingerprinted `to_dict()` |
-| `models/evidence.py` | Evidence type hierarchy (10 subclasses) | `EvidenceBase`, `HttpRequestEvidence`, `BrowserExecutionEvidence`, `ScreenshotEvidence`, `TimingEvidence`, `OOBCallbackEvidence`, `AuthorizationComparisonEvidence`, `GraphQLSchemaEvidence`, `CommandExecutionEvidence`, `ResponseDiffEvidence`, `CompositeEvidence` |
+| `models/evidence.py` | Evidence type hierarchy (12 subclasses) | `EvidenceBase`, `HttpRequestEvidence`, `BrowserExecutionEvidence`, `ScreenshotEvidence`, `TimingEvidence`, `OOBCallbackEvidence`, `AuthorizationComparisonEvidence`, `GraphQLSchemaEvidence`, `CommandExecutionEvidence`, `ResponseDiffEvidence`, `CompositeEvidence`, `OwnershipEvidence`, `ImpactEvidence` |
+| `models/evidence_bundle.py` | Evidence bundle with categorization and quality scoring | `EvidenceBundle`, `BundleCategory` — `from_finding()`, `submission_ready` property |
 | `engines/evidence_engine.py`        | Evidence storage with SHA-256 content-based dedup + SQLite persistence (WAL mode, batch inserts) | `EvidenceEngine`, `store()`, `link_to_finding()`, `get_evidence()`, `batch_insert()`, `snapshot()`, `restore()` |
 | `engines/dedup.py`                 | Finding deduplication with serialization for resume | `DeduplicationEngine`, `add()`, `add_legacy()`, `get_findings()`, `to_dict()`, `from_dict()` |
 | `engines/evidence_validator.py`    | Evidence completeness validation | `EvidenceCompletenessValidator` with `CONFIDENCE_PENALTY` (delta subtraction) |
+| `engines/submission_readiness.py`  | Evidence-aware submission readiness assessment | `SubmissionReadinessEngine` — overrides mechanical stage → state mapping |
+| `engines/consensus_engine.py`      | Pluggable validator consensus engine | `ValidationConsensusEngine`, `ValidatorVote`, `ConsensusResult` — weighted scoring with 3 built-in validators |
+| `engines/ownership_validator.py`   | Ownership claim validation | `OwnershipValidator` — produces `OwnershipEvidence` from authz comparison |
+| `engines/impact_validator.py`      | Impact claim validation | `ImpactValidator` — produces `ImpactEvidence` from exploitation-proof evidence |
 
 ---
 

@@ -362,7 +362,7 @@ class ScannerBase:
             base_score = score
             object.__setattr__(f, "_confidence_base_before_validator", base_score)
             object.__setattr__(f, "_confidence_evidence_bonus", evidence_bonus)
-            log(f"  [Confidence] {f.vuln_type} @ {f.url}: base={base_score}, evidence_bonus={evidence_bonus}, validator_penalty={getattr(f, '_confidence_validator_penalty', 0)}, final={f.confidence_score}", Colors.CYAN, verbose_only=True, verbose=self.verbose)
+            log(f"  [Confidence] {f.vuln_type} @ {f.url}: base={base_score}, evidence_bonus={evidence_bonus}, final={f.confidence_score}", Colors.CYAN, verbose_only=True, verbose=self.verbose)
 
             log(f"  [FOUND] [{sev}] {title} @ {url} [{stage}, {score:.0f}/100]",
                 Colors.RED if sev in ("CRITICAL", "HIGH") else Colors.YELLOW)
