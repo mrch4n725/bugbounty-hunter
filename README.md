@@ -65,10 +65,10 @@ Key capabilities:
 
 ## How It Works
 
-The scanner operates in four phases:
+The scanner operates in five phases:
 
 ```
-Recon ──▶ Intelligence ──▶ Active Checks ──▶ Verification ──▶ Report
+Recon ──▶ Intelligence ──▶ Active Checks ──▶ Verification ──▶ Post-Scan ──▶ Report
 ```
 
 1. **Reconnaissance** — Crawls the target, discovers URLs, forms, and query parameters; performs subdomain discovery; extracts JavaScript bundles and mines them for endpoints and secrets.
@@ -82,6 +82,8 @@ Recon ──▶ Intelligence ──▶ Active Checks ──▶ Verification ─�
    - **Browser execution** — XSS payloads executed in headless Chromium with screenshot capture
    - **Live secret validation** — AWS keys tested against STS, GitHub tokens against the API, Slack tokens validated by format
    - **Multi-signal analysis** — SQLi requires 2+ independent signals (error, boolean, time, OOB) before Confirmed
+
+5. **Post-Scan** — Findings pass through a pipeline: duplicate risk assessment, CVSS/impact narrative enrichment, pipeline metrics collection (funnel/bottleneck analysis), and regression comparison against previous scan outputs.
 
 ---
 
@@ -478,6 +480,8 @@ Additional report features:
 - **Rich progress bar** — live ETA, findings counter, current module/URL display during both target-level module execution (`ModuleProgress`) and per-URL scanning (`ScanProgress`). Falls back to plain text with `--no-rich`.
 - **Real-time output** — `[FOUND] [severity] title @ url` for each new finding as it's discovered
 - **Keyboard interrupt safe** — Ctrl+C saves all findings collected so far with no data loss
+- **Regression detection** — findings flagged as regressions from prior scans are highlighted with `[!] N regression(s) detected` in terminal output; stored in `config["_regressions"]` for downstream tools
+- **Pipeline metrics** — post-scan pipeline funnel printed: signals → potential → validated → verified → submission ready, including validation/submission rates and bottleneck stage (`--disable-engines metrics` to opt out)
 
 **Exit codes:**
 

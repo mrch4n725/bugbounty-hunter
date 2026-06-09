@@ -104,6 +104,8 @@ All 25 scanners import from `models.evidence`, call `evidence_engine.store()` an
 
 The `VerificationStage` is set correctly by most scanners, but the confidence/evidence strength/false-positive triad is entirely unpopulated.
 
+**Partly addressed:** The `finding()` factory now auto-syncs `finding_state` from `VerificationStage` and `confidence_label` from `confidence_score` so that dict-style access (`f["finding_state"]`, `f["confidence_label"]`) returns populated values even when scanners don't set them explicitly.
+
 ### Reproduction Quality
 
 All scanners produce `steps_to_reproduce`. Quality varies:
@@ -165,3 +167,19 @@ This shows which scanners provide which verification stage, and whether it maps 
 3. Add evidence to remaining 5 low-maturity scanners
 4. Implement shared confidence calculator
 5. Standardize `generate_reproduction()` across all scanners
+
+---
+
+## Task Completion
+
+| # | Task | Status | Module |
+|---|---|---|---|
+| 1 | Decouple ApiScanner/IdorScanner from VulnScanner | ✅ Done | `modules/api_scanner.py`, `modules/idor.py` |
+| 2 | Standardise scan_* router methods (walrus → result check) | ✅ Done | `modules/scanner.py` |
+| 3 | Wire ScanBudgetEngine output (sort by allocated_budget) | ✅ Done | `engines/scan_budget.py` |
+| 4 | Add evidence_count to headers scanner findings | ✅ Done | `scanners/headers.py` |
+| 5 | Sync finding_state/confidence_label on dict findings | ✅ Done | `modules/utils.py` |
+| 6 | DuplicateRiskEngine + ImpactEngine in post-scan pipeline | ✅ Done | `main.py` |
+| 7 | Replay regression detection | ✅ Done | `main.py` |
+| 8 | Metrics output (pipeline funnel post-scan) | ✅ Done | `main.py` |
+| 9 | Documentation updates | ✅ Done | AGENTS.md, README.md, ARCHITECTURE.md, AUDIT_VALIDATION_MATURITY.md |

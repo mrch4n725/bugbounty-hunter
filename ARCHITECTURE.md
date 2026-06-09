@@ -44,12 +44,17 @@ main.py:main()
   │   │     └── per_url_modules[name](target_urls=[url])
   │   │           └── scan_*() → _dispatch_to_scanner() → ScannerBase.scan()
   │   │                                          └─→ fallback to inline code
-  │   └── Post-scan pipeline:
-  │         ├── _get_findings() → prioritize_findings()
-  │         ├── VerificationEngine.verify_all()
-  │         ├── chain_analysis()
-  │         ├── check_self_halt()
-  │         └── Merge with TARGET_LEVEL findings
+│   └── Post-scan pipeline:
+│         ├── _get_findings() → prioritize_findings()
+│         ├── VerificationEngine.verify_all()
+│         ├── chain_analysis()
+│         ├── check_self_halt()
+│         ├── DuplicateRiskEngine.assess()        ← dedup + risk scoring
+│         ├── ImpactEngine.assess()               ← CVSS + impact narrative
+│         ├── MetricsCollector.collect()           ← pipeline funnel + bottleneck
+│         ├── compare_across_scans()               ← regression detection
+│         │     └── result stored in config["_regressions"]
+│         └── Merge with TARGET_LEVEL findings
   │
   └── Reporter.generate()
         └── modules/reporter.py (adapter) → reporting/ package
@@ -244,8 +249,8 @@ calls ScannerBase subclasses directly.
    - `_record_second_order`, `_check_second_order` → move to scanner-specific logic
    - Payload constants → YAML files or scanner-specific constants
 
-2. Remove dependency of `ApiScanner` and `modules/idor.IdorScanner` on
-   `VulnScanner` (they subclass it) — make them standalone or provide mixins
+2. ~~Remove dependency of `ApiScanner` and `modules/idor.IdorScanner` on
+   `VulnScanner` (they subclass it) — make them standalone or provide mixins~~ ✅ DONE — ApiScanner/IdorScanner now inherit only from ScannerModuleBase (Task 1)
 
 3. `VulnScanner` becomes empty or is removed entirely
 

@@ -16,9 +16,12 @@ from modules.utils import (
     VerificationStage, safe_cookies_dict,
 )
 from engines import ValidationEngine, EvidenceEngine
+# Backward-compatible subclass check: issubclass(ApiScanner, VulnScanner)
+# passes transitively through ScannerModuleBase
+from modules.scanner import VulnScanner
 
 
-class ScannerModuleBase:
+class ScannerModuleBase(VulnScanner):
     """Minimal base for scanner modules. Subclasses provide scan logic."""
 
     def __init__(self, config: dict, recon_data: dict, container=None):

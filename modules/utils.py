@@ -238,6 +238,7 @@ from models.finding import (
     EvidenceStrength,
     FalsePositiveRisk,
     ConfidenceLevel,
+    FindingState,
     CONFIDENCE_WEIGHTS,
     calculate_confidence,
     evidence_strength_from_score,
@@ -1331,6 +1332,10 @@ def finding(
         exploitability_rating=exploitability_rating or "unknown",
         confidence_reasons=confidence_reasons,
     )
+
+    # Sync FindingState and ConfidenceLabel for dict-compatible access
+    f.finding_state = FindingState.from_verification_stage(f.verification_stage).value
+    f.confidence_label = ConfidenceLevel.from_score(f.confidence_score).value
 
     # Set dynamically-accessed legacy fields
     # NOTE: "proof" maps to "evidence" and "validation_steps" maps to "reproduction_steps"

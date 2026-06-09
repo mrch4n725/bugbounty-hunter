@@ -163,8 +163,8 @@ HTML reports use `html.escape()` on every user-provided field at render time. Co
 | `modules/utils.py` | Shared utilities, finding engine, dedup, OOB, BrowserValidator, curl builder, classify, safe HTTP | `finding()`, `_build_curl()`, `BrowserValidator`, `OOBDetectionFramework`, `RateLimiter`, `DeduplicationEngine`, `SecretValidator`, `safe_get()`, `safe_post()` |
 | `modules/reporter.py` | Legacy wrapper — delegates to `reporting/` package, passes container via `**kwargs` | `Reporter` class |
 | `modules/scanner_base.py` | ScannerModuleBase — shared utility methods for ApiScanner/IdorScanner | `ScannerModuleBase` |
-| `modules/api_scanner.py` | API-specific vulnerability scanning | `ApiScanner(ScannerModuleBase, VulnScanner)` with role-based sessions, GraphQL auth bypass, query depth |
-| `modules/idor.py` | Parameter-based IDOR detection with AuthorizationComparisonEvidence | `IdorScanner(ScannerModuleBase, VulnScanner)` with ownership validation (`verify_ownership()`), role sessions |
+| `modules/api_scanner.py` | API-specific vulnerability scanning | `ApiScanner(ScannerModuleBase)` with role-based sessions, GraphQL auth bypass, query depth |
+| `modules/idor.py` | Parameter-based IDOR detection with AuthorizationComparisonEvidence | `IdorScanner(ScannerModuleBase)` with ownership validation (`verify_ownership()`), role sessions |
 | `modules/recon.py` | Crawling, subdomain discovery, JS analysis | Recon class |
 | `scanners/base.py` | ScannerBase 5-phase lifecycle | `ScannerBase` (init → prepare → scan → finalize → findings) |
 | `scanners/xss.py` | XSS detection via ScannerBase | `XSSScanner(ScannerBase)`: reflected, stored, DOM, form |
@@ -212,7 +212,7 @@ f = finding("CSRF+XSS->ATO", url, severity, details, evidence,
 
 ### 4d. ApiScanner / IdorScanner
 
-These subclass `ScannerModuleBase` (with `VulnScanner` secondary parent for backward-compatible `issubclass` checks). They do **not** call `self._add()`. Instead they use `_append_finding(local_list, f)`. Their findings are merged into final output via fingerprint dedup in main.py.
+These subclass `ScannerModuleBase` directly (VulnScanner dependency removed in Task 1). They do **not** call `self._add()`. Instead they use `_append_finding(local_list, f)`. Their findings are merged into final output via fingerprint dedup in main.py.
 
 ### 4e. _build_curl()
 
@@ -356,6 +356,7 @@ Every HTML report includes a `<script type="application/ld+json">` block with al
 | SQLiScanner TimingEvidence | `_test_parameter()` creates a `TimingEvidence` object when time signal detected (`triggered_time_ms`, `baseline_time_ms`). The scan() method stores and links it via `evidence_engine`. |
 | ChatGPTReporter evidence rendering | Uses per-evidence-type markdown rendering (`_evidence_to_markdown()`). Supports TimingEvidence, OOBCallbackEvidence, BrowserExecutionEvidence, ScreenshotEvidence, AuthorizationComparisonEvidence, GraphQLSchemaEvidence. Falls back to `str()` for unknown types. |
 | HackerOne/Bugcrowd authZ body diff | `AuthorizationComparisonEvidence` now renders HTTP status codes, body-diff flag, and up-to-200-char body excerpts for both original and target responses. |
+| finding_state / confidence_label dict access | `finding()` now sets `finding_state = FindingState.from_verification_stage(f.verification_stage).value` and `confidence_label = ConfidenceLevel.from_score(f.confidence_score).value` after construction. These fields are available via `f["finding_state"]` and `f["confidence_label"]`. |
 
 ---
 

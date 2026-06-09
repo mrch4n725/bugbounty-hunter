@@ -13,7 +13,6 @@ from typing import Any, Optional
 from urllib.parse import urlparse, parse_qs
 
 from models.finding import Finding
-from modules.scanner import VulnScanner
 from modules.scanner_base import ScannerModuleBase
 from modules.utils import (
     make_session, safe_get, safe_post, finding, log, Colors, _build_curl,
@@ -66,7 +65,7 @@ SEQUENTIAL_DELTAS = [-1, 1, -100, 100]
 
 # ── Scanner class ──────────────────────────────────────────────────────────────
 
-class IdorScanner(ScannerModuleBase, VulnScanner):
+class IdorScanner(ScannerModuleBase):
     """Scanner for Insecure Direct Object Reference vulnerabilities."""
 
     def __init__(self, config: dict, recon_data: dict, container=None):

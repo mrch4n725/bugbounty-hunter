@@ -15,7 +15,6 @@ from urllib.parse import urljoin
 import yaml
 
 from models.finding import Finding
-from modules.scanner import VulnScanner
 from modules.scanner_base import ScannerModuleBase
 from modules.utils import (
     make_session, safe_get, safe_post, finding, log, Colors, _build_curl,
@@ -82,7 +81,7 @@ BATCH_SIZE = 100
 
 # ── Scanner class ──────────────────────────────────────────────────────────────
 
-class ApiScanner(ScannerModuleBase, VulnScanner):
+class ApiScanner(ScannerModuleBase):
     """Vulnerability scanner targeting REST and GraphQL APIs."""
 
     def __init__(self, config: dict, recon_data: dict, container=None):

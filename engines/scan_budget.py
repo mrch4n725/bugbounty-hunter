@@ -85,7 +85,7 @@ class ScanBudgetEngine:
         )
 
     def sorted_urls(self) -> list[str]:
-        return [s.url for s in sorted(self.scores, key=lambda s: -s.score)]
+        return [s.url for s in sorted(self.scores, key=lambda s: -s.allocated_budget)]
 
     def get_budget(self, url: str) -> int:
         for s in self.scores:

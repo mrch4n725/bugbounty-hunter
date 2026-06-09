@@ -1094,7 +1094,8 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_ssti(self, target_urls: list[str] | None = None) -> list[dict]:
-        if result := self._dispatch_to_scanner("ssti", target_urls):
+        result = self._dispatch_to_scanner("ssti", target_urls)
+        if result is not None:
             return result
         return []
 
@@ -2209,7 +2210,8 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_headers(self, target_urls: list[str] | None = None) -> list[dict]:
-        if result := self._dispatch_to_scanner("headers", target_urls):
+        result = self._dispatch_to_scanner("headers", target_urls)
+        if result is not None:
             return result
         return []
 
@@ -3016,7 +3018,8 @@ class VulnScanner:
         Proves authorization failures with evidence-driven role comparison.
         No legacy fallback — this is a pure ScannerBase module.
         """
-        if result := self._dispatch_to_scanner("authorization", target_urls):
+        result = self._dispatch_to_scanner("authorization", target_urls)
+        if result is not None:
             return result
         return []
 

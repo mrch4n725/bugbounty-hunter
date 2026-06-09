@@ -1312,10 +1312,26 @@ def run(config: dict) -> int:
             history_filename = config.get("history_file", "scan_history.json")
             output_dir = config.get("output_dir", "reports")
             history_path = os.path.join(output_dir, history_filename) if not os.path.isabs(history_filename) else history_filename
+            regressions = []
             if os.path.isfile(history_path):
                 container.replay_engine.compare_across_scans(
                     all_findings, history_path, config.get("target", ""),
                 )
+                for f in all_findings:
+                    rr = getattr(f, "replay_regression", None)
+                    if rr and rr.get("changed"):
+                        regressions.append({
+                            "fingerprint": f.fingerprint,
+                            "title": f.title,
+                            "url": f.url,
+                            "previous_scan": rr.get("previous_scan", ""),
+                            "previous_timestamp": rr.get("previous_timestamp", ""),
+                        })
+            if regressions:
+                log(f"[!] {len(regressions)} regression(s) detected — findings changed since last scan", Colors.RED)
+                config["_regressions"] = regressions
+            elif os.path.isfile(history_path):
+                log("[*] No regressions detected", Colors.GREEN)
         except Exception as e:
             log(f"[!] Replay cross-scan comparison failed: {e}", Colors.YELLOW)
 
