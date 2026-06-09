@@ -186,6 +186,37 @@ class SSRFScanner(ScannerBase):
 
         return None
 
+    @staticmethod
+    def _verify_metadata_content(resp) -> dict:
+        """Verify cloud metadata response content and extract structured info."""
+        result = {"valid": False, "format": "unknown", "excerpt": "", "keys": []}
+        if not resp:
+            return result
+        body = resp.text[:2000]
+        result["excerpt"] = body[:200]
+        if body.strip().startswith("{"):
+            try:
+                parsed = json.loads(body)
+                result["format"] = "json"
+                result["keys"] = list(parsed.keys())[:10]
+                result["valid"] = True
+            except json.JSONDecodeError:
+                result["format"] = "invalid_json"
+        elif body.strip().startswith("["):
+            try:
+                json.loads(body)
+                result["format"] = "json_array"
+                result["valid"] = True
+            except json.JSONDecodeError:
+                result["format"] = "invalid_json"
+        elif "/" in body and any(k in body for k in ("ami-", "instance", "meta-data", "security-credentials")):
+            result["format"] = "aws_metadata_listing"
+            result["valid"] = True
+        elif body.strip().startswith("<?xml"):
+            result["format"] = "xml"
+            result["valid"] = True
+        return result
+
     def validate(self, detection: DetectionResult) -> ValidationResult | None:
         from scanners.base import ValidationResult
         sigs = getattr(detection, "evidence_signals", []) or []
@@ -193,6 +224,13 @@ class SSRFScanner(ScannerBase):
         credentials_found = "credentials" in sigs
         metadata_sigs = [s for s in sigs if s not in ("json", "credentials")]
         score = 0
+
+        content_info = self._verify_metadata_content(detection.raw_response) if detection.raw_response else {}
+        if content_info.get("valid"):
+            score += 20
+            if content_info["format"] == "json":
+                score += 10
+
         if len(metadata_sigs) >= 3:
             score += 40
         elif len(metadata_sigs) >= 2:
@@ -204,9 +242,15 @@ class SSRFScanner(ScannerBase):
         if credentials_found:
             score += 20
         if score >= 55:
-            return ValidationResult(confirmed=True, signals=metadata_sigs, method="metadata_strong", detail=f"SSRF confidence score {score}")
+            detail = f"SSRF confidence score {score}"
+            if content_info.get("format"):
+                detail += f", format={content_info['format']}"
+            return ValidationResult(confirmed=True, signals=metadata_sigs, method="metadata_strong", detail=detail)
         if score >= 30:
-            return ValidationResult(confirmed=True, signals=metadata_sigs, method="metadata_weak", detail=f"SSRF confidence score {score}")
+            detail = f"SSRF confidence score {score}"
+            if content_info.get("format"):
+                detail += f", format={content_info['format']}"
+            return ValidationResult(confirmed=True, signals=metadata_sigs, method="metadata_weak", detail=detail)
         return ValidationResult(confirmed=False, signals=metadata_sigs, method="metadata_weak", detail="Low confidence SSRF")
 
     def collect_evidence(self, detection: DetectionResult,
@@ -215,6 +259,8 @@ class SSRFScanner(ScannerBase):
         ev_list = []
         resp = detection.raw_response
         if resp:
+            content_info = self._verify_metadata_content(resp)
+            excerpt = content_info.get("excerpt", resp.text[:200])
             req_ev = HttpRequestEvidence(
                 method="GET",
                 url=detection.url,
@@ -223,10 +269,10 @@ class SSRFScanner(ScannerBase):
                 description=f"SSRF probe to cloud metadata endpoint via {detection.url}",
             )
             resp_ev = ResponseExcerptEvidence(
-                excerpt=resp.text[:500],
+                excerpt=f"[Format: {content_info['format']}, Valid: {content_info['valid']}]\n{excerpt}",
                 length=len(resp.text),
                 context="ssrf_metadata",
-                description=f"Cloud metadata response ({len(resp.text)} chars)",
+                description=f"Cloud metadata response ({len(resp.text)} chars, format={content_info['format']})",
             )
             ev_list.extend([req_ev, resp_ev])
         return ev_list
@@ -236,10 +282,9 @@ class SSRFScanner(ScannerBase):
         sigs = getattr(detection, "evidence_signals", []) or []
         metadata_sigs = [s for s in sigs if s not in ("json", "credentials")]
         return [
-            f"Send GET request to {detection.url} — the vulnerable parameter is: {detection.parameter}",
-            f"Observe cloud metadata signature in response: {', '.join(metadata_sigs[:3])}",
-            "This confirms the server fetches URLs from user-controllable parameters and returns the response",
-            "Escalate: attempt OOB callback confirmation for verified SSRF status",
+            f"curl -X GET '{detection.url}?{detection.parameter}=http://169.254.169.254/latest/meta-data/'",
+            f"Observe cloud metadata signature in response: {', '.join(metadata_sigs[:3])} — the server fetches URLs from user-controllable parameters",
+            "An attacker can access internal cloud metadata, pivot to internal networks, and potentially achieve RCE via SSRF to internal services",
         ]
 
     def _calculate_ssrf_confidence(self, signatures: list[str], baseline_diff: bool,

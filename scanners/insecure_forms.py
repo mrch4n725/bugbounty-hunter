@@ -119,16 +119,14 @@ class InsecureFormsScanner(ScannerBase):
         vuln_type = f.get("vuln_type", "")
         if vuln_type == "Insecure Form Action":
             return [
-                f"Navigate to page containing form that submits to {url}",
-                "Open browser DevTools or a proxy (Burp/ZAP) to inspect the request",
+                f"curl -X POST '{url}' -d 'username=test&password=test123' -v 2>&1 | grep -i \"^\\<\"",
                 "Submit the form and observe that POST data is sent over HTTP (cleartext) — no TLS encryption",
                 "Any network eavesdropper can read form data including passwords, tokens, and personal information",
             ]
         return [
-            f"Navigate to the page containing the password form",
+            f"curl -X POST '{url}' -d 'password=test123' -v 2>&1 | grep \"location:\"",
             f"Inspect the form action URL: {url} — note it points to a different origin",
-            "Submit the form with a test password",
-            "Observe that credentials are sent to a third-party origin — the password may be harvested by an external service",
+            "Credentials are sent to a third-party origin — the password may be harvested by an external service",
         ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:

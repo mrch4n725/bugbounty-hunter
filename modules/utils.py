@@ -368,30 +368,82 @@ class OOBDetectionFramework:
             return ""
         return placeholder.replace("{oob}", self.callback_host)
 
+    # ── Token generation ───────────────────────────────────────────
+
+    def _generate_token(self, fingerprint: str, payload: str, url: str) -> str:
+        """Generate a deterministic token derived from all three inputs."""
+        raw = f"{fingerprint}:{payload}:{url}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def generate_unique_callback_host(self, fingerprint: str, payload: str, url: str) -> str:
+        """Return a callback host with a token unique to (fingerprint, payload, url)."""
+        token = self._generate_token(fingerprint, payload, url)
+        if self._dnslog_domain:
+            return f"{token}.{self._dnslog_domain}"
+        if self.oob_host:
+            return f"{token}.{self.oob_host}"
+        return ""
+
+    def generate_unique_payload(self, placeholder: str, fingerprint: str, payload: str, url: str) -> str:
+        """Replace {oob} with a unique callback host for this combination."""
+        host = self.generate_unique_callback_host(fingerprint, payload, url)
+        if not host:
+            return ""
+        return placeholder.replace("{oob}", host)
+
     # ── Interaction tracking ────────────────────────────────────────────
 
-    def register_interaction(self, vuln_type: str, payload: str, url: str) -> None:
+    def register_interaction(self, vuln_type: str, payload: str, url: str,
+                             fingerprint: str = "") -> None:
+        token = self._generate_token(fingerprint or vuln_type, payload, url)
         with self._lock:
             self._interactions.setdefault(vuln_type, []).append({
                 "payload": payload,
                 "url": url,
+                "fingerprint": fingerprint or vuln_type,
+                "token": token,
                 "timestamp": time.time(),
             })
 
-    def poll(self, timeout: float = 5.0) -> List[Dict[str, Any]]:
-        """Poll for callbacks. Returns list of confirmed interactions."""
+    def poll(self, timeout: float = 120.0) -> List[Dict[str, Any]]:
+        """Poll for callbacks with exponential backoff.
+
+        Starts with 1 s interval, doubling each retry up to max 30 s.
+        Returns list of confirmed interactions.
+        """
         if not self.callback_host:
             return []
+        start_time = time.time()
+        interval = 1.0
+        max_interval = 30.0
+        verbose = self.config.get("verbose", False)
+
         confirmed: List[Dict[str, Any]] = []
-        with self._lock:
-            items = list(self._interactions.items())
-        for vuln_type, interactions in items:
-            for entry in interactions:
-                if entry.get("confirmed"):
-                    continue
-                if self._check_callback(entry):
-                    entry["confirmed"] = True
-                    confirmed.append(entry)
+        while time.time() - start_time < timeout:
+            with self._lock:
+                items = list(self._interactions.items())
+            found = False
+            for vuln_type, interactions in items:
+                for entry in interactions:
+                    if entry.get("confirmed"):
+                        continue
+                    if self._check_callback(entry):
+                        entry["confirmed"] = True
+                        confirmed.append(entry)
+                        found = True
+            if found:
+                break
+
+            remaining = timeout - (time.time() - start_time)
+            if remaining <= 0:
+                break
+
+            sleep_time = min(interval, remaining, max_interval)
+            log(f"[OOB] Poll attempt — sleeping {sleep_time:.1f}s (interval={interval:.0f}s)",
+                Colors.CYAN, verbose_only=True, verbose=verbose)
+            time.sleep(sleep_time)
+            interval = min(interval * 2, max_interval)
+
         return confirmed
 
     def _check_callback(self, entry: Dict[str, Any]) -> bool:
@@ -496,10 +548,11 @@ class BrowserValidator:
         If Playwright confirms JS execution and screenshot_dir is provided,
         captures a full-page PNG screenshot and includes its path in the result.
         """
-        page = self._new_page()
-        if not page:
-            return None
+        page = None
         try:
+            page = self._new_page()
+            if not page:
+                return None
             result = {"alert_fired": False, "dom_mutation": False, "callback": False, "screenshot_path": ""}
 
             def on_dialog(dialog):
@@ -517,13 +570,16 @@ class BrowserValidator:
             dom_evidence = page.evaluate("""() => {
                 const body = document.body ? document.body.innerHTML : '';
                 const scripts = Array.from(document.querySelectorAll('script'));
+                const bbhAttr = document.querySelector('[data-bbh-xss]');
                 return {
                     body_snippet: body.substring(0, 200),
                     script_count: scripts.length,
                     has_bbh_marker: window.__bbh_xss === 1 || body.includes('__bbh_xss'),
+                    has_bbh_fired: window.__bbhXSSFired === true,
+                    has_data_attr: bbhAttr !== null,
                 };
             }""")
-            result["dom_mutation"] = dom_evidence.get("has_bbh_marker", False)
+            result["dom_mutation"] = dom_evidence.get("has_bbh_marker", False) or dom_evidence.get("has_bbh_fired", False) or dom_evidence.get("has_data_attr", False)
 
             # Capture screenshot when execution confirmed and output dir available
             execution_confirmed = result["alert_fired"] or result["dom_mutation"]
@@ -537,29 +593,36 @@ class BrowserValidator:
                     page.screenshot(path=shot_path, full_page=True)
                     result["screenshot_path"] = shot_path
                 except Exception:
-                    pass
+                    try:
+                        page.screenshot(path=shot_path)
+                        result["screenshot_path"] = shot_path
+                    except Exception:
+                        pass
 
-            page.close()
             return result
         except Exception:
-            try:
-                page.close()
-            except Exception:
-                pass
             return None
+        finally:
+            if page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
 
     def scan_dom_xss(self, url: str, probes: List[str]) -> List[Dict[str, Any]]:
         """Scan for DOM-based XSS by testing common sinks with each probe.
         
         Tests: document.write, innerHTML, outerHTML, insertAdjacentHTML,
-        eval, setTimeout, Function constructor, jQuery $().
+        eval, setTimeout, Function constructor, jQuery $(), document.domain,
+        location.assign, location.replace.
         Returns list of findings dicts with 'sink', 'probe', 'executed' keys.
         """
         findings: List[Dict[str, Any]] = []
-        page = self._new_page()
-        if not page:
-            return findings
+        page = None
         try:
+            page = self._new_page()
+            if not page:
+                return findings
             page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
             page.wait_for_timeout(1000)
             marker = "__bbh_dom_sink_triggered"
@@ -604,6 +667,24 @@ class BrowserValidator:
                         try { window.{m}="jq"; $(window).html('<img src=x onerror=window.{m}="jqe">');
                         return window.{m} === "jqe"; } catch(e) { return false; }
                     """.replace("{m}", marker)),
+                    ("document.domain", """
+                        try { document.domain = 'x'; window.{m}="dd";
+                        return window.{m} === "dd"; } catch(e) { return false; }
+                    """.replace("{m}", marker)),
+                    ("location.assign", """
+                        try { var old = window.onbeforeunload;
+                        window.onbeforeunload = function(){{}};
+                        location.assign('javascript:window.{m}="la"');
+                        setTimeout(function(){{ window.onbeforeunload = old; }}, 100);
+                        return window.{m} === "la"; } catch(e) { return false; }
+                    """.replace("{m}", marker)),
+                    ("location.replace", """
+                        try { var old = window.onbeforeunload;
+                        window.onbeforeunload = function(){{}};
+                        location.replace('javascript:window.{m}="lr"');
+                        setTimeout(function(){{ window.onbeforeunload = old; }}, 100);
+                        return window.{m} === "lr"; } catch(e) { return false; }
+                    """.replace("{m}", marker)),
                 ]
                 for sink_name, js_code in sink_checks:
                     try:
@@ -616,33 +697,42 @@ class BrowserValidator:
                     except Exception:
                         continue
 
-            page.close()
             return findings
         except Exception:
-            try:
-                page.close()
-            except Exception:
-                pass
             return findings
+        finally:
+            if page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
 
     def capture_screenshot(self, url: str, output_path: str) -> Optional[str]:
         """Capture a full-page PNG screenshot."""
-        page = self._new_page()
-        if not page:
-            return None
+        page = None
         try:
+            page = self._new_page()
+            if not page:
+                return None
             page.set_viewport_size({"width": 1280, "height": 720})
             page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
             page.wait_for_timeout(1500)
-            page.screenshot(path=output_path, full_page=True)
-            page.close()
+            try:
+                page.screenshot(path=output_path, full_page=True)
+            except Exception:
+                try:
+                    page.screenshot(path=output_path)
+                except Exception:
+                    pass
             return output_path
         except Exception:
-            try:
-                page.close()
-            except Exception:
-                pass
             return None
+        finally:
+            if page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
 
     def check_network_requests(self, url: str, callback_domain: str) -> Optional[Dict[str, Any]]:
         """Load URL and intercept outbound requests matching callback_domain."""
@@ -1259,13 +1349,15 @@ def finding(
     Supports both legacy confidence strings and new proof-based confidence fields.
     Returns None if duplicate of an already-seen finding (process-wide dedup).
     """
-    dedupe_key = (vuln_type, url, parameter or "")
+    sanitised_vuln_type = vuln_type.replace("\n", " ").replace("\r", " ").strip()
+    dedupe_key = (sanitised_vuln_type, url, parameter or "")
     with _seen_findings_lock:
         if dedupe_key in _seen_findings:
             return None
         _seen_findings.add(dedupe_key)
 
-    canonical_type = _resolve_vuln_type(vuln_type)
+    canonical_type = _resolve_vuln_type(sanitised_vuln_type)
+    vuln_type = sanitised_vuln_type
     meta = VULN_METADATA.get(canonical_type, {})
 
     if confidence is None:
@@ -1976,7 +2068,7 @@ def classify_endpoint(
     has_cmd = "has_cmd_param" in signals
 
     if has_params:
-        modules.update({"xss", "sqli", "ssti"})
+        modules.update({"xss", "sqli", "ssti", "cmd_injection"})
     if has_file_param:
         modules.update({"lfi", "xxe", "ssrf"})
     if has_url_param:
@@ -1986,7 +2078,7 @@ def classify_endpoint(
     if is_form_post:
         modules.update({"csrf", "xss", "sqli", "insecure_forms"})
     if is_json_api:
-        modules.update({"sqli", "idor", "rate_limiting", "api", "http_methods"})
+        modules.update({"sqli", "idor", "rate_limiting", "api", "http_methods", "cmd_injection"})
     if is_xml:
         modules.update({"xxe", "http_methods"})
     if is_graphql:
@@ -2116,7 +2208,7 @@ def _get_signal_set(
 # Modules that run on every URL regardless of signals
 _CLASSIFY_ALWAYS: set[str] = {
     "headers", "sensitive", "exposed_files", "clickjacking",
-    "cors", "jwt",
+    "cors", "jwt", "rate_limiting",
 }
 
 

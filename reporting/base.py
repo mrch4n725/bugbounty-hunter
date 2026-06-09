@@ -650,6 +650,18 @@ class ReporterBase:
             parts.append(f"Demonstrated: {ia['demonstrated_impact']}")
         return " | ".join(parts)
 
+    @staticmethod
+    def _validate_screenshot_path(path: str) -> bool:
+        """Check if file exists and has PNG magic bytes before embedding."""
+        if not path or not os.path.isfile(path):
+            return False
+        try:
+            with open(path, "rb") as f:
+                header = f.read(8)
+            return header[:4] == b'\x89PNG' or header[:2] == b'\xff\xd8'
+        except Exception:
+            return False
+
     def _build_curl_command(self, finding: Dict[str, Any]) -> str:
         req = finding.get("request", "")
         if req.startswith("curl"):

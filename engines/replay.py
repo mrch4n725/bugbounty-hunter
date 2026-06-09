@@ -23,12 +23,14 @@ class ReplayEngine:
         validation_step: str = "",
         evidence_fingerprint: str = "",
     ) -> ValidationSnapshot:
+        response_body = response or finding.response_excerpt or ""
         snapshot = ValidationSnapshot(
             request=request or finding.request or "",
-            response=response or finding.response_excerpt or "",
+            response=response_body,
             validation_step=validation_step,
             evidence_fingerprint=evidence_fingerprint,
         )
+        snapshot.response_body_hash = hashlib.sha256(response_body.encode()).hexdigest()
         return snapshot
 
     def build_bundle(
@@ -161,7 +163,8 @@ class ReplayEngine:
             prev_record = prev_records[fp]
             prev_req = prev_record.get("request", "")
             prev_resp = prev_record.get("response_excerpt", "")
-            prev_hash = hashlib.sha256(f"{prev_req}{prev_resp}".encode()).hexdigest()[:16]
+            prev_resp_hash = prev_record.get("response_body_hash", "")
+            prev_hash = hashlib.sha256(f"{prev_req}{prev_resp}{prev_resp_hash}".encode()).hexdigest()[:16]
 
             if current_fp != prev_hash:
                 object.__setattr__(f, "replay_regression", {

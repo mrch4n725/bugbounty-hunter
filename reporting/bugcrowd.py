@@ -61,14 +61,14 @@ class BugcrowdReporter(ReporterBase):
                     desc = getattr(ev, 'description', f'Evidence #{j+1}') if hasattr(ev, 'description') else f'Evidence #{j+1}'
                     if ev_type == "HttpRequestEvidence":
                         curl = getattr(ev, 'curl_command', '') or getattr(ev, 'method', '') + ' ' + getattr(ev, 'url', '')
-                        evidence_parts.append(f"> **{desc}**\n```\n{curl}\n```")
+                        evidence_parts.append(f"> **{desc}** — **Reproduction Request**\n```\n{curl}\n```")
                     elif ev_type == "BrowserExecutionEvidence":
                         scr = getattr(ev, 'screenshot_path', '')
                         ctx = getattr(ev, 'execution_context', '')
                         alert = getattr(ev, 'alert_fired', False)
                         dom = getattr(ev, 'dom_mutation', False)
                         status = "✅ Executed" if alert or dom else "❌ Not executed"
-                        scr_line = f"\n![Screenshot]({scr})" if scr else ""
+                        scr_line = f"\n![Screenshot]({scr})" if scr and ReporterBase._validate_screenshot_path(scr) else ""
                         evidence_parts.append(f"> **{desc}** — {status}\n> Context: {ctx}{scr_line}")
                     elif ev_type == "AuthorizationComparisonEvidence":
                         orig_user = getattr(ev, 'original_user', '')
@@ -127,7 +127,7 @@ class BugcrowdReporter(ReporterBase):
             urls = "\n".join(f"- {u}" for u in grouped) if grouped else f"- {f.get('url', self.target)}"
 
             screenshot_path = f.get("screenshot_path", "")
-            screenshot_line = f"\n**Screenshot:** {screenshot_path}\n" if screenshot_path else ""
+            screenshot_line = f"\n**Screenshot:** {screenshot_path}\n" if screenshot_path and ReporterBase._validate_screenshot_path(screenshot_path) else ""
             response_excerpt = f.get("response_excerpt", "")
 
             per_finding.append(f"""## Finding #{i}: {title}

@@ -25,6 +25,7 @@ Usage:
 
 import json
 import os
+import threading
 import time
 from typing import Any
 from collections import defaultdict
@@ -48,7 +49,7 @@ class OutcomeEngine:
             config.get("output_dir", "reports"), "outcomes"
         )
         os.makedirs(self.outcome_dir, exist_ok=True)
-        self._lock = False
+        self._lock = threading.Lock()
 
     def _path(self) -> str:
         return os.path.join(self.outcome_dir, OUTCOME_FILE)
@@ -73,8 +74,9 @@ class OutcomeEngine:
             "note": note,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
-        with open(self._path(), "a") as f:
-            f.write(json.dumps(record) + "\n")
+        with self._lock:
+            with open(self._path(), "a") as f:
+                f.write(json.dumps(record) + "\n")
 
     def load_outcomes(self) -> list[dict]:
         """Load all stored outcome records."""

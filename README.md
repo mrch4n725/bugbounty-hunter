@@ -58,7 +58,7 @@ Key capabilities:
 - **Scope enforcement** — every outbound request, including redirect chains, is validated against allowed targets
 - **Canonical Finding model** — all findings normalized to the `Finding` dataclass with UUIDv7 identifiers, SHA-256 root-cause fingerprints, CVSS vectors, impact narratives, and remediation guidance
 - **Submission-ready reports** — HTML, JSON, TXT, Markdown, HackerOne, and Bugcrowd formats with CVSS scoring, impact assessment, remediation guidance, structured evidence, and curl reproduction commands
-- **Resume support** — interrupted scans can be resumed from their last checkpoint
+- **Resume support** — interrupted scans can be resumed from their last checkpoint; findings and evidence persist across sessions via serialized dedup state + SQLite-backed evidence engine
 - **Authenticated scanning** — cookie and header injection for session-based testing
 
 ---
@@ -248,7 +248,7 @@ If a scan is interrupted (Ctrl+C, crash, timeout), resume it:
 python3 main.py --target https://example.com --resume
 ```
 
-This reads `.scan_state.json` from the current directory and skips previously completed URLs. Only URLs that were not processed are re-scanned.
+This reads `.scan_state.json` from the output directory and skips previously completed URLs. Findings and evidence from the previous run are automatically restored via serialized dedup state and SQLite-backed evidence persistence. Only URLs that were not processed are re-scanned.
 
 ### Configuration File
 
@@ -568,7 +568,9 @@ bugbounty-hunter/
 ├── engines/
 │   ├── __init__.py
 │   ├── validation_engine.py         # Centralized OOB, browser, timing, secret, auth, GraphQL validation
-│   └── evidence_engine.py           # Evidence storage, linking, snapshot/restore
+│   ├── evidence_engine.py           # Evidence storage, linking, SQLite persistence (WAL + batch inserts), snapshot/restore
+│   ├── dedup.py                     # Finding deduplication with serialization (to_dict/from_dict) for resume
+│   └── outcome_feedback.py          # Outcome tracking (JSON Lines → thread-safe with Lock)
 ├── scanners/
 │   ├── __init__.py
 │   ├── base.py                      # ScannerBase — shared lifecycle (detect/validate/collect/reproduce/confidence)
@@ -585,7 +587,7 @@ bugbounty-hunter/
 │   ├── hackerone.py                 # HackerOneReporter — submission-ready format
 │   └── bugcrowd.py                  # BugcrowdReporter — summary + per-finding detail
 ├── tests/
-│   └── run.py                       # 214 standalone tests (zero external dependencies)
+│   └── run.py                       # 259 standalone tests (zero external dependencies)
 └── reports/                         # Output directory (gitignored)
 ```
 

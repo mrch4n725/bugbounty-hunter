@@ -64,14 +64,22 @@ class ScanBudgetEngine:
         capabilities: dict[str, bool] | None = None,
         asset_graph: Any = None,
     ) -> ScanBudget:
+        if not urls:
+            return ScanBudget(
+                total_requests=0,
+                remaining=0,
+                allocation={},
+                system_load=self._estimate_load(),
+            )
         scores = self.compute_scores(urls, historical_data, capabilities=capabilities, asset_graph=asset_graph)
         allocation: dict[str, int] = {}
         total_allocated = 0
+        total_score = sum(sc.score for sc in scores) or 1
 
         for s in scores:
             proportional = max(
                 self.MIN_BUDGET,
-                int(total_request_capacity * (s.score / max(sum(sc.score for sc in scores), 1))),
+                int(total_request_capacity * (s.score / total_score)),
             )
             capped = min(self.MAX_BUDGET, proportional)
             allocation[s.url] = capped

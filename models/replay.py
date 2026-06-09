@@ -7,6 +7,7 @@ from typing import Any
 class ValidationSnapshot:
     request: str = ""
     response: str = ""
+    response_body_hash: str = ""
     timestamp: str = ""
     validation_step: str = ""
     evidence_fingerprint: str = ""
@@ -19,6 +20,7 @@ class ValidationSnapshot:
         return {
             "request": self.request[:500],
             "response": self.response[:500],
+            "response_body_hash": self.response_body_hash,
             "timestamp": self.timestamp,
             "validation_step": self.validation_step,
             "evidence_fingerprint": self.evidence_fingerprint,

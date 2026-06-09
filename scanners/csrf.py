@@ -18,7 +18,7 @@ from models.finding import Finding
 from models.evidence import ResponseExcerptEvidence, HttpRequestEvidence
 from modules.utils import (
     finding, VerificationStage, log, Colors, _build_curl, safe_post, safe_get,
-    safe_cookies_dict,
+    safe_cookies_dict, make_session,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
@@ -170,11 +170,90 @@ class CSRFScanner(ScannerBase):
 
     def generate_reproduction(self, f: dict) -> list[str]:
         return [
-            f"Navigate to the page containing the form at {f['url']}",
-            "Using a proxy or curl, submit the same POST request without any anti-CSRF token (remove csrf_token / authenticity_token fields)",
-            "Observe that the server accepts the request with HTTP 200 — no token validation enforced",
-            "Compare with legitimate request that includes a token — both succeed, confirming missing CSRF protection",
+            f"curl -X POST '{f['url']}' -d 'action=transfer&amount=1000&recipient=attacker'",
+            "Observe that the server accepts the request with HTTP 200 — no anti-CSRF token validation enforced; compare with legitimate request that includes a token — both succeed",
+            "An attacker can forge cross-origin requests to perform state-changing actions (password change, fund transfer, privilege escalation) on behalf of authenticated victims",
         ]
+
+    def _check_json_content_type_confusion(self, urls: list[str]) -> list[Finding]:
+        """Check if JSON endpoints accept text/plain content-type (CSRF bypass)."""
+        json_findings: list[Finding] = []
+        for url in urls:
+            if not self._in_scope(url):
+                continue
+            try:
+                resp = safe_get(self.session, url, self.timeout)
+                if not resp or "application/json" not in resp.headers.get("Content-Type", ""):
+                    continue
+                test_data = '{"test":"csrf_probe"}'
+                plain_resp = safe_post(
+                    self.session, url, data=test_data,
+                    headers={"Content-Type": "text/plain"},
+                    timeout=self.timeout, raise_for_status=False,
+                )
+                if plain_resp and plain_resp.status_code in (200, 201, 202, 204):
+                    json_resp = safe_post(
+                        self.session, url, data=test_data,
+                        headers={"Content-Type": "application/json"},
+                        timeout=self.timeout, raise_for_status=False,
+                    )
+                    if json_resp and json_resp.status_code in (200, 201, 202, 204):
+                        f = finding(
+                            vuln_type="CSRF JSON Content-Type Confusion",
+                            url=url,
+                            severity="medium",
+                            details="JSON endpoint accepts text/plain content-type — browser can send cross-origin POST without preflight",
+                            evidence=f"text/plain POST returned HTTP {plain_resp.status_code}, same as application/json ({json_resp.status_code})",
+                            request=_build_curl("POST", url, {"Content-Type": "text/plain"}, data=test_data),
+                            response_excerpt=plain_resp.text[:200],
+                            verification_stage=VerificationStage.VALIDATED.value,
+                            steps_to_reproduce=[
+                                f"Send POST to {url} with Content-Type: text/plain and body: {test_data}",
+                                "Observe that the server returns HTTP 200 — same as with application/json",
+                                "An attacker can craft a self-submitting form with enctype=text/plain to bypass CSRF protection",
+                            ],
+                        )
+                        if f:
+                            self._add_finding(f)
+                            json_findings.append(f)
+                            log(f"  [CSRF JSON] {url} — text/plain accepted", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+            except Exception:
+                continue
+        return json_findings
+
+    def _test_origin_referer_bypass(self, form: dict, base_data: dict) -> ValidationResult | None:
+        """Validate CSRF by testing Origin/Referer header bypass."""
+        form_action = form.get("action", form.get("url", ""))
+        if not form_action:
+            return None
+        try:
+            for origin in ("null", "https://evil.com", "https://attacker.com"):
+                bypass_session = make_session(self.config)
+                bypass_session.headers.update({"Origin": origin})
+                resp = safe_post(bypass_session, form_action, base_data or {"test": "test"},
+                                self.timeout, raise_for_status=False)
+                if resp and resp.status_code in (200, 201, 202, 204, 301, 302):
+                    return ValidationResult(
+                        confirmed=True,
+                        signals=[f"Origin bypass: Origin={origin} returned HTTP {resp.status_code}"],
+                        method="origin_bypass",
+                        detail=f"Server accepted POST with malicious Origin header ({origin}) — no CSRF protection via Origin check",
+                    )
+            for referer in ("https://evil.com/", "https://attacker.com/page"):
+                bypass_session = make_session(self.config)
+                bypass_session.headers.update({"Referer": referer})
+                resp = safe_post(bypass_session, form_action, base_data or {"test": "test"},
+                                self.timeout, raise_for_status=False)
+                if resp and resp.status_code in (200, 201, 202, 204, 301, 302):
+                    return ValidationResult(
+                        confirmed=True,
+                        signals=[f"Referer bypass: Referer={referer} returned HTTP {resp.status_code}"],
+                        method="referer_bypass",
+                        detail=f"Server accepted POST with spoofed Referer header ({referer}) — no CSRF protection via Referer check",
+                    )
+        except Exception:
+            return None
+        return None
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         forms = self.recon.get("forms", [])
@@ -198,13 +277,20 @@ class CSRFScanner(ScannerBase):
 
                 validation_result = self.validate(detection, form)
                 evidence_list = self.collect_evidence(detection, validation_result)
+                base_data = {
+                    fld.get("name", "field"): fld.get("value", "test")
+                    for fld in form.get("fields", [])[:5]
+                }
 
                 stage = VerificationStage.VALIDATED.value if (validation_result and validation_result.confirmed) else VerificationStage.DETECTED.value
 
-                curl_cmd = _build_curl("POST", detection.url, {}, data={
-                    fld.get("name", "field"): fld.get("value", "test")
-                    for fld in form.get("fields", [])[:5]
-                })
+                if stage == VerificationStage.DETECTED.value and not self.config.get("passive"):
+                    bypass_result = self._test_origin_referer_bypass(form, base_data)
+                    if bypass_result and bypass_result.confirmed:
+                        validation_result = bypass_result
+                        stage = VerificationStage.VALIDATED.value
+
+                curl_cmd = _build_curl("POST", detection.url, {}, data=base_data)
 
                 f = finding(
                     vuln_type="Missing CSRF Protection",
@@ -234,4 +320,8 @@ class CSRFScanner(ScannerBase):
                     log(f"  [CSRF] {detection.url} [{stage}]", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
             except Exception:
                 continue
+
+        urls = self.recon.get("urls", []) if target_urls is None else target_urls
+        self._check_json_content_type_confusion(urls)
+
         return self._get_findings()

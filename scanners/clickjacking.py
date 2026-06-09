@@ -112,10 +112,9 @@ class ClickjackingScanner(ScannerBase):
 
     def generate_reproduction(self, f: dict) -> list[str]:
         return [
-            f"Send GET request to {f['url']} and inspect response headers",
-            "Verify X-Frame-Options header is missing (should be DENY or SAMEORIGIN)",
-            "Verify Content-Security-Policy lacks frame-ancestors directive",
-            f"Create an HTML page with <iframe src='{f['url']}'> — the page loads inside the iframe",
+            f"curl -X GET '{f['url']}' -I | grep -i \"X-Frame-Options\\|Content-Security-Policy\\|frame-ancestors\"",
+            "Verify X-Frame-Options header is missing (should be DENY or SAMEORIGIN) and Content-Security-Policy lacks frame-ancestors directive",
+            f"An attacker can create a transparent overlay page at attacker.com that loads '{f['url']}' in a hidden iframe and tricks victims into clicking UI elements, enabling account takeover and sensitive actions",
         ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:

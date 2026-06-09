@@ -10,6 +10,7 @@ Lifecycle:
 Maturity: Level 3 (Detect + Validate + typed evidence + reproduction)
 """
 
+import re
 from urllib.parse import urlparse, parse_qs
 
 from models.finding import Finding
@@ -52,6 +53,25 @@ class OpenRedirectScanner(ScannerBase):
         return parsed.netloc == "evil.com" or parsed.netloc.endswith(".evil.com")
 
     @staticmethod
+    def _find_js_redirects(body: str) -> list[str]:
+        """Detect JS-based redirects in response body (no Location header needed)."""
+        patterns = [
+            r'window\.location\s*=\s*["\'](https?://[^"\']+)["\']',
+            r'window\.location\.href\s*=\s*["\'](https?://[^"\']+)["\']',
+            r'document\.location\s*=\s*["\'](https?://[^"\']+)["\']',
+            r'document\.location\.href\s*=\s*["\'](https?://[^"\']+)["\']',
+            r'window\.location\.replace\(["\'](https?://[^"\']+)["\']',
+            r'location\.href\s*=\s*["\'](https?://[^"\']+)["\']',
+        ]
+        targets = []
+        for pat in patterns:
+            for m in re.finditer(pat, body, re.IGNORECASE):
+                target_url = m.group(1)
+                if "evil.com" in target_url:
+                    targets.append(target_url)
+        return targets
+
+    @staticmethod
     def _inject_param(url: str, param: str, value: str) -> str:
         from urllib.parse import urlencode, urlunparse
         parsed = urlparse(url)
@@ -76,6 +96,16 @@ class OpenRedirectScanner(ScannerBase):
                         context=f"Redirect to {loc[:80]}",
                         raw_response=resp,
                         evidence_signals=[f"Location: {loc[:100]}"],
+                    )
+                js_targets = self._find_js_redirects(resp.text)
+                if js_targets:
+                    return DetectionResult(
+                        url=test_url,
+                        parameter=parameter,
+                        payload=payload,
+                        context=f"JS redirect to {js_targets[0][:80]}",
+                        raw_response=resp,
+                        evidence_signals=[f"JS redirect: {t}" for t in js_targets[:3]],
                     )
             except Exception:
                 continue
@@ -114,8 +144,9 @@ class OpenRedirectScanner(ScannerBase):
 
     def generate_reproduction(self, detection: DetectionResult) -> list[str]:
         return [
-            f"Send GET to {detection.url}",
-            f"Observe redirect to external domain: {detection.context}",
+            f"curl -X GET '{detection.url}' -I",
+            f"Observe redirect to external domain: {detection.context} — the server follows user-controlled redirect parameters without validation",
+            "An attacker can use this redirect for phishing campaigns: victims clicking a legitimate-looking link are silently redirected to malicious sites",
         ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:

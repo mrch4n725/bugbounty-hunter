@@ -289,6 +289,7 @@ class HTMLReporter(ReporterBase):
                     e_curl = html.escape(curl)
                     parts.append(
                         f'<details><summary>{e_desc}</summary>'
+                        f'<div class="row"><strong>Reproduction Request:</strong></div>'
                         f'<pre class="evidence">{e_curl}</pre></details>'
                     )
                 elif ev_type == "BrowserExecutionEvidence":
@@ -299,7 +300,7 @@ class HTMLReporter(ReporterBase):
                     status = "✓ Executed" if alert or dom else "✗ Not executed"
                     e_ctx = html.escape(ctx)
                     scr_html = ""
-                    if scr_path:
+                    if scr_path and ReporterBase._validate_screenshot_path(scr_path):
                         scr_html = f'<br><a href="{html.escape(scr_path)}" target="_blank"><img src="{html.escape(scr_path)}" alt="Browser screenshot" style="max-width:100%;max-height:300px;border:1px solid var(--border);border-radius:4px"></a>'
                     parts.append(
                         f'<details open><summary>{e_desc} — <strong>{status}</strong></summary>'
@@ -307,7 +308,7 @@ class HTMLReporter(ReporterBase):
                     )
                 elif ev_type == "ScreenshotEvidence":
                     scr_path = getattr(ev, 'file_path', '')
-                    if scr_path:
+                    if scr_path and ReporterBase._validate_screenshot_path(scr_path):
                         parts.append(
                             f'<details open><summary>{e_desc}</summary>'
                             f'<a href="{html.escape(scr_path)}" target="_blank"><img src="{html.escape(scr_path)}" alt="Screenshot" style="max-width:100%;max-height:300px;border:1px solid var(--border);border-radius:4px"></a></details>'
@@ -344,8 +345,8 @@ class HTMLReporter(ReporterBase):
                     violated = getattr(ev, 'ownership_violated', False)
                     orig_body = getattr(ev, 'original_body_excerpt', '')
                     tgt_body = getattr(ev, 'target_body_excerpt', '')
-                    e_orig = html.escape(orig_body[:300])
-                    e_tgt = html.escape(tgt_body[:300])
+                    e_orig = html.escape(orig_body[:200])
+                    e_tgt = html.escape(tgt_body[:200])
                     parts.append(
                         f'<details open><summary>{e_desc} {"✓ Violation" if violated else "No violation"}</summary>'
                         f'<div class="evidence">'
@@ -455,7 +456,7 @@ class HTMLReporter(ReporterBase):
                 response_html = f'<div class="row"><strong>Response:</strong><details><summary>View response excerpt ({len(response_excerpt)} chars)</summary><pre class="evidence">{e_response}</pre></details></div>'
 
             screenshot_html = ""
-            if screenshot_path:
+            if screenshot_path and ReporterBase._validate_screenshot_path(screenshot_path):
                 screenshot_html = f'<div class="row"><strong>Validation Screenshot:</strong><details open><summary>View Playwright screenshot</summary><a href="{html.escape(screenshot_path)}" target="_blank"><img src="{html.escape(screenshot_path)}" alt="XSS execution screenshot" style="max-width:100%;border:1px solid var(--border);border-radius:4px;cursor:zoom-in" /></a></details></div>'
 
             steps_to_reproduce_html = ""

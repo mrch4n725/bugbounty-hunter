@@ -2784,20 +2784,20 @@ class JWTScanner(ScannerBase):
         vuln_type = f.get("vuln_type", "")
         if vuln_type == "JWT: alg=none":
             return [
-                f"Capture the JWT from {url}",
-                f"The JWT header contains alg=none — no signature is required",
-                "Send a modified JWT with any payload and alg=none, no signature",
-                "Observe that the server accepts the forged token",
+                f"curl -X GET '{url}' -H 'Authorization: Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.'",
+                "The JWT header contains alg=none — the server accepts unsigned tokens; send a modified JWT with any payload and alg=none, no signature",
+                "An attacker can forge arbitrary JWT tokens with any claims (admin privileges, arbitrary user IDs) without knowing the signing secret",
             ]
         if vuln_type == "JWT Token Disclosure":
             return [
-                f"Send request to {url}",
-                f"Observe the response contains a JWT token",
-                "Decode the JWT payload to inspect claims",
+                f"curl -X GET '{url}' -I",
+                f"Observe the response contains a JWT token — decoded payload reveals: {f.get('response_excerpt', '')[:100]}",
+                "Exposed JWT tokens can be decoded (base64) to reveal sensitive claims, and if not expired, used to impersonate the user",
             ]
         return [
-            f"Send request to {url} and locate JWT tokens",
-            "Inspect JWT header and payload for weak configurations",
+            f"curl -X GET '{url}' -H 'Authorization: Bearer <token>'",
+            "Inspect JWT header and payload for weak configurations (alg=none, weak secret, excessive claims)",
+            "Weak JWT configurations allow token forgery, impersonation, and privilege escalation",
         ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:

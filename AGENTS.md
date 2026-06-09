@@ -19,7 +19,7 @@ Each finding carries a confidence score (0–100), evidence strength (Weak/Moder
 ### Entry point
 
 ```
-main.py                     — CLI arg parsing, orchestration, autosave, --dry-run, --legacy-scanners
+main.py                     — CLI arg parsing, orchestration, autosave, --dry-run, --resume, --legacy-scanners
 modules/
   scanner.py                — Core VulnScanner with scan_* methods, feature-flag dispatchers
   utils.py                  — Finding engine, dedup, OOB, BrowserValidator, helpers
@@ -174,8 +174,9 @@ HTML reports use `html.escape()` on every user-provided field at render time. Co
 | `models/config.py` | ScanConfig dataclass | `ScanConfig` with `use_new_scanners: bool = True` |
 | `models/finding.py` | Finding class with dict-compat shim | `Finding` with strict `__getitem__`, content-fingerprinted `to_dict()` |
 | `models/evidence.py` | Evidence type hierarchy (10 subclasses) | `EvidenceBase`, `HttpRequestEvidence`, `BrowserExecutionEvidence`, `ScreenshotEvidence`, `TimingEvidence`, `OOBCallbackEvidence`, `AuthorizationComparisonEvidence`, `GraphQLSchemaEvidence`, `CommandExecutionEvidence`, `ResponseDiffEvidence`, `CompositeEvidence` |
-| `engines/evidence_engine.py` | Evidence storage with SHA-256 content-based dedup | `EvidenceEngine`, `store()`, `get_evidence()` |
-| `engines/evidence_validator.py` | Evidence completeness validation | `EvidenceCompletenessValidator` with `CONFIDENCE_PENALTY` (delta subtraction) |
+| `engines/evidence_engine.py`        | Evidence storage with SHA-256 content-based dedup + SQLite persistence (WAL mode, batch inserts) | `EvidenceEngine`, `store()`, `link_to_finding()`, `get_evidence()`, `batch_insert()`, `snapshot()`, `restore()` |
+| `engines/dedup.py`                 | Finding deduplication with serialization for resume | `DeduplicationEngine`, `add()`, `add_legacy()`, `get_findings()`, `to_dict()`, `from_dict()` |
+| `engines/evidence_validator.py`    | Evidence completeness validation | `EvidenceCompletenessValidator` with `CONFIDENCE_PENALTY` (delta subtraction) |
 
 ---
 
@@ -251,6 +252,7 @@ log("message", Colors.RED, verbose_only=True, verbose=self.verbose)
 - **No test framework dependency** (no pytest, no unittest) — tests are standalone Python scripts
 - Tests exercise all imports, enums, finding dedup, curl building, confidence mapping, reporter rendering, and module structure
 - Run with: `python3 tests/run.py`
+- Current test count: **259 tests** (all passing)
 - `--dry-run` against real targets for integration: `python3 main.py --target https://example.com --dry-run --passive`
 - Multi-role auth: `python3 main.py --target https://example.com --role user_a --auth-header user_b:'Authorization:Bearer tok_b'`
 
@@ -326,7 +328,7 @@ Every HTML report includes a `<script type="application/ld+json">` block with al
 | DOM XSS except indentation | The `try/except` block for `scan_dom_xss` uses a nested `try` with `except` at same indent as the `try` |
 | Rate limiting probe | Threads copy session state at definition time, use stateless `requests.post()` — never share `self.session` across threads |
 | Role sessions | `build_role_sessions()` in utils.py creates a `{role_name: Session}` dict from `--auth-header` args. `IdorScanner` and `ApiScanner` auto-initialize `self.role_sessions`. Ownership validation needs >=2 roles. |
-| Scan state JSON | Uses `.scan_state.json` in CWD for `--resume` |
+| Scan state JSON | Uses `.scan_state.json` in output dir for `--resume`. Now includes serialized findings (via `DeduplicationEngine.to_dict()`) + `completed_urls`. Resume restores both dedup state and evidence (via SQLite persistence). |
 | `_build_curl_command` fallback | Calls `_build_curl(method, url, {})` when no request field is on finding |
 | TARGET_LEVEL not on VulnScanner | `module_map` and `TARGET_LEVEL` are local variables in `main.py`'s `run()`, not class attributes |
 | Playwright availability | Checked via `CapabilityRegistry.get_global().has("playwright")` — not module-level `try` imports |
@@ -357,6 +359,12 @@ Every HTML report includes a `<script type="application/ld+json">` block with al
 | ChatGPTReporter evidence rendering | Uses per-evidence-type markdown rendering (`_evidence_to_markdown()`). Supports TimingEvidence, OOBCallbackEvidence, BrowserExecutionEvidence, ScreenshotEvidence, AuthorizationComparisonEvidence, GraphQLSchemaEvidence. Falls back to `str()` for unknown types. |
 | HackerOne/Bugcrowd authZ body diff | `AuthorizationComparisonEvidence` now renders HTTP status codes, body-diff flag, and up-to-200-char body excerpts for both original and target responses. |
 | finding_state / confidence_label dict access | `finding()` now sets `finding_state = FindingState.from_verification_stage(f.verification_stage).value` and `confidence_label = ConfidenceLevel.from_score(f.confidence_score).value` after construction. These fields are available via `f["finding_state"]` and `f["confidence_label"]`. |
+| DeduplicationEngine serialization | `to_dict()` serialises all `_groups` to `{fingerprint: finding_dict}`. `from_dict(data)` classmethod restores state. Used by `--resume` in `main.py` to persist findings across sessions. |
+| Screenshot validation | `ReporterBase._validate_screenshot_path()` checks `os.path.isfile()` + PNG magic bytes (`\x89PNG`) or JPEG (`\xff\xd8`). Used by all 5 reporters (HTML, TXT, HackerOne, Bugcrowd) before embedding screenshot paths. |
+| Screenshot artifact upload | `Reporter.generate()` copies all referenced screenshot files to `{output_dir}/screenshots/` during report generation. Paths in the output dir remain untouched. |
+| EvidenceEngine SQLite persistence | When `config["evidence_db_path"]` is set, EvidenceEngine persists all evidence to SQLite with WAL mode (`PRAGMA journal_mode=WAL`). The `batch_insert()` context manager wraps multiple `store()`/`link_to_finding()` calls in a single transaction. On restart, `_init_db()` reloads all evidence from the SQLite DB. Data survives process restarts. |
+| EvidenceEngine `INSERT OR REPLACE` | `store()` followed by `link_to_finding()` both call `_db_insert` with the same fingerprint. Uses `INSERT OR REPLACE` so the second call (from linking) overwrites the first (from store) with the correct `finding_id`. |
+| OutcomeEngine lock fix | `engines/outcome_feedback.py` had `self._lock = False` (a boolean). Fixed to `threading.Lock()`. File writes now properly guarded with `with self._lock:`. |
 
 ---
 

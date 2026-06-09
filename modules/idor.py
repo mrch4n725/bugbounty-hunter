@@ -247,7 +247,8 @@ class IdorScanner(ScannerModuleBase):
             if not resp_alt or resp_alt.status_code != 200:
                 continue
 
-            if resp_alt.text != resp_self.text:
+            similarity = self._jaccard_similarity(resp_self.text, resp_alt.text)
+            if similarity < 0.85:
                 f_dict = finding(
                     "IDOR - Horizontal Privilege Escalation",
                     url, "critical",
@@ -484,6 +485,17 @@ class IdorScanner(ScannerModuleBase):
 
     # ── Ownership validation (Phase 5) ────────────────────────────────────
 
+    @staticmethod
+    def _jaccard_similarity(text_a: str, text_b: str) -> float:
+        """Compute Jaccard similarity on whitespace-tokenised word sets."""
+        set_a = set(text_a.lower().split())
+        set_b = set(text_b.lower().split())
+        if not set_a and not set_b:
+            return 1.0
+        intersection = set_a & set_b
+        union = set_a | set_b
+        return len(intersection) / len(union) if union else 0.0
+
     def verify_ownership(self, findings: list[dict], candidates: list[dict]) -> None:
         """Explicit User A ↔ User B ownership comparison.
         
@@ -527,7 +539,9 @@ class IdorScanner(ScannerModuleBase):
             if not resp_b or resp_b.status_code != 200:
                 continue
 
-            if resp_b.text != resp_a.text and len(resp_b.text) > 300:
+            similarity = self._jaccard_similarity(resp_a.text, resp_b.text)
+            body_diff = similarity < 0.85
+            if body_diff and len(resp_b.text) > 300:
                 auth_evidence = AuthorizationComparisonEvidence(
                     original_user=default_role,
                     target_user=alt_role,

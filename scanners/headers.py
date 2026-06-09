@@ -151,27 +151,37 @@ class HeadersScanner(ScannerBase):
             context = detection.context
             if context == "missing_header":
                 return [
-                    f"Send GET request to {url}",
-                    f"Observe missing security header: {header}",
+                    f"curl -X GET '{url}' -I",
+                    f"Observe missing security header: {header} — not present in response headers",
+                    f"Attackers can exploit the absence of {header} to perform attacks that this header would otherwise prevent",
                 ]
             elif context == "information_disclosure":
                 return [
-                    f"Send GET request to {url}",
-                    f"Observe information disclosure header: {header}={detection.payload}",
+                    f"curl -X GET '{url}' -I",
+                    f"Observe information disclosure header: {header}={detection.payload} — reveals server internals",
+                    "Attackers can use this information to identify server versions, technologies, and tailor exploits accordingly",
                 ]
             elif context == "weak_csp":
                 return [
-                    f"Send GET request to {url}",
-                    f"Observe weak Content-Security-Policy: {detection.payload[:80]}",
+                    f"curl -X GET '{url}' -I",
+                    f"Observe weak Content-Security-Policy: {detection.payload[:80]} — allows unsafe-inline or overly permissive sources",
+                    "A weak CSP allows attackers to bypass XSS protections by injecting scripts from permitted but untrusted sources",
                 ]
             elif context == "insecure_cookie":
                 return [
-                    f"Send GET request to {url}",
-                    f"Observe insecure cookie flags: {detection.payload[:80]}",
+                    f"curl -X GET '{url}' -I",
+                    f"Observe insecure cookie flags: {detection.payload[:80]} — missing Secure, HttpOnly, or SameSite attributes",
+                    "Insecure cookies can be stolen via XSS (no HttpOnly), transmitted over HTTP (no Secure), or forged cross-site (no SameSite)",
                 ]
+            return [
+                f"curl -X GET '{url}' -I",
+                "Inspect HTTP response headers for security misconfigurations",
+                "Security header misconfigurations weaken the application's defense against common web attacks",
+            ]
         return [
-            "Send GET request to the target URL",
-            "Inspect response headers for security misconfigurations",
+            "curl -X GET <target-url> -I",
+            "Inspect HTTP response headers for security misconfigurations",
+            "Security header misconfigurations weaken the application's defense against common web attacks",
         ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:

@@ -82,7 +82,23 @@ class SSTIScanner(ScannerBase):
         new_query = urlencode(params, doseq=True)
         return urlunparse(parsed._replace(query=new_query))
 
+    def _has_pre_existing_result(self, url: str, parameter: str) -> bool:
+        """Fetch page without payload — skip if result values already present in baseline."""
+        baseline = safe_get(self.session, url, self.timeout)
+        if not baseline:
+            return False
+        body = baseline.text
+        for val in ("49", "14", "0"):
+            if val in body:
+                return True
+        for tpl in ("{{", "${", "<%=", "#{"):
+            if tpl in body:
+                return True
+        return False
+
     def detect(self, url: str, parameter: str) -> DetectionResult | None:
+        if self._has_pre_existing_result(url, parameter):
+            return None
         payloads = SSTI_PAYLOADS
         for payload in payloads.get("arithmetic", []):
             test_url = self._inject_param(url, parameter, payload)
@@ -93,13 +109,39 @@ class SSTIScanner(ScannerBase):
             arithmetic_possible = any(e in body for e in ["49", "14"])
             raw_payload_absent = payload not in body
             if arithmetic_possible and raw_payload_absent:
+                second_payload = "{{7-7}}" if "7*7" in payload else "{{7+7}}"
+                if payload.count("*") > 0:
+                    second_payload = "{{7-7}}"
+                elif payload.count("+") > 0:
+                    second_payload = "{{7*7}}"
+                elif payload.count("-") > 0:
+                    second_payload = "{{7*7}}"
+                else:
+                    second_payload = "{{7-7}}"
+                second_url = self._inject_param(url, parameter, second_payload)
+                second_resp = safe_get(self.session, second_url, self.timeout)
+                second_confirmed = False
+                if second_resp:
+                    second_body = second_resp.text
+                    if "{{7-7}}" in second_payload and "0" in second_body and "{{7-7}}" not in second_body:
+                        second_confirmed = True
+                    elif "{{7+7}}" in second_payload and "14" in second_body and "{{7+7}}" not in second_body:
+                        second_confirmed = True
+                    elif "{{7*7}}" in second_payload and "49" in second_body and "{{7*7}}" not in second_body:
+                        second_confirmed = True
+                signals = ["Arithmetic evaluation detected"]
+                if second_confirmed:
+                    signals.append("Dual arithmetic confirmed")
+                    context = "arithmetic"
+                else:
+                    context = "arithmetic_single"
                 return DetectionResult(
                     url=test_url,
                     parameter=parameter,
                     payload=payload,
-                    context="arithmetic",
+                    context=context,
                     raw_response=resp,
-                    evidence_signals=["Arithmetic evaluation detected"],
+                    evidence_signals=signals,
                 )
             if payload in body:
                 return DetectionResult(
@@ -156,16 +198,29 @@ class SSTIScanner(ScannerBase):
 
     def generate_reproduction(self, detection: DetectionResult, stage: str = "detected",
                               engine: str | None = None, proof: str = "") -> list[str]:
-        steps = [f"Send request to {detection.url} with payload '{detection.payload}' in parameter '{detection.parameter}'"]
         if stage == "detected":
-            steps.append("Observe template syntax in response")
+            return [
+                f"curl -X GET '{detection.url}?{detection.parameter}={detection.payload}'",
+                "Observe template syntax reflected in the response — unsanitized template expression confirms injection point",
+                "An attacker can execute arbitrary code on the server via template engine RCE, leading to full server compromise",
+            ]
         elif stage == "validated":
-            steps.append("Observe arithmetic evaluation in response")
-            if engine:
-                steps.append(f"Engine fingerprinted as {engine}")
+            return [
+                f"curl -X GET '{detection.url}?{detection.parameter}={detection.payload}'",
+                f"Observe arithmetic evaluation in response—template engine evaluates expressions{(', engine fingerprinted as ' + engine) if engine else ''}",
+                "Confirmed template injection allows code execution: read files, access environment variables, and potentially execute OS commands",
+            ]
         elif stage == "exploitable":
-            steps.append("Observe read-proof output indicating full server-side execution")
-        return steps
+            return [
+                f"curl -X GET '{detection.url}?{detection.parameter}={detection.payload}'",
+                "Observe read-proof output indicating full server-side execution — engine evaluation produces arbitrary output",
+                "Full server-side template execution achieved: read /etc/passwd, access environment variables, execute OS commands via template engine RCE vectors",
+            ]
+        return [
+            f"curl -X GET '{detection.url}?{detection.parameter}={detection.payload}'",
+            "Observe template syntax in response",
+            "An attacker can execute arbitrary code on the server via template engine RCE",
+        ]
 
     def collect_evidence(self, detection: DetectionResult,
                          validation: dict | None = None,

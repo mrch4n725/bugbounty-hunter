@@ -109,6 +109,44 @@ class RateLimitingScanner(ScannerBase):
     def detect(self, url: str, parameter: str | None = None) -> DetectionResult | None:
         return None
 
+    def _measure_baseline(self, test_url: str) -> tuple[float, float]:
+        """Measure baseline response time over 3 normal requests."""
+        times = []
+        for _ in range(3):
+            try:
+                start = time.time()
+                self.session.post(test_url, timeout=self.timeout, data={"baseline": "1"})
+                times.append((time.time() - start) * 1000)
+            except Exception:
+                continue
+        if not times:
+            return (0.0, 0.0)
+        return (sum(times) / len(times), max(times))
+
+    @staticmethod
+    def _detect_waf_in_429(body: str, headers: dict) -> str | None:
+        """Detect WAF signatures in 429 responses."""
+        body_lower = body.lower() if body else ""
+        waf_signals = {
+            "Cloudflare": ["cf-ray", "cloudflare", "__cfduid"],
+            "AWS WAF": ["awswaf", "x-amzn-requestid", "x-amzn-errortype"],
+            "CloudFront": ["x-amz-cf-id", "cloudfront"],
+            "Akamai": ["akamai", "ak-xam-plugin"],
+            "Fastly": ["x-fastly-request-id", "fastly"],
+            "ModSecurity": ["mod_security", "not acceptable", "request blocked"],
+        }
+        for waf_name, signals in waf_signals.items():
+            for sig in signals:
+                if sig in body_lower:
+                    return waf_name
+        for key in headers:
+            key_lower = key.lower()
+            for waf_name, signals in waf_signals.items():
+                for sig in signals:
+                    if sig in key_lower:
+                        return waf_name
+        return None
+
     def detect_candidate(self, test_url: str, probe_data: dict) -> DetectionResult | None:
         try:
             base_resp = self.session.post(test_url, timeout=self.timeout, data={"baseline": "1"})
@@ -117,11 +155,13 @@ class RateLimitingScanner(ScannerBase):
         except Exception:
             return None
 
+        baseline_avg, baseline_max = self._measure_baseline(test_url)
+
         _probe_cookies = safe_cookies_dict(self.session.cookies)
         _probe_headers = dict(self.session.headers)
 
         def _probe(_idx: int, _url=test_url, _data=probe_data, _timeout=self.timeout,
-                   _cookies=_probe_cookies, _headers=_probe_headers) -> tuple[int, str]:
+                   _cookies=_probe_cookies, _headers=_probe_headers) -> tuple[int, str, dict]:
             try:
                 import requests as _requests
                 delay = random.uniform(0.5, 1.5) if self.config.get("stealth") else max(0.05, self.config.get("delay", 0.0))
@@ -129,24 +169,32 @@ class RateLimitingScanner(ScannerBase):
                     time.sleep(delay)
                 r = _requests.post(_url, data=_data, timeout=_timeout,
                                    cookies=_cookies, headers=_headers, verify=False)
-                return (r.status_code, r.text[:500])
+                return (r.status_code, r.text[:500], dict(r.headers))
             except Exception:
-                return (0, "")
+                return (0, "", {})
 
-        results: list[tuple[int, str]] = []
+        results: list[tuple[int, str, dict]] = []
         start = time.time()
 
         with ThreadPoolExecutor(max_workers=5) as pool:
-            for status_code, body_snippet in pool.map(_probe, range(PROBE_COUNT)):
-                results.append((status_code, body_snippet))
+            for status_code, body_snippet, resp_headers in pool.map(_probe, range(PROBE_COUNT)):
+                results.append((status_code, body_snippet, resp_headers))
 
         elapsed = time.time() - start
-        statuses = [s for s, _ in results]
+        statuses = [s for s, _, _ in results]
         unique_statuses = set(statuses)
         has_429 = 429 in unique_statuses
         has_5xx = any(s >= 500 for s in unique_statuses)
         first_body = results[0][1] if results else ""
-        body_changed = any(b != first_body for b in [b for _, b in results[1:]])
+        body_changed = any(b != first_body for _, b, _ in results[1:])
+
+        waf_detected = None
+        if has_429:
+            for status, body, headers in results:
+                if status == 429:
+                    waf_detected = self._detect_waf_in_429(body, headers)
+                    if waf_detected:
+                        break
 
         throttled = has_429 or (body_changed and not has_5xx)
         if throttled:
@@ -160,8 +208,50 @@ class RateLimitingScanner(ScannerBase):
             evidence_signals=[
                 f"Sent {PROBE_COUNT} POST requests in {elapsed:.1f}s. Statuses: {sorted(unique_statuses)}. No 429 received. Body changed: {body_changed}.",
                 f"elapsed_ms={elapsed * 1000:.0f}",
+                f"baseline_ms={baseline_avg:.0f}",
             ],
+            raw_response=None,
         )
+
+    def validate(self, detection: DetectionResult) -> ValidationResult | None:
+        elapsed_ms = 0.0
+        statuses_seen = set()
+        main_sig = ""
+        for sig in detection.evidence_signals:
+            if sig.startswith("elapsed_ms="):
+                try:
+                    elapsed_ms = float(sig.split("=")[1])
+                except (ValueError, IndexError):
+                    pass
+            elif not main_sig:
+                main_sig = sig
+        if main_sig:
+            import re
+            m = re.search(r"Statuses: \{([^}]+)\}", main_sig)
+            if m:
+                try:
+                    statuses_seen = {int(s.strip()) for s in m.group(1).split(",") if s.strip().isdigit()}
+                except ValueError:
+                    pass
+        all_200 = statuses_seen == {200}
+        fast_burst = elapsed_ms < 25_000
+        no_throttling = 429 not in statuses_seen and not any(s >= 500 for s in statuses_seen)
+        if all_200 and fast_burst:
+            return ValidationResult(
+                confirmed=True,
+                signals=[f"all_200", f"burst_{elapsed_ms:.0f}ms"],
+                method="burst_analysis",
+                detail=f"Rate limiting absent: {PROBE_COUNT} POSTs in {elapsed_ms / 1000:.1f}s, all returned 200",
+            )
+        if no_throttling and fast_burst:
+            return ValidationResult(
+                confirmed=False,
+                signals=[f"burst_{elapsed_ms:.0f}ms"],
+                method="burst_analysis",
+                detail=f"No rate limit triggered: statuses {sorted(statuses_seen)}, {elapsed_ms / 1000:.1f}s",
+            )
+        return ValidationResult(confirmed=False, method="burst_analysis",
+                                detail=f"No rate limiting detected across {PROBE_COUNT} rapid requests")
 
     def validate(self, detection: DetectionResult) -> ValidationResult | None:
         elapsed_ms = 0.0
@@ -206,27 +296,33 @@ class RateLimitingScanner(ScannerBase):
     def collect_evidence(self, detection: DetectionResult,
                          validation_result: ValidationResult | None = None) -> list:
         elapsed_ms = 0.0
+        baseline_ms_val = 0.0
         for sig in detection.evidence_signals:
             if sig.startswith("elapsed_ms="):
                 try:
                     elapsed_ms = float(sig.split("=")[1])
                 except (ValueError, IndexError):
                     pass
+            elif sig.startswith("baseline_ms="):
+                try:
+                    baseline_ms_val = float(sig.split("=")[1])
+                except (ValueError, IndexError):
+                    pass
         return [
             TimingEvidence(
-                baseline_time_ms=0.0,
+                baseline_time_ms=baseline_ms_val,
                 triggered_time_ms=elapsed_ms,
                 delay_threshold_ms=0.0,
                 total_attempts=PROBE_COUNT,
-                description=f"Rate limit burst: {PROBE_COUNT} POSTs in {elapsed_ms / 1000:.2f}s",
+                description=f"Rate limit burst: {PROBE_COUNT} POSTs in {elapsed_ms / 1000:.2f}s (baseline avg: {baseline_ms_val:.0f}ms)",
             ),
         ]
 
     def generate_reproduction(self, f: dict) -> list[str]:
         return [
-            f"Send {PROBE_COUNT} rapid POST requests to {f['url']} in quick succession (with minimal delay between requests)",
+            f"for i in $(seq 1 {PROBE_COUNT}); do curl -X POST '{f['url']}' -d 'username=admin&password=test$i' & done; wait",
             f"None of the {PROBE_COUNT} requests returned HTTP 429 (rate limited) or showed throttling behavior",
-            "Without rate limiting, an attacker can perform brute-force password guessing, credential stuffing, or OTP enumeration at full speed",
+            "Without rate limiting, an attacker can perform brute-force password guessing, credential stuffing, or OTP enumeration at full speed with no account lockout protection",
         ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:

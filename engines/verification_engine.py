@@ -225,6 +225,17 @@ class VerificationEngine:
             if not any("Exploitation proof" in r for r in reasons):
                 reasons.append("+ Exploitation proof demonstrated (VerificationEngine)")
         f["confidence_reasons"] = reasons
+        existing_steps = f.get("steps_to_reproduce", [])
+        if not isinstance(existing_steps, list):
+            existing_steps = [str(existing_steps)] if existing_steps else []
+        if evidence_parts:
+            for part in evidence_parts:
+                step = f"Verification: {part}"
+                if step not in existing_steps:
+                    existing_steps.append(step)
+        if stage == "verified" and not any("Independently verified" in s for s in existing_steps):
+            existing_steps.append("Independently verified via OOB callback or browser execution confirmation")
+        f["steps_to_reproduce"] = existing_steps
         log(f"  [Verify] {f.get('vuln_type', '')} @ {f.get('url', '')} promoted to {stage.upper()} (score={f['confidence_score']})",
             Colors.GREEN)
 
@@ -376,6 +387,8 @@ class VerificationEngine:
         has_output = any("output" in s.lower() or "marker" in s.lower() for s in current_steps)
 
         # Phase 1: Output-based detection
+        baseline_resp = safe_get(self._session, self._inject_param(url, param, "1"), self._timeout, raise_for_status=False)
+        baseline_len = len(baseline_resp.text) if baseline_resp else 0
         if not has_output:
             for payload, marker in CMDI_OUTPUT_PAYLOADS:
                 test_url = self._inject_param(url, param, payload)
@@ -385,8 +398,8 @@ class VerificationEngine:
                         self._promote(f, "exploitable", [f"output:{marker} (payload: {payload[:30]})"])
                         has_output = True
                         break
-                    if not marker and len(resp.text) > 200:
-                        self._promote(f, "validated", [f"output:large_response ({len(resp.text)} bytes)"])
+                    if not marker and len(resp.text) > baseline_len + 200:
+                        self._promote(f, "validated", [f"output:large_response ({len(resp.text)} bytes, baseline {baseline_len})"])
                         has_output = True
                         break
 
@@ -433,6 +446,9 @@ class VerificationEngine:
         if not param or not url:
             return
 
+        baseline_resp = safe_get(self._session, self._inject_param(url, param, "1"), self._timeout, raise_for_status=False)
+        baseline_len = len(baseline_resp.text) if baseline_resp else 0
+
         for path, marker in LFI_PATHS:
             # Try direct and encoded variants
             variants = [path, path.replace("/", "%2F"), path.replace("/", "..%2F")]
@@ -443,10 +459,11 @@ class VerificationEngine:
                     if marker and marker in resp.text:
                         self._promote(f, "exploitable", [f"lfi:file_read {path}"])
                         return
-                    if len(resp.text) > 500:
-                        self._promote(f, "validated", [f"lfi:large_response {path} ({len(resp.text)} bytes)"])
-                    if len(resp.text) > 100:
-                        self._promote(f, "validated", [f"lfi:changed_response {path}"])
+                    delta = len(resp.text) - baseline_len
+                    if delta > 400:
+                        self._promote(f, "validated", [f"lfi:large_response {path} (+{delta}B)"])
+                    elif delta > 50:
+                        self._promote(f, "validated", [f"lfi:changed_response {path} (+{delta}B)"])
 
     def _verify_open_redirect(self, f: Finding) -> None:
         url = f.get("url", "")
@@ -458,7 +475,7 @@ class VerificationEngine:
             target = self.config.get("target", "")
             if final_url != url and not final_url.startswith(target.rstrip("/")):
                 self._promote(f, "validated", [f"redirect:{final_url}"])
-            # Also check for open redirect via common parameters if not already done
+                return
             parsed = urlparse(url)
             params = parse_qs(parsed.query, keep_blank_values=True)
             for param_name, values in params.items():
@@ -466,6 +483,7 @@ class VerificationEngine:
                     if val.startswith(("http://", "https://", "//")):
                         if not val.startswith(target.rstrip("/")):
                             self._promote(f, "validated", [f"redirect_param:{param_name}={val}"])
+                            return
 
     def _try_oob(self, f: Finding, vuln_type: str) -> None:
         if not self.oob_available or not self.oob:
@@ -503,6 +521,7 @@ class VerificationEngine:
             test_url = self._inject_param(url, param, oob_payload)
             safe_get(self._session, test_url, 10, raise_for_status=False)
             self.oob.register_interaction(vuln_type, oob_payload, url)
+            time.sleep(1)
             confirmed = self.oob.poll()
             if confirmed:
                 self._promote(f, "verified", ["oob:callback"])
@@ -517,6 +536,7 @@ class VerificationEngine:
             safe_get(self._session, test_url, 10, raise_for_status=False)
             self.oob.register_interaction(vuln_type, payload, url)
 
+        time.sleep(1)
         confirmed = self.oob.poll()
         if confirmed:
             self._promote(f, "verified", ["oob:callback"])

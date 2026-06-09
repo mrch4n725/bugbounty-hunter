@@ -130,20 +130,67 @@ class CORSScanner(ScannerBase):
         vuln_type = f.get("vuln_type", "")
         if vuln_type == "CORS: Wildcard ACAO":
             return [
-                f"Send GET request to {url} with Origin header set to https://evil.com",
-                "Observe Access-Control-Allow-Origin: https://evil.com in the response — origin is reflected",
-                "An attacker can make authenticated cross-origin requests from any domain",
+                f"curl -X GET '{url}' -H 'Origin: https://evil.com' -I",
+                "Observe Access-Control-Allow-Origin: https://evil.com in the response — origin is reflected from the request header",
+                "An attacker can make authenticated cross-origin requests from any domain via client-side JavaScript, bypassing Same-Origin Policy",
             ]
         if vuln_type == "CORS: Wildcard ACAO with Credentials":
             return [
-                f"Send GET request to {url} with Origin: https://evil.com",
-                "Observe Access-Control-Allow-Origin: https://evil.com and Access-Control-Allow-Credentials: true",
-                "An attacker can make authenticated requests (cookies sent) from any domain via client-side JavaScript",
+                f"curl -X GET '{url}' -H 'Origin: https://evil.com' -I",
+                "Observe Access-Control-Allow-Origin: https://evil.com and Access-Control-Allow-Credentials: true — cookies will be sent cross-origin",
+                "An attacker can exfiltrate sensitive data by making authenticated requests (cookies sent) from any domain via client-side JavaScript",
             ]
         return [
-            f"Send GET request to {url} and inspect CORS headers",
-            "Test with non-standard Origin headers to verify reflection patterns",
+            f"curl -X GET '{url}' -H 'Origin: https://evil.com' -I",
+            "Inspect Access-Control-Allow-Origin in response headers for reflection patterns",
+            "CORS misconfigurations allow attackers to bypass Same-Origin Policy and access protected resources",
         ]
+
+    def _test_credentials_mode(self, url: str) -> list[dict]:
+        """Test if CORS misconfiguration allows credentialed cross-origin reads."""
+        results: list[dict] = []
+        probe_session = make_session(self.config)
+        probe_session.headers.update({"Origin": "https://evil.com"})
+        try:
+            probe_resp = safe_get(probe_session, url, self.timeout)
+            if not probe_resp:
+                return results
+            acao = probe_resp.headers.get("Access-Control-Allow-Origin", "")
+            acac = probe_resp.headers.get("Access-Control-Allow-Credentials", "")
+            if acao == "https://evil.com" and acac.lower() == "true":
+                results.append({
+                    "confirmed": True,
+                    "method": "credentials_confirmed",
+                    "url": url,
+                    "acao": acao,
+                    "credentials": True,
+                    "context": "credentialed_reflection",
+                    "detail": f"Origin reflected with Access-Control-Allow-Credentials: true — attacker can read authenticated responses",
+                })
+            # Test preflight bypass with custom headers
+            preflight_session = make_session(self.config)
+            preflight_session.headers.update({
+                "Origin": "https://evil.com",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "X-Custom-Header",
+            })
+            pre_resp = safe_get(preflight_session, url, self.timeout)
+            if pre_resp:
+                pre_acao = pre_resp.headers.get("Access-Control-Allow-Origin", "")
+                pre_headers = pre_resp.headers.get("Access-Control-Allow-Headers", "")
+                if pre_acao == "https://evil.com" and pre_headers:
+                    results.append({
+                        "confirmed": True,
+                        "method": "preflight_bypass",
+                        "url": url,
+                        "acao": pre_acao,
+                        "allowed_headers": pre_headers,
+                        "context": "preflight_bypass",
+                        "detail": f"Preflight accepted custom headers — XHR with non-simple headers allowed from any origin",
+                    })
+        except Exception:
+            pass
+        return results
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
@@ -160,15 +207,17 @@ class CORSScanner(ScannerBase):
         for url in urls_to_check:
             detections = self.detect(url)
             validations = self.validate(url)
+            credentials_tests = self._test_credentials_mode(url)
 
             resp = safe_get(self.session, url, self.timeout)
-            if not detections and not validations:
+            if not detections and not validations and not credentials_tests:
                 continue
 
             for d in detections:
                 matched_v = [v for v in validations if v["confirmed"] and v["url"] == url]
+                cred = any(c for c in credentials_tests if c["confirmed"] and c["url"] == url)
                 if d.context == "wildcard_acao":
-                    stage = VerificationStage.EXPLOITABLE.value if any(v.get("credentials") for v in matched_v) else VerificationStage.DETECTED.value
+                    stage = VerificationStage.EXPLOITABLE.value if (any(v.get("credentials") for v in matched_v) or cred) else VerificationStage.DETECTED.value
                 else:
                     stage = VerificationStage.VALIDATED.value if matched_v else VerificationStage.DETECTED.value
 
@@ -204,19 +253,41 @@ class CORSScanner(ScannerBase):
                 )
                 if f:
                     self._enrich_finding(f, 0, f["verification_stage"])
-                    if matched_v:
-                        # Store validation evidence
-                        for v in matched_v:
-                            fp = f.get("fingerprint", "")
-                            if fp:
-                                req_ev = HttpRequestEvidence(
-                                    method="GET",
-                                    url=url,
-                                    curl_command=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
-                                )
-                                self.evidence_engine.store(req_ev)
-                                self.evidence_engine.link_to_finding(req_ev, fp)
+                    if matched_v or cred:
+                        fp = f.get("fingerprint", "")
+                        if fp:
+                            req_ev = HttpRequestEvidence(
+                                method="GET",
+                                url=url,
+                                curl_command=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
+                            )
+                            self.evidence_engine.store(req_ev)
+                            self.evidence_engine.link_to_finding(req_ev, fp)
                     self._add_finding(f)
                     log(f"  [CORS] {url} — {vuln_type}", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+
+        if credentials_tests:
+            for ct in credentials_tests:
+                if not ct["confirmed"]:
+                    continue
+                curl_cmd = _build_curl("GET", ct["url"], {"Origin": "https://evil.com"}, cookies=safe_cookies_dict(self.session.cookies))
+                f = finding(
+                    vuln_type="CORS: Credentialed Cross-Origin Bypass",
+                    url=ct["url"],
+                    severity="critical",
+                    details=ct["detail"],
+                    evidence=f"ACAO: {ct.get('acao', '')} | Credentials: true",
+                    request=curl_cmd,
+                    response_excerpt="",
+                    verification_stage=VerificationStage.VERIFIED.value,
+                    steps_to_reproduce=[
+                        f"Send GET to {ct['url']} with Origin: https://evil.com",
+                        f"Observe Access-Control-Allow-Origin: https://evil.com with Access-Control-Allow-Credentials: true",
+                        "An attacker's JavaScript can read authenticated cross-origin responses including CSRF tokens and user data",
+                    ],
+                )
+                if f:
+                    self._add_finding(f)
+                    log(f"  [CORS CRED] {ct['url']} — credentialed bypass confirmed", Colors.RED, verbose_only=True, verbose=self.verbose)
 
         return self._get_findings()

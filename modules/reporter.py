@@ -7,6 +7,7 @@ from modules.reporter import Reporter.
 
 import json
 import os
+import shutil
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 
@@ -128,6 +129,35 @@ class Reporter:
             Path(self.output_dir).mkdir(parents=True, exist_ok=True)
             reporter = self._resolve_format()
             reporter.findings = reporter._dedupe_findings()
+
+            # Collect screenshot artifacts into output_dir/screenshots/
+            artifacts_dir = os.path.join(self.output_dir, "screenshots")
+            for f in reporter.findings:
+                for path_attr in ("screenshot_path",):
+                    src = f.get(path_attr, "")
+                    if not src or not os.path.isfile(src):
+                        continue
+                    try:
+                        os.makedirs(artifacts_dir, exist_ok=True)
+                        dst = os.path.join(artifacts_dir, os.path.basename(src))
+                        if os.path.abspath(src) != os.path.abspath(dst):
+                            shutil.copy2(src, dst)
+                    except Exception:
+                        pass
+                ev_list = f.get("evidence", "")
+                if isinstance(ev_list, list):
+                    for ev in ev_list:
+                        for ev_attr in ("screenshot_path", "file_path"):
+                            ev_path = getattr(ev, ev_attr, "") if hasattr(ev, ev_attr) else ""
+                            if not ev_path or not os.path.isfile(ev_path):
+                                continue
+                            try:
+                                os.makedirs(artifacts_dir, exist_ok=True)
+                                dst = os.path.join(artifacts_dir, os.path.basename(ev_path))
+                                if os.path.abspath(ev_path) != os.path.abspath(dst):
+                                    shutil.copy2(ev_path, dst)
+                            except Exception:
+                                pass
 
             # Re-aggregate root cause groups after dedup (ReporterBase.__init__
             # computed them from the pre-dedup list, making them stale).

@@ -103,41 +103,94 @@ class DirectoryFuzzScanner(ScannerBase):
         vuln_type = f.get("vuln_type", "")
         if vuln_type == "Directory Listing Enabled":
             return [
-                f"Send GET request to {url}",
-                "Server responds with HTTP 200 — the path exists and is publicly accessible",
-                "Directory listing is enabled — browse available files in the response",
+                f"curl -X GET '{url}'",
+                "Server responds with HTTP 200 and a directory listing — browse available files in the response",
+                "Directory listing exposes the full file tree: source code, backups, configuration files, and potentially credentials",
             ]
         if vuln_type == "Exposed Common Path":
             return [
-                f"Send GET request to {url}",
+                f"curl -X GET '{url}'",
                 "Server responds with HTTP 200 — the path exists and is publicly accessible",
-                "Review the returned content for sensitive information",
+                "Review the returned content for sensitive information that should not be publicly exposed",
             ]
         if vuln_type == "Forbidden Path (Access Control Exists)":
             return [
-                f"Send GET request to {url}",
+                f"curl -X GET '{url}'",
                 "Server responds with HTTP 403 — the path exists but access is restricted",
                 "Try different HTTP methods, authentication headers, or path variations to bypass access control",
             ]
         return [
-            f"Send GET request to {url}",
+            f"curl -X GET '{url}'",
             "Server responds with HTTP 401 — the path requires valid authentication credentials",
             "Try common credentials, default passwords, or check if the authentication can be bypassed",
         ]
+
+    def _compute_baseline(self) -> tuple[str | None, int]:
+        """Fetch a non-existent path and store its content fingerprint for soft-404 comparison."""
+        import hashlib
+        marker = hashlib.md5(self.base_url.encode()).hexdigest()[:8]
+        non_existent = f"{self.base_url.rstrip('/')}/bbh_404_{marker}"
+        try:
+            resp = safe_get(self.session, non_existent, self.timeout, raise_for_status=False)
+            if resp:
+                return hashlib.md5(resp.text.encode()).hexdigest(), len(resp.text)
+        except Exception:
+            pass
+        return None, 0
+
+    @staticmethod
+    def _jaccard_similarity(text_a: str, text_b: str) -> float:
+        set_a = set(text_a.lower().split())
+        set_b = set(text_b.lower().split())
+        if not set_a and not set_b:
+            return 1.0
+        intersection = set_a & set_b
+        union = set_a | set_b
+        return len(intersection) / len(union) if union else 0.0
+
+    def _is_soft_404(self, resp, baseline_fp: str | None, baseline_size: int) -> bool:
+        """Check if response resembles a soft 404 (same as baseline)."""
+        if baseline_fp is None:
+            return False
+        import hashlib
+        cur_hash = hashlib.md5(resp.text.encode()).hexdigest()
+        if cur_hash == baseline_fp:
+            return True
+        if baseline_size > 0:
+            size_ratio = abs(len(resp.text) - baseline_size) / max(baseline_size, 1)
+            if size_ratio < 0.1:
+                return True
+        return False
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         urls = self.recon.get("urls", [])
         base = urlparse(self.base_url).netloc
         if not base:
             return self._get_findings()
-        paths = list(COMMON_DIRFUZZ_PATHS)
+        baseline_fp, baseline_size = self._compute_baseline()
+        # Load built-in wordlist from payloads/directory_fuzz.txt
+        import os as _os
+        builtin_wordlist = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "payloads", "directory_fuzz.txt")
+        paths = []
+        if _os.path.exists(builtin_wordlist):
+            try:
+                with open(builtin_wordlist, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            paths.append(line)
+            except Exception:
+                paths = list(COMMON_DIRFUZZ_PATHS)
+        else:
+            paths = list(COMMON_DIRFUZZ_PATHS)
+        # If custom wordlist specified in config, merge additional paths
         custom_wordlist = self.config.get("wordlist")
         if custom_wordlist:
             try:
                 with open(custom_wordlist, "r", encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
-                        if line and line not in paths:
+                        if line and not line.startswith("#") and line not in paths:
                             paths.append(line)
             except Exception:
                 pass
@@ -151,9 +204,13 @@ class DirectoryFuzzScanner(ScannerBase):
                 if detection is None:
                     continue
 
+                resp = detection.raw_response
+                if resp and self._is_soft_404(resp, baseline_fp, baseline_size):
+                    log(f"  [DIRB] {target_url} — skipped (soft 404)", Colors.WHITE, verbose_only=True, verbose=self.verbose)
+                    continue
+
                 validation_result = self.validate(detection)
                 evidence_list = self.collect_evidence(detection, validation_result)
-                resp = detection.raw_response
 
                 for ev in evidence_list:
                     self.evidence_engine.store(ev)

@@ -7,7 +7,7 @@ the **Legacy Runtime** (`VulnScanner` inline methods in `modules/scanner.py`)
 and the **New Runtime** (25 `ScannerBase` subclasses in `scanners/` +
 `VerificationEngine` + `EvidenceEngine` + `ApplicationContainer`).
 
-The new runtime is **functionally complete** — all 25 scanners exist, all 214
+The new runtime is **functionally complete** — all 25 scanners exist, all 259
 tests pass — and `main.py` routes through `module_map` dict
 pointing to `VulnScanner.scan_*` methods. Every `scan_*` method is a router
 that tries `_dispatch_to_scanner()` first, then falls back to its own inline
@@ -309,7 +309,7 @@ Bootstrap → Container → Scanner Lifecycle → Validation → Evidence → Re
 
 ## 8. Verification Strategy
 
-1. After each phase, run `python3 tests/run.py` (214 tests must pass)
+1. After each phase, run `python3 tests/run.py` (259 tests must pass)
 2. Phase 2 cross-check: add `--compare-scanners` mode that runs both
    `_dispatch_to_scanner()` AND inline logic, diffs findings, warns on mismatches
 3. Full integration: `python3 main.py --target http://testphp.vulnweb.com --auto`

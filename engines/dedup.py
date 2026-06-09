@@ -41,6 +41,22 @@ class DeduplicationEngine:
                 results.append(f)
             return results
 
+    def to_dict(self) -> dict[str, dict]:
+        """Serialize dedup state to a dict of fingerprint → finding dicts."""
+        with self._lock:
+            return {fp: finding.to_dict() for fp, finding in self._groups.items()}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, dict]) -> "DeduplicationEngine":
+        """Restore dedup state from a dict of fingerprint → finding dicts."""
+        engine = cls()
+        for fp, d in data.items():
+            finding = Finding.from_dict(d)
+            if finding.fingerprint != fp:
+                finding.fingerprint = fp
+            engine._groups[fp] = finding
+        return engine
+
     def clear(self) -> None:
         with self._lock:
             self._groups.clear()

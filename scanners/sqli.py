@@ -198,14 +198,14 @@ class SQLiScanner(ScannerBase):
         if is_post:
             content_type = "JSON" if "JSON" in detection.param else "XML" if "XML" in detection.param else "form"
             return [
-                f"Send POST request to {detection.url} with Content-Type: application/{content_type.lower()} and a SQL injection payload in the body",
-                f"Observe signal: {signal_detail}",
-                "Compare POST response against baseline — SQL error messages confirm injection",
+                f"curl -X POST '{detection.url}' -H 'Content-Type: application/{content_type.lower()}' -d '{{\"query\":\"test\\' OR 1=1--\"}}'",
+                f"Observe signal: {signal_detail} — SQL error messages confirm injection",
+                "An attacker can extract the entire database: credentials, PII, financial records, and other sensitive data",
             ]
         return [
-            f"Send GET request to {detection.url} with SQL injection payload in parameter '{detection.param}'",
-            f"Observe signal: {signal_detail}",
-            "Compare response against baseline — SQL error messages, timing delays, or boolean condition differences confirm injection",
+            f"curl -X GET '{detection.url}?{detection.param}=test%27%20OR%201%3D1--'",
+            f"Observe signal: {signal_detail} — SQL error messages, timing delays, or boolean condition differences confirm injection",
+            "An attacker can extract the entire database: credentials, PII, financial records, and other sensitive data",
         ]
 
     # ── Scan entry point ────────────────────────────────────────────────
@@ -330,9 +330,12 @@ class SQLiScanner(ScannerBase):
                         break
 
         baseline_start = time.time()
-        safe_get(self.session, url, 15, raise_for_status=False)
+        baseline_resp = safe_get(self.session, url, 15, raise_for_status=False)
         baseline_delay = time.time() - baseline_start
+        if baseline_resp is None:
+            baseline_delay = 1.0
         baseline_ms = baseline_delay * 1000
+        min_time_threshold = max(baseline_delay + 4, 5.0)
         for payload in payloads.get("time_based", []):
             test_url = self._inject_param(url, param, payload)
             delays = []
@@ -342,7 +345,7 @@ class SQLiScanner(ScannerBase):
                 time_resp = safe_get(self.session, test_url, 15, raise_for_status=False)
                 delays.append(time.time() - start)
             min_delay = min(delays)
-            if min_delay > baseline_delay + 4 and all(d > baseline_delay + 3 for d in delays):
+            if min_delay > min_time_threshold and all(d > max(baseline_delay + 3, 4.0) for d in delays):
                 signals["time"] = True
                 triggered_ms = min_delay * 1000
                 timing_evidence = TimingEvidence(

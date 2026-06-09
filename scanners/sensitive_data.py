@@ -40,6 +40,18 @@ class SensitiveDataScanner(ScannerBase):
     SCANNER_MATURITY = 4
     TARGET_LEVEL = False
 
+    @staticmethod
+    def _shannon_entropy(value: str) -> float:
+        """Compute Shannon entropy of a string. Low entropy (< 3.5) suggests FP."""
+        if not value:
+            return 0.0
+        import math
+        freq = {}
+        for c in value:
+            freq[c] = freq.get(c, 0) + 1
+        entropy = -sum((count / len(value)) * math.log2(count / len(value)) for count in freq.values())
+        return round(entropy, 2)
+
     def detect(self, url: str, parameter: str | None = None) -> DetectionResult | None:
         parsed_path = urlparse(url).path.lower()
         if any(parsed_path.endswith(ext) for ext in STATIC_EXTENSIONS):
@@ -52,13 +64,17 @@ class SensitiveDataScanner(ScannerBase):
             match = pattern.search(body)
             if match:
                 value = match.group(0)[:120]
+                entropy = self._shannon_entropy(value)
+                if entropy < 3.5:
+                    log(f"  [SENSITIVE] {url} — skipped '{label}' due to low entropy ({entropy})", Colors.WHITE, verbose_only=True, verbose=self.verbose)
+                    continue
                 return DetectionResult(
                     url=url,
                     parameter="",
                     payload=value,
                     context=label,
                     raw_response=resp,
-                    evidence_signals=[f"Matched: {label}: {value}"],
+                    evidence_signals=[f"Matched: {label}: {value} (entropy={entropy})"],
                 )
         return None
 
@@ -129,9 +145,9 @@ class SensitiveDataScanner(ScannerBase):
                 pattern_str = str(pat.pattern)
                 break
         return [
-            f"Send GET request to {url}",
-            f"Search response body for {label} matching: {pattern_str}",
-            f"Rotate exposed credentials immediately — they can be used for lateral attacks",
+            f"curl -X GET '{url}'",
+            f"Search response body for {label} matching: {pattern_str} — pattern hit confirms exposure",
+            f"Rotate exposed credentials immediately — they can be used for lateral attacks, account takeover, and data breaches",
         ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:

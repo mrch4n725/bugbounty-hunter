@@ -160,7 +160,7 @@ class ChatGPTReporter(ReporterBase):
             param = f.get("parameter", "")
             response_excerpt = f.get("response_excerpt", "")
             request = f.get("request", "")
-            steps = f.get("steps_to_reproduce", [])
+            steps = f.get("steps_to_reproduce") or f.get("validation_steps", [])
             evidence_raw = f.get("evidence", "")
 
             content += f"## {i}. {title}\n\n"
@@ -223,7 +223,7 @@ class ChatGPTReporter(ReporterBase):
             else:
                 evidence_serialised = str(evidence_raw) if evidence_raw else ""
 
-            steps = f.get("steps_to_reproduce", [])
+            steps = f.get("steps_to_reproduce") or f.get("validation_steps", [])
             if not isinstance(steps, list):
                 steps = [str(steps)] if steps else []
 

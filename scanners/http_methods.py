@@ -124,9 +124,9 @@ class HttpMethodsScanner(ScannerBase):
 
     def generate_reproduction(self, f: dict) -> list[str]:
         return [
-            f"Send OPTIONS request to {f['url']} and inspect the Allow header",
-            f"Server advertises dangerous methods: {f.get('evidence', '')}",
-            f"Test each method (e.g., curl -X PUT {f['url']}) to verify it is actually enabled, not just advertised",
+            f"curl -X OPTIONS '{f['url']}' -I",
+            f"Server advertises dangerous methods: {f.get('evidence', '')} — verify with: curl -X PUT '{f['url']}' -d 'test'",
+            "Dangerous HTTP methods (PUT, DELETE, TRACE, PATCH) can allow attackers to modify or delete server resources if actually enabled",
         ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:

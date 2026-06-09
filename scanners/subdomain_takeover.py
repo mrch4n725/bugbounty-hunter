@@ -39,8 +39,10 @@ TAKEOVER_SIGNATURES: dict[str, list[str]] = {
         "No such app", "There's nothing here, yet.",
     ],
     "Azure": [
-        "The requested URL was not found on this server.",
-        "A DNS leak or misconfiguration",
+        "There is no site configured at this address",
+        "The web you are trying to access is not available",
+        "the hostname you are trying to reach is not configured",
+        "did not find a resource associated with this hostname",
     ],
     "Cloudfront": [
         "NoSuchCloudFrontDistribution",
@@ -77,6 +79,28 @@ TAKEOVER_SIGNATURES: dict[str, list[str]] = {
     "Unbounce": [
         "The page you requested was not found",
     ],
+    "Fly.io": [
+        "Page not found",
+        "404 Not Found - Fly",
+    ],
+    "Render": [
+        "Render",
+        "Redirecting to 404",
+    ],
+    "Railway": [
+        "There is nothing here, yet.",
+        "404 - Nothing here",
+    ],
+    "Vercel": [
+        "The page could not be found",
+        "404: NOT_FOUND",
+        "Vercel",
+    ],
+    "Pantheon": [
+        "The gods are angry",
+        "pantheon",
+        "This site is not configured",
+    ],
 }
 
 FLAT_SIGNATURES: list[str] = []
@@ -99,6 +123,11 @@ SERVICE_CNAME_PATTERNS: dict[str, list[str]] = {
     "Bitbucket": [".bitbucket.io"],
     "Campaign Monitor": [".createsend.com"],
     "Unbounce": [".unbouncepages.com"],
+    "Fly.io": [".fly.dev", ".fly.io"],
+    "Render": [".onrender.com"],
+    "Railway": [".railway.app"],
+    "Vercel": [".vercel.app", "cname.vercel-dns.com"],
+    "Pantheon": [".pantheonsite.io", ".pantheon.io"],
 }
 
 
@@ -251,10 +280,11 @@ class SubdomainTakeoverScanner(ScannerBase):
         ]
 
     def generate_reproduction(self, f: dict) -> list[str]:
+        host = f['url'].split("/")[2]
         return [
-            f"Send GET request to {f['url']}",
-            f"Response contains takeover fingerprint: '{f.get('evidence', '')}'",
-            "The DNS CNAME points to an unclaimed or expired external service — register the external resource to claim the subdomain",
+            f"curl -X GET '{f['url']}' -H 'Host: {host}'",
+            f"Response contains takeover fingerprint: '{f.get('evidence', '')}' — the DNS CNAME points to an unclaimed external service",
+            "An attacker who registers the unclaimed external resource can serve arbitrary content under the victim's subdomain, enabling phishing, session hijacking, and complete loss of subdomain integrity",
         ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:

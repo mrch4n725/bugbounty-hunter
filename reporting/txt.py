@@ -100,9 +100,10 @@ class TXTReporter(ReporterBase):
                     lines.append(f"    Request     : {f['request']}")
                 if f.get('response_excerpt'):
                     lines.append(f"    Response    : {f['response_excerpt'][:300]}")
-                if f.get('screenshot_path'):
-                    lines.append(f"    Screenshot  : {f['screenshot_path']}")
-                steps = f.get('validation_steps') or f.get('steps_to_reproduce', [])
+                scr_path = f.get('screenshot_path', '')
+                if scr_path and ReporterBase._validate_screenshot_path(scr_path):
+                    lines.append(f"    Screenshot  : {scr_path}")
+                steps = f.get('steps_to_reproduce') or f.get('validation_steps', [])
                 if steps:
                     for s in steps[:5]:
                         lines.append(f"    ⬩ {s}")

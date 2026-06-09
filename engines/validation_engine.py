@@ -1,3 +1,4 @@
+import json
 import time
 import threading
 from typing import Any
@@ -90,28 +91,39 @@ class ValidationEngine:
             return ""
         return self._oob.generate_payload(placeholder)
 
-    def register_oob(self, vuln_type: str, payload: str, url: str) -> None:
+    def register_oob(self, vuln_type: str, payload: str, url: str,
+                     fingerprint: str = "") -> None:
         if self._oob is None:
             return
-        self._oob.register_interaction(vuln_type, payload, url)
+        self._oob.register_interaction(vuln_type, payload, url, fingerprint)
 
-    def poll_oob(self, timeout: float = 5.0) -> list[OOBCallbackEvidence]:
-        """Poll for OOB callbacks and return structured evidence."""
+    def poll_oob(self, timeout: float = 120.0) -> list[OOBCallbackEvidence]:
+        """Poll for OOB callbacks and return structured evidence.
+
+        Every returned OOBCallbackEvidence is populated with:
+          callback_type, callback_host, callback_token,
+          interaction_time (entry timestamp), raw_data (full entry dict).
+        """
         if self._oob is None:
             return []
         confirmed = self._oob.poll(timeout=timeout)
         results: list[OOBCallbackEvidence] = []
         for entry in confirmed:
+            entry_ts = entry.get("timestamp", time.time())
+            if isinstance(entry_ts, (int, float)):
+                interaction_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(entry_ts))
+            else:
+                interaction_time = str(entry_ts)
+
             ev = OOBCallbackEvidence(
-                callback_type="dns",
-                callback_host=entry.get("payload", ""),
-                callback_token=self._oob.callback_token,
-                interaction_time=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                raw_data=str(entry),
-                description=f"OOB callback confirmed for {entry.get('vuln_type', 'unknown')} @ {entry.get('url', '')}",
+                callback_type="dns" if self._oob._dnslog_domain else "http",
+                callback_host=self._oob.callback_host,
+                callback_token=entry.get("token", self._oob.callback_token),
+                interaction_time=interaction_time,
+                raw_data=json.dumps(entry, default=str),
+                description=f"OOB callback confirmed @ {entry.get('url', '')}",
                 status=EvidenceStatus.VERIFIED,
             )
-            # Store original target URL for finding creation
             ev._original_url = entry.get("url", "")
             results.append(ev)
         return results

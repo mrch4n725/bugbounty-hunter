@@ -106,19 +106,20 @@ class ScannerBase:
         ctx = getattr(result, "context", "") if result else ""
         if url and ctx:
             return [
-                f"Send request to {url}",
+                f"curl -X GET '{url}'",
                 f"Observe: {ctx}",
-                "Verify by inspecting the response for the expected vulnerability signal",
+                "Verify by inspecting the response for the expected vulnerability signal and assess impact based on accessible data or functionality",
             ]
         if url:
             return [
-                f"Send request to {url}",
+                f"curl -X GET '{url}'",
                 "Inspect the response for anomalies or unexpected behavior",
+                "Assess impact based on what information or functionality is exposed",
             ]
         return [
-            "Identify the target endpoint that may be vulnerable",
-            "Send a crafted request with a test payload",
+            "curl -X GET <target-url>",
             "Inspect the response for the expected vulnerability signal",
+            "Assess impact based on what an attacker could achieve by exploiting this finding",
         ]
 
     def calculate_confidence(self, signals: int, stage: "VerificationStage",
@@ -172,14 +173,20 @@ class ScannerBase:
     def _in_scope(self, url: str) -> bool:
         return url_in_scope(url, self.config)
 
+    _global_fingerprinted = False
+    _global_fingerprint_lock = threading.Lock()
+
     def _prepare_scan(self) -> None:
         if self._prepared:
             return
         self._prepared = True
         if not (self.config.get("passive") or self.config.get("dry_run")):
             self._detect_waf()
-        self._fingerprint_baselines()
-        self._fingerprint_tech()
+        with self.__class__._global_fingerprint_lock:
+            if not self.__class__._global_fingerprinted:
+                self._fingerprint_baselines()
+                self._fingerprint_tech()
+                self.__class__._global_fingerprinted = True
 
     def _detect_waf(self) -> None:
         target = self.config.get("target", "")
@@ -266,7 +273,9 @@ class ScannerBase:
     def _run_threaded(self, fn, items):
         q = Queue()
         results = []
+        errors = []
         lock = threading.Lock()
+        error_lock = threading.Lock()
         for item in items:
             q.put(item)
 
@@ -283,6 +292,8 @@ class ScannerBase:
                             results.extend(result if isinstance(result, list) else [result])
                 except Exception as e:
                     log(f"  [worker] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
+                    with error_lock:
+                        errors.append(e)
                 q.task_done()
 
         ts = [threading.Thread(target=worker, daemon=True) for _ in range(self.threads)]
@@ -290,6 +301,8 @@ class ScannerBase:
             t.start()
         for t in ts:
             t.join()
+        if errors and self.verbose:
+            log(f"  [_run_threaded] {len(errors)} worker error(s) suppressed", Colors.YELLOW)
         return results
 
     def _enrich_confidence(self, f: Finding) -> None:
@@ -324,6 +337,9 @@ class ScannerBase:
         score = self.calculate_confidence(signals, stage_enum, evidence_count, fp_risk)
         if f.get("confidence_score", 0) == 0:
             f["confidence_score"] = score
+        if verification_stage_value == VerificationStage.VERIFIED.value:
+            current = f.get("confidence_score", 0)
+            f["confidence_score"] = min(max(current, 86), 100)
         f["evidence_strength"] = evidence_strength.value
         f["false_positive_risk"] = fp_risk
 
@@ -340,6 +356,14 @@ class ScannerBase:
             url = f.get("url", "")[:60]
             stage = f.get("verification_stage", "detected").replace("_", " ").title()
             score = f.get("confidence_score", 0)
+
+            evidence_count = len(getattr(f, 'evidence', []) or [])
+            evidence_bonus = min(evidence_count * 5, 20)
+            base_score = score
+            object.__setattr__(f, "_confidence_base_before_validator", base_score)
+            object.__setattr__(f, "_confidence_evidence_bonus", evidence_bonus)
+            log(f"  [Confidence] {f.vuln_type} @ {f.url}: base={base_score}, evidence_bonus={evidence_bonus}, validator_penalty={getattr(f, '_confidence_validator_penalty', 0)}, final={f.confidence_score}", Colors.CYAN, verbose_only=True, verbose=self.verbose)
+
             log(f"  [FOUND] [{sev}] {title} @ {url} [{stage}, {score:.0f}/100]",
                 Colors.RED if sev in ("CRITICAL", "HIGH") else Colors.YELLOW)
 

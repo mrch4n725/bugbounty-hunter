@@ -54,19 +54,71 @@ class ExposedFilesScanner(ScannerBase):
     @staticmethod
     def _validate_content(path: str, body: str, raw: bytes) -> bool:
         ext = path.lower()
+        # Config / dotenv files
         if ".env" in ext:
             return "=" in body
         if "/.git/config" in ext:
             return "[core]" in body
+
+        # PHP files
+        if "wp-config.php" in ext or "wp-config.php.bak" in ext:
+            return "<?php" in body or "DB_NAME" in body or "wp-config" in body
+        if "config.php" in ext:
+            return "<?php" in body
         if "phpinfo" in ext:
             return "PHP Version" in body
+
+        # Apache configuration
+        if ".htpasswd" in ext:
+            return ":" in body  # user:password format
+        if ".htaccess" in ext:
+            return any(d in body for d in ("RewriteRule", "RewriteEngine", "Deny from", "Allow from",
+                                           "Order allow", "Order deny", "ErrorDocument", "Redirect",
+                                           "AuthType", "AuthName", "Require"))
+
+        # Docker / container files
+        if "dockerfile" in ext:
+            return any(d in body for d in ("FROM ", "RUN ", "CMD ", "COPY ", "WORKDIR", "EXPOSE ", "ENV "))
+        if "docker-compose" in ext and ".yml" in ext:
+            return any(d in body for d in ("version:", "services:", "image:", "volumes:", "networks:"))
+        if ".dockerignore" in ext:
+            return len(body.strip()) > 3
+
+        # XML-based config files
+        if ext.endswith(".xml"):
+            return body.lstrip().startswith("<?xml") or body.lstrip().startswith("<")
+        if "web.config" in ext:
+            return "<configuration>" in body or "<?xml" in body
+        if "pom.xml" in ext:
+            return "<project" in body or "<?xml" in body
+
+        # Cloud credentials
+        if ".aws/credentials" in ext:
+            return "[default]" in body or "aws_access_key_id" in body
+        if ".aws/config" in ext:
+            return "[" in body and "=" in body
+
+        # SSH private keys
+        if ".ssh/id_rsa" in ext:
+            return body.startswith("-----BEGIN") or "PRIVATE KEY" in body or "OPENSSH" in body
+
+        # Generic secret / password files
+        if "secrets" in ext or "password" in ext:
+            return "=" in body or ":" in body
+
+        # Binary archives
         if ext.endswith(".zip"):
             return raw[:2] == b"PK"
         if ext.endswith(".gz") or ext.endswith(".tar.gz"):
             return raw[:2] == b"\x1f\x8b"
+
+        # SQL backups
         if ext.endswith(".sql"):
             return any(body.lstrip().startswith(w) for w in ("-- ", "CREATE", "INSERT", "DROP", "ALTER", "SELECT"))
-        return True
+
+        # Catch-all: for paths without a specific validator, still check that
+        # the body has meaningful content (not just whitespace/empty)
+        return bool(body.strip())
 
     def detect(self, url: str, parameter: str | None = None) -> DetectionResult | None:
         resp = safe_get(self.session, url, self.timeout, raise_for_status=False)
@@ -118,13 +170,14 @@ class ExposedFilesScanner(ScannerBase):
         stage = f.get("verification_stage", "detected")
         if stage == "validated":
             return [
-                f"Send GET request to {url}",
-                f"Observe: Sensitive file is publicly accessible (HTTP 200, content validated)",
-                "Sensitive files should not be publicly accessible",
+                f"curl -X GET '{url}'",
+                f"Observe: Sensitive file is publicly accessible (HTTP 200, content validated) — contains potentially sensitive information",
+                "Sensitive files should not be publicly accessible; they can leak credentials, source code, API keys, or business logic",
             ]
         return [
-            f"Send GET request to {url}",
+            f"curl -X GET '{url}'",
             "Inspect the HTTP 200 response for exposed sensitive content",
+            "Publicly accessible sensitive files can leak credentials, source code, or business logic to attackers",
         ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:

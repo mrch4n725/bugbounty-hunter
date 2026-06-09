@@ -152,6 +152,9 @@ class EvidenceCompletenessValidator:
         new_score = max(0, base_score - cls.CONFIDENCE_PENALTY)
         finding.confidence_score = new_score
 
+        # Track penalty for confidence breakdown logging
+        object.__setattr__(finding, "_confidence_validator_penalty", cls.CONFIDENCE_PENALTY)
+
         # Mark as partially validated
         from models.finding import VerificationStage
         finding.verification_stage = VerificationStage.PARTIALLY_VALIDATED.value

@@ -696,15 +696,24 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     # collected via all_findings_local and merged in Step 5.
     per_url_modules = {k: v for k, v in module_map.items() if k not in TARGET_LEVEL}
 
-    # Resume support: load completed URLs from scan state
+    # Resume support: load completed URLs + dedup state from scan state
     resume_file = os.path.join(config.get("output_dir", "reports"), ".scan_state.json")
     completed_urls: set[str] = set()
+    saved_findings: list[dict] = []
     if config.get("resume"):
         try:
             with open(resume_file, "r") as f:
                 state = json.load(f)
             completed_urls = set(state.get("completed_urls", []))
-            log(f"[*] Resume mode: {len(completed_urls)} URLs already scanned, skipping", Colors.CYAN)
+            saved_findings = state.get("findings", [])
+            # Restore dedup state if findings were saved
+            if saved_findings and hasattr(scanner, 'dedup'):
+                scanner.dedup = DeduplicationEngine.from_dict(
+                    {f["fingerprint"]: f for f in saved_findings}
+                )
+                log(f"[*] Resume mode: {len(completed_urls)} URLs skipped, {len(saved_findings)} previous findings restored", Colors.CYAN)
+            else:
+                log(f"[*] Resume mode: {len(completed_urls)} URLs already scanned, skipping", Colors.CYAN)
         except (FileNotFoundError, json.JSONDecodeError):
             log("[*] No scan state found, starting fresh", Colors.CYAN)
 
@@ -762,8 +771,13 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
             # Persist scan state after each URL
             try:
                 os.makedirs(os.path.dirname(resume_file), exist_ok=True)
+                state = {
+                    "completed_urls": list(completed_urls),
+                    "target": config.get("target"),
+                    "findings": list(scanner.dedup.to_dict().values()) if hasattr(scanner, 'dedup') else [],
+                }
                 with open(resume_file, "w") as f:
-                    json.dump({"completed_urls": list(completed_urls), "target": config.get("target")}, f)
+                    json.dump(state, f)
             except Exception:
                 pass
 
@@ -832,6 +846,12 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     with lock:
         all_findings.clear()
         all_findings.extend(updated)
+
+    # ── Evidence orphan detection ──
+    if evidence_engine is not None:
+        orphaned = evidence_engine.get_orphaned_evidence()
+        log(f"[*] Evidence engine: {len(orphaned)} orphaned evidence items (not linked to any finding)",
+            Colors.CYAN, verbose_only=True, verbose=config.get("verbose", False))
 
     if oob_poller:
         oob_poller.stop()
@@ -1000,6 +1020,9 @@ def main():
 def run(config: dict) -> int:
 
     # ── Capability-driven startup ────────────────────────────────────────
+    # Enable SQLite-backed evidence persistence with WAL mode
+    output_dir = config.get("output_dir", "reports")
+    config.setdefault("evidence_db_path", os.path.join(output_dir, "evidence.db"))
     capabilities, container = bootstrap(config)
     config = auto_upgrade_config(config, capabilities)
     print_startup_summary(capabilities)
@@ -1249,7 +1272,6 @@ def run(config: dict) -> int:
     if default_cred:
         duser, dpass = default_cred
         from modules.utils import finding
-        from models.finding import Finding
         dc_url = login_url or config["target"]
         df = finding(
             vuln_type="Default Credentials",

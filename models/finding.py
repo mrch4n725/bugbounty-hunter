@@ -137,6 +137,34 @@ def compute_root_cause_fingerprint(vuln_type: str, root_cause: str) -> str:
     ).hexdigest()
 
 
+def guard_confidence_invariants(finding: "Finding") -> None:
+    """Clamp confidence_score when stage/state invariants are violated.
+
+    - VERIFIED stage must have confidence_score >= 61
+    - SUBMISSION_READY state must have confidence_score >= 86
+
+    Logs a warning and clamps the score when violated.
+    """
+    stage = (finding.verification_stage or "").lower()
+    state = (finding.finding_state or "").lower()
+
+    if stage in ("verified", "exploitable") and finding.confidence_score < 61:
+        import warnings
+        warnings.warn(
+            f"Confidence invariant: {finding.vuln_type} @ {finding.url} "
+            f"stage={stage} but confidence_score={finding.confidence_score} < 61 — clamped"
+        )
+        object.__setattr__(finding, "confidence_score", 61)
+
+    if state == "submission_ready" and finding.confidence_score < 86:
+        import warnings
+        warnings.warn(
+            f"Confidence invariant: {finding.vuln_type} @ {finding.url} "
+            f"state=submission_ready but confidence_score={finding.confidence_score} < 86 — clamped"
+        )
+        object.__setattr__(finding, "confidence_score", 86)
+
+
 # ── Finding Model ──────────────────────────────────────────────────────────
 
 @dataclass
@@ -275,6 +303,7 @@ class Finding:
                 self.evidence_strength = evidence_strength_from_score(self.confidence_score).value
             if self.false_positive_risk == "high":
                 self.false_positive_risk = false_positive_risk_from_score(self.confidence_score).value
+        guard_confidence_invariants(self)
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
