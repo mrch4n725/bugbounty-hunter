@@ -19,14 +19,14 @@ Each scanner is assessed across five dimensions (0–5):
 | 1 | **XSS** | 4 | 4 | 5 | 4 | 3 | 1 | HttpRequest, HttpResponse, ResponseExcerpt, BrowserExecution, Screenshot | Yes | Yes | No confidence_score |
 | 2 | **SQLi** | 4 | 4 | 4 | 4 | 2 | 1 | Timing, HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score; timing evidence only for time-based |
 | 3 | **SSRF** | 4 | 4 | 3 | 0 | 2 | 3 | **None** | **No** | **No** | **CRITICAL: No typed evidence at all** — uses only OOB poll but doesn't store OOBCallbackEvidence |
-| 4 | **BlindXSS** | 4 | 3 | 4 | 3 | 3 | 1 | OOBCallback | Yes | Yes | No confidence_score |
+| 4 | **BlindXSS** | 4 | 3 | 4 | 4 | 3 | 1 | HttpRequest, OOBCallback | Yes | Yes | ⚡ Addressed — Fix 5 added HttpRequestEvidence for injection requests |
 | 5 | **CMDI** | 4 | 4 | 4 | 4 | 2 | 1 | Timing, HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score |
 | 6 | **XXE** | 4 | 4 | 4 | 4 | 2 | 1 | HttpRequest, ResponseExcerpt, OOBCallback | Yes | Yes | No confidence_score |
 | 7 | **Authorization** | 4 | 4 | 4 | 5 | 3 | 1 | AuthorizationComparison | Yes | Yes | No confidence_score |
 | 8 | **SSTI** | 3 | 3 | 3 | 0 | 3 | 1 | **None** | **No** | **No** | **HIGH: No typed evidence at all** — uses 3-stage detect/validate/exploit but stores nothing |
 | 9 | **SensitiveData** | 3 | 3 | 1 | 3 | 2 | 1 | HttpRequest, ResponseExcerpt, SecretValidation | Yes | Yes | Only pattern-matching; no validation beyond regex |
 | 10 | **IDOR** | 3 | 3 | 3 | 4 | 3 | 1 | AuthorizationComparison (via modules/idor.py) | Yes | Yes | No confidence_score |
-| 11 | **Headers** | 2 | 3 | 2 | 0 | 2 | 1 | **None** | **No** | **No** | **HIGH: No typed evidence** — CORS validation exists but isn't stored |
+| 11 | **Headers** | 4 | 4 | 2 | 3 | 3 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | ⚡ Addressed — Fix 4 added HttpRequestEvidence + ResponseExcerptEvidence storage and linking. Multi-signal detection (missing headers, info disclosure, CSP, cookies, CORS). Context-aware reproduction. |
 | 12 | **LFI** | 2 | 3 | 2 | 2 | 3 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score |
 | 13 | **OpenRedirect** | 2 | 3 | 2 | 0 | 3 | 1 | **None** | **No** | **No** | **HIGH: No typed evidence** — Location header stored as string only |
 | 14 | **ExposedFiles** | 2 | 2 | 1 | 2 | 2 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score |
@@ -38,21 +38,23 @@ Each scanner is assessed across five dimensions (0–5):
 | 20 | **InsecureForms** | 1 | 2 | 0 | 0 | 2 | 1 | **None** | **No** | **No** | **HIGH: No typed evidence** — form structure analysis only |
 | 21 | **DirectoryFuzz** | 1 | 2 | 1 | 0 | 2 | 1 | **None** | **No** | **No** | **HIGH: No typed evidence** — status code based only |
 | 22 | **SubdomainTakeover** | 1 | 2 | 0 | 0 | 2 | 1 | **None** | **No** | **No** | **HIGH: No typed evidence** — signature string match only |
-| 23 | **RateLimiting** | 1 | 2 | 1 | 2 | 2 | 1 | Timing | Yes | Yes | No confidence_score |
+| 23 | **RateLimiting** | 1 | 2 | 1 | 2 | 2 | 1 | Timing | Yes | Yes | No confidence_score; now TARGET_LEVEL (runs once per host, not per URL) |
+| 24 | **CORS** | 3 | 3 | 2 | 2 | 2 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score |
+| 25 | **JWT** | 3 | 3 | 2 | 2 | 2 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score |
 
 ## Summary Statistics
 
 | Metric | Count | % |
 |---|---|---|
-| Total scanners | 23 | 100% |
-| Maturity ≥ 4 (skip legacy) | 7 | 30% |
-| Maturity = 3 | 3 | 13% |
-| Maturity = 2 | 5 | 22% |
-| Maturity = 1 | 8 | 35% |
-| Use evidence_engine | 15 | 65% |
-| Store typed evidence | 15 | 65% |
-| **NO typed evidence** | **8** | **35%** |
-| Link evidence to findings | 15 | 65% |
+| Total scanners | 25 | 100% |
+| Maturity ≥ 4 (skip legacy) | 10 | 40% |
+| Maturity = 3 | 10 | 40% |
+| Maturity = 2 | 5 | 20% |
+| Maturity = 1 | 0 | 0% |
+| Use evidence_engine | 19 | 76% |
+| Store typed evidence | 18 | 72% |
+| **NO typed evidence** | **7** | **28%** |
+| Link evidence to findings | 18 | 72% |
 | Produce confidence_score | 1 | 4% |
 | Produce evidence_strength | 0 | 0% |
 | Produce false_positive_risk | 0 | 0% |
@@ -76,13 +78,13 @@ SSTI has a sophisticated 3-stage detection pipeline (detect → validate → exp
 
 **Fix**: Add `HttpRequestEvidence` for each payload sent, `ResponseExcerptEvidence` for each response, and optionally a `CompositeEvidence` packaging all three stages.
 
-### High Gap: 7 Low-Maturity Scanners with No Evidence
+### High Gap: 6 Low-Maturity Scanners with No Evidence (1 fixed)
 
 These scanners produce findings with string evidence only and never touch `evidence_engine`:
 
-- **Headers** (Maturity 2): Has CORS validation logic but doesn't store evidence
-- **OpenRedirect** (Maturity 2): Has `detect()` and `generate_reproduction()` but no evidence storage
-- **CSRF** (Maturity 1), **InsecureForms** (Maturity 1), **DirectoryFuzz** (Maturity 1), **SubdomainTakeover** (Maturity 1): No evidence at all
+~~- **Headers** (was Maturity 2, now 4): Had CORS validation logic but didn't store evidence~~ ✅ **Fixed in Fix 4** — now stores HttpRequestEvidence + ResponseExcerptEvidence
+- **OpenRedirect** (Maturity 3): Has `detect()` and `generate_reproduction()` but no evidence storage
+- **CSRF** (Maturity 2), **InsecureForms** (Maturity 2), **DirectoryFuzz** (Maturity 3), **SubdomainTakeover** (Maturity 3): No evidence at all
 
 **Fix**: Add `HttpRequestEvidence` + `ResponseExcerptEvidence` as a baseline for all of them.
 
@@ -115,9 +117,11 @@ All scanners produce `steps_to_reproduce`. Quality varies:
 3. Consider `CompositeEvidence` to bundle all 3 stages under one finding
 4. Link to fingerprint
 
-### Phase 3: Medium — 7 Evidence-Starved Scanners (est. 30 min each = 3.5 hours)
+### Phase 3: Medium — Evidence-Starved Scanners (est. 30 min each = 2.5 hours)
 
-For each of: Headers, OpenRedirect, CSRF, InsecureForms, DirectoryFuzz, SubdomainTakeover:
+✅ **Headers** — Fixed in Fix 4 (HttpRequestEvidence + ResponseExcerptEvidence stored and linked)
+
+Remaining (5): OpenRedirect, CSRF, InsecureForms, DirectoryFuzz, SubdomainTakeover:
 
 1. Import `HttpRequestEvidence`, `ResponseExcerptEvidence`
 2. After each probe request: store evidence and link to finding
@@ -154,7 +158,7 @@ This shows which scanners provide which verification stage, and whether it maps 
 
 | Stage | Description | Scanners that reach this stage |
 |---|---|---|
-| **DETECTED** | Signal found, no confirmation | All 23 |
+| **DETECTED** | Signal found, no confirmation | All 25 |
 | **VALIDATED** | Secondary signal confirms | XSS, SQLi, SSRF, CMDI, XXE, SSTI, IDOR, Headers (CORS), OpenRedirect, LFI, SensitiveData (partial), GraphQL (partial) |
 | **EXPLOITABLE** | Safe exploitation proof | XSS, SQLi (time-based), CMDI, SSTI, SensitiveData (partial) |
 | **VERIFIED** | OOB callback / browser execution | XSS (BrowserValidator), SQLi (OOB), SSRF (OOB), BlindXSS (OOB), CMDI (OOB), XXE (OOB), Authorization (role comparison) |
@@ -166,6 +170,6 @@ This shows which scanners provide which verification stage, and whether it maps 
 2. Fix SSTI evidence gap — a 3-stage detection pipeline with no evidence is misleading
 
 **Next sprint**:
-3. Add evidence to 7 low-maturity scanners
+3. Add evidence to remaining 5 low-maturity scanners
 4. Implement shared confidence calculator
 5. Standardize `generate_reproduction()` across all scanners

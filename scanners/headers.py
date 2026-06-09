@@ -13,7 +13,7 @@ Maturity: Level 4 (Full lifecycle — typed evidence, reproduction, confidence, 
 from typing import Any
 
 from models.finding import Finding
-from models.evidence import ResponseExcerptEvidence
+from models.evidence import ResponseExcerptEvidence, HttpRequestEvidence
 from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
@@ -235,6 +235,14 @@ class HeadersScanner(ScannerBase):
                     findings.append(f)
                     fp = f.get("fingerprint", "")
                     if fp and self.evidence_engine is not None and resp is not None:
+                        req_ev = HttpRequestEvidence(
+                            method="GET",
+                            url=url,
+                            curl_command=curl_cmd,
+                            description=f"Header check request at {url}",
+                        )
+                        self.evidence_engine.store(req_ev)
+                        self.evidence_engine.link_to_finding(req_ev, fp)
                         resp_ev = ResponseExcerptEvidence(
                             excerpt=resp.text[:500],
                             length=len(resp.text),

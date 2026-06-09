@@ -526,6 +526,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         "subdomain_takeover", "graphql", "blind_xss", "api", "openapi",
         "http_methods", "authorization",
         "cors", "jwt", "cms",
+        "rate_limiting",
     }
 
     if config["passive"]:

@@ -495,7 +495,7 @@ CMS_CHECKS: dict[str, list[dict]] = {
         {"path": "/readme.html", "name": "WordPress Version Disclosure", "severity": "low",
          "check": lambda b: "WordPress" in b},
         {"path": "/wp-admin/admin-ajax.php", "name": "WordPress Unauthenticated AJAX", "severity": "low",
-         "check": lambda b: "0" in b or "error" not in b.lower()},
+         "check": lambda b: b.strip() in ("0", "-1")},
         {"path": "/?author=1", "name": "WordPress Author Enumeration", "severity": "low",
          "check": lambda b: "author" in b.lower() and ("/author/" in b or "author-1" in b)},
     ],
@@ -547,7 +547,7 @@ class VulnScanner:
             self.evidence   = EvidenceEngine()
 
         # Phase 3: new scanner delegates (scanners/ package)
-        self._use_new_scanners = config.get("use_new_scanners", False)
+        self._use_new_scanners = config.get("use_new_scanners", True)
         self._container = container
 
         # Phase 4: auto-discovered scanner instances
@@ -3661,7 +3661,7 @@ class VulnScanner:
         return []
 
     def scan_jwt(self, target_urls: list[str] | None = None) -> list[dict]:
-        """Dispatch to JWTSanner (ScannerBase)."""
+        """Dispatch to JWTScanner (ScannerBase)."""
         if result := self._dispatch_to_scanner("jwt"):
             return result
         return []

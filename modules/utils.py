@@ -787,8 +787,8 @@ class SecretValidator:
         if SecretValidator._has_long_run(body, 4):
             return {"valid": False, "type": "twilio_token", "details": "Long repeated-char run detected — not a real token"}
         unique_chars = len(set(body))
-        if unique_chars < 24:
-            return {"valid": False, "type": "twilio_token", "details": f"Too few unique chars ({unique_chars}/24) — likely garbage"}
+        if unique_chars < 10:
+            return {"valid": False, "type": "twilio_token", "details": f"Too few unique chars ({unique_chars}/10) — likely garbage"}
         return {"valid": None, "type": "twilio_token", "details": "Format and entropy pass — not API-verified"}
 
     @staticmethod

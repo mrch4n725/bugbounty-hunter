@@ -28,7 +28,7 @@ modules/
   idor.py                   — IdorScanner (subclass of VulnScanner), param-based IDOR
   recon.py                  — Reconnaissance, crawling, subdomain discovery, JS analysis
 scanners/
-  __init__.py               — Exports: all 23 ScannerBase subclasses, discover_scanner_classes()
+  __init__.py               — Exports: all 25 ScannerBase subclasses, discover_scanner_classes()
   base.py                   — ScannerBase with 5-phase lifecycle + finalize() returning list[dict]
   xss.py                    — XSSScanner: reflected, stored, DOM, form XSS
   headers.py                — HeadersScanner: security header audit
@@ -89,12 +89,12 @@ f = finding("XSS Reflected", "https://example.com/xss?q=1", "critical",
 
 The `module_map` and `TARGET_LEVEL` sets live in `main.py`'s `run()` function, **not** on `VulnScanner`. There are two tiers:
 
-- **TARGET_LEVEL modules** (run once per target, not per URL): `headers`, `dirb`, `exposed_files`, `clickjacking`, `subdomain_takeover`, `graphql`, `blind_xss`, `http_methods`, `js_secrets`, `api`, `openapi`
-- **Per-URL modules** (run for each discovered URL): `xss`, `sqli`, `lfi`, `ssrf`, `xxe`, `ssti`, `cmd_injection`, `open_redirect`, `csrf`, `insecure_forms`, `idor`, `rate_limiting`
+- **TARGET_LEVEL modules** (run once per target, not per URL): `headers`, `dirb`, `exposed_files`, `clickjacking`, `subdomain_takeover`, `graphql`, `blind_xss`, `http_methods`, `js_secrets`, `api`, `openapi`, `authorization`, `cors`, `jwt`, `cms`, `rate_limiting`
+- **Per-URL modules** (run for each discovered URL): `xss`, `sqli`, `lfi`, `ssrf`, `xxe`, `ssti`, `cmd_injection`, `open_redirect`, `csrf`, `insecure_forms`, `idor`
 
 ### 2j. New scanner lifecycle (default on, opt-out via --legacy-scanners)
 
-ScannerBase subclasses are the **default** for 20 modules. Use `--legacy-scanners` to fall back to inline scan methods in `modules/scanner.py`. Currently 20 modules have ScannerBase implementations: xss, sqli, ssrf, ssti, lfi, open_redirect, csrf, headers, clickjacking, http_methods, insecure_forms, exposed_files, dirb, sensitive_data, subdomain_takeover, graphql, blind_xss, xxe, cmd_injection, rate_limiting. Each implements a 5-phase lifecycle:
+ScannerBase subclasses are the **default** for all 25 modules. Use `--legacy-scanners` to fall back to inline scan methods in `modules/scanner.py`. Currently 25 modules have ScannerBase implementations: xss, sqli, ssrf, ssti, lfi, open_redirect, csrf, headers, clickjacking, http_methods, insecure_forms, exposed_files, dirb, sensitive_data, subdomain_takeover, graphql, blind_xss, xxe, cmd_injection, rate_limiting, cors, jwt, authorization, openapi, idor. Each implements a 5-phase lifecycle:
 
 1. **init** — receives config, recon data, container
 2. **prepare** — load payloads, init state
@@ -102,7 +102,7 @@ ScannerBase subclasses are the **default** for 20 modules. Use `--legacy-scanner
 4. **finalize** — post-scan cleanup
 5. **findings** — return discovered findings list
 
-`VulnScanner` detects `self._use_new_scanners` and dispatches to lazy-loaded scanner instances. Findings from the ScannerBase path go through the same `_add()` / dedup pipeline as legacy findings.
+`VulnScanner` detects `self._use_new_scanners` (defaults to `True`) and dispatches to lazy-loaded scanner instances. Findings from the ScannerBase path go through the same `_add()` / dedup pipeline as legacy findings.
 
 ### 2c. Intelligence-led per-URL module selection
 
@@ -277,9 +277,15 @@ Applied in `main()` after config-file merge but before `build_config()`. Explici
 python3 main.py --target https://example.com --auto
 ```
 
-### 7b. Rich progress bar (`ScanProgress`)
+### 7b. Rich progress bars (`ScanProgress` + `ModuleProgress`)
 
-`ScanProgress` in `modules/utils.py` wraps Rich `Progress` with `TimeRemainingColumn` and findings counter. Used in `_run_scans()` via context manager:
+Two progress displays cover the full scan pipeline:
+
+1. **`ModuleProgress`** — spinner + module name shown during TARGET_LEVEL module execution (headers, clickjacking, cors, etc.). Wraps Rich `Status`.
+
+2. **`ScanProgress`** — progress bar with `SpinnerColumn`, `BarColumn`, `TimeRemainingColumn`, and findings counter for the per-URL scan loop. Uses the same `Console` singleton as `log()` to avoid display corruption.
+
+In `_run_scans()` in `main.py`:
 
 ```python
 with ScanProgress(total_urls, config, "Scanning URLs") as prog:
@@ -287,9 +293,18 @@ with ScanProgress(total_urls, config, "Scanning URLs") as prog:
         prog.advance(url, findings_count)
 ```
 
-Falls back to no-op when Rich is unavailable or `--no-rich` is set.
+Both fall back to no-op when Rich is unavailable or `--no-rich` is set.
 
-### 7c. `--format chatgpt` (ChatGPTReporter)
+### 7c. `--status` flag
+
+When `--status` is passed alongside `--target`:
+1. **Pre-scan** — prints a detailed configuration summary (target, modules, threads, RPS, timeout, OOB host, etc.)
+2. **During scan** — prints a status line every 25 URLs (`[STATUS] N/M URLs scanned, X findings so far`)
+3. **Post-scan** — prints a final report with findings count broken down by severity
+
+When `--status` is passed without `--target`, it prints the config summary and exits without scanning.
+
+### 7d. `--format chatgpt` (ChatGPTReporter)
 
 Single-file markdown report optimized for ChatGPT ingestion. Located in `reporting/chatgpt.py`. Features:
 - YAML frontmatter with structured summary
@@ -300,7 +315,7 @@ Single-file markdown report optimized for ChatGPT ingestion. Located in `reporti
 
 Auto-selected when `--auto` is used.
 
-### 7d. JSON-LD in HTML reports
+### 7e. JSON-LD in HTML reports
 
 Every HTML report includes a `<script type="application/ld+json">` block with all findings data. This structured data enables LLMs (ChatGPT, Claude) to parse findings without text extraction. Fields: target URL, timestamp, severity counts, verification breakdown, and per-finding details (title, vuln_type, severity, url, parameter, verification_stage, confidence_score, false_positive_risk, cvss_score).
 

@@ -21,7 +21,7 @@ flowchart TD
     end
 
     subgraph new["New Runtime (scanners/)"]
-        scanner_base["ScannerBase (22 subclasses)"]
+        scanner_base["ScannerBase (25 subclasses)"]
         detect["detect()"]
         validate["validate()"]
         evidence["collect_evidence()"]

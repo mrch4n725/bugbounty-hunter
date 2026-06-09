@@ -14,6 +14,7 @@ from urllib.parse import urlparse, parse_qs
 from urllib.parse import urlencode as _urlencode
 
 from models.finding import Finding
+from models.evidence import HttpRequestEvidence
 from modules.utils import (
     safe_get, safe_post, finding, log, Colors, _build_curl,
     VerificationStage,
@@ -92,9 +93,23 @@ class BlindXSSScanner(ScannerBase):
                         data[field["name"]] = payload
                         if method == "POST":
                             safe_post(self.session, action, data, self.timeout, raise_for_status=False)
+                            inj_ev = HttpRequestEvidence(
+                                method="POST",
+                                url=action,
+                                curl_command=_build_curl("POST", action, dict(self.session.headers), data=data),
+                                description=f"Blind XSS injection via POST form field '{field['name']}'",
+                            )
                         else:
                             safe_get(self.session, action + "?" + _urlencode(data),
                                      self.timeout, raise_for_status=False)
+                            inj_ev = HttpRequestEvidence(
+                                method="GET",
+                                url=action + "?" + _urlencode(data),
+                                curl_command=_build_curl("GET", action + "?" + _urlencode(data), dict(self.session.headers)),
+                                description=f"Blind XSS injection via GET param '{field['name']}'",
+                            )
+                        if self.evidence_engine is not None:
+                            self.evidence_engine.store(inj_ev)
                         self.validation.register_oob("blind_xss", payload, action)
                         self._oob_urls.append(("blind_xss", payload, action))
             except Exception as e:
@@ -111,6 +126,14 @@ class BlindXSSScanner(ScannerBase):
                     new_qs = _urlencode(qs, doseq=True)
                     test_url = parsed._replace(query=new_qs).geturl()
                     safe_get(self.session, test_url, self.timeout, raise_for_status=False)
+                    inj_ev = HttpRequestEvidence(
+                        method="GET",
+                        url=test_url,
+                        curl_command=_build_curl("GET", test_url, dict(self.session.headers)),
+                        description=f"Blind XSS injection via URL param '{param}'",
+                    )
+                    if self.evidence_engine is not None:
+                        self.evidence_engine.store(inj_ev)
                     self.validation.register_oob("blind_xss", payload, test_url)
                     self._oob_urls.append(("blind_xss", payload, test_url))
 

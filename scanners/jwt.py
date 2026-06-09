@@ -1,5 +1,5 @@
 """
-JWTSanner — detects JWT vulnerabilities.
+JWTScanner — detects JWT vulnerabilities.
 
 Passive analysis:
   - Detect JWT tokens in Authorization headers, cookies, and response bodies
@@ -52,7 +52,7 @@ WEAK_ALG_PAYLOADS = [
 ]
 
 
-class JWTSanner(ScannerBase):
+class JWTScanner(ScannerBase):
     SCANNER_NAME = "jwt"
     SCANNER_MATURITY = 3
     TARGET_LEVEL = True
@@ -77,8 +77,8 @@ class JWTSanner(ScannerBase):
         parts = token.split(".")
         if len(parts) != 3:
             return None
-        header = JWTSanner._decode_jwt_part(parts[0])
-        payload = JWTSanner._decode_jwt_part(parts[1])
+        header = JWTScanner._decode_jwt_part(parts[0])
+        payload = JWTScanner._decode_jwt_part(parts[1])
         if header is None or payload is None:
             return None
         return {

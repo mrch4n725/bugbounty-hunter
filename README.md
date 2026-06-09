@@ -50,7 +50,7 @@ It combines multithreaded reconnaissance, intelligence-led module selection, and
 
 Key capabilities:
 
-- **25+ scan modules** — XSS, SQLi, SSTI, SSRF, XXE, Command Injection, Blind XSS, LFI, Open Redirect, CSRF, IDOR, GraphQL, API, and more
+- **27+ scan modules** — XSS, SQLi, SSTI, SSRF, XXE, Command Injection, Blind XSS, LFI, Open Redirect, CSRF, IDOR, GraphQL, API, JWT, CORS, and more
 - **Evidence chain** — every finding progresses through Detection → Validation → Exploitation → Verification with confidence scoring
 - **Out-of-band (OOB) confirmation** — SSRF, XXE, Command Injection, Blind XSS, and SQLi confirmed via DNS/HTTP callbacks (Interactsh / Burp Collaborator)
 - **Browser-based XSS validation** — Playwright executes payloads in a headless Chromium instance and captures screenshots of successful execution
@@ -181,8 +181,8 @@ python3 main.py --target https://example.com --threads 20 --rps 10
 # Stealth mode (slow, randomized)
 python3 main.py --target https://example.com --stealth
 
-# Use new ScannerBase architecture (opt-in, experimental)
-python3 main.py --target https://example.com --new-scanners
+# Use legacy scanner architecture (opt-out, not recommended)
+python3 main.py --target https://example.com --legacy-scanners
 ```
 
 ### Authenticated Scanning
@@ -323,10 +323,11 @@ module_params:
 | `--no-mask-curl` | off | Show sensitive headers (Authorization, Cookie, etc.) in curl commands |
 | `--dry-run` | off | Recon + attack surface summary only; skip all active fuzzing |
 | `--passive` | off | No active fuzzing (headers, recon, and passive checks only) |
-| `--new-scanners` | off | Use new ScannerBase-based scanners (opt-in, experimental). Enables typed evidence, EvidenceEngine, and 5-phase lifecycle for supported modules (XSS, Headers). Currently an opt-in migration target — legacy modules/scanner.py remains the default. |
+| `--status` | off | Show detailed scan status: pre-scan config summary, periodic progress every 25 URLs, and final findings-by-severity report. |
 | `--role` | — | Current user role name for authorization testing (e.g. `user_a`, `admin`) |
 | `--auth-header` | — | Auth header for a role in format `role_name:Header:Value` (repeatable). E.g. `--auth-header user_b:'Authorization:Bearer tok_b'` |
 | `--auto` | off | Auto mode: sensible defaults for a quick scan (`rps=3`, `threads=5`, `autosave=60s`, `format=chatgpt`). Single-command convenience — just `python main.py --target https://x.com --auto`. |
+| `--legacy-scanners` | off | Fall back to legacy inline scanner logic in `modules/scanner.py` (not recommended; ScannerBase is the default). |
 | `--verbose`, `-v` | off | Per-request and per-finding diagnostic output |
 
 ---
@@ -359,7 +360,7 @@ module_params:
 | IDOR (Path) | `idor_path` | Target-level | Path-based IDOR via parameter mutation across discovered routes |
 | API | `api` | Target-level | OpenAPI/Swagger discovery, REST endpoint fuzzing, mass assignment, BOLA |
 | JS Secrets | `js_secrets` | Target-level | Regex + AST secret extraction from JavaScript bundles (integrated into recon) |
-| Rate Limiting | `rate_limiting` | Per-URL | Tests endpoint rate limiting by rapid sequential requests |
+| Rate Limiting | `rate_limiting` | Target-level | Tests endpoint rate limiting by rapid sequential requests (runs once per host, not per URL) |
 
 **Module types** — Per-URL modules run only on URLs where they are applicable (determined by `classify_endpoint()`). Target-level modules run once per target regardless of URL count.
 
@@ -419,23 +420,20 @@ python3 -m playwright install chromium
 
 Browser validation is optional — the scanner runs fine without it, reporting XSS as **Detected** instead of **Verified**.
 
-### New Scanner Architecture (--new-scanners)
+### Scanner Architecture (Default: ScannerBase)
 
-The optional `--new-scanners` flag enables the `ScannerBase`-based architecture with typed
-evidence, lifecycle phases, and EvidenceEngine integration. Currently supports XSS and
-Headers modules. When enabled:
+BugBounty Hunter uses the `ScannerBase`-based architecture by default (all 25 scanners)
+with typed evidence, lifecycle phases, and EvidenceEngine integration:
 
 1. **5-phase lifecycle** — Each scanner implements `detect → validate → collect_evidence → generate_reproduction → calculate_confidence`
 2. **Typed evidence** — `HttpRequestEvidence`, `BrowserExecutionEvidence`, `TimingEvidence`, `OOBCallbackEvidence`, etc. render as structured blocks in reports (HackerOne, Bugcrowd, HTML)
 3. **EvidenceEngine integration** — Evidence is content-fingerprinted (SHA-256), deduplicated, and linked to findings. Reporters automatically enrich findings with linked evidence
 
-Usage:
+To fall back to the legacy inline scanner logic:
 
 ```bash
-python3 main.py --target https://example.com --new-scanners
+python3 main.py --target https://example.com --legacy-scanners
 ```
-
-> **Note:** This is opt-in while migration is in progress. The legacy `modules/scanner.py` path remains the default until all modules are migrated to `ScannerBase`.
 
 ### Live Secret Validation
 
@@ -477,7 +475,7 @@ Additional report features:
 - **JSON-LD structured data** — every HTML report includes `<script type="application/ld+json">` block with all finding data for LLM parsing (ChatGPT, Claude)
 - **Interim autosave** — `--autosave-interval N` saves partial reports every N seconds (`.partial` suffix)
 - **Live findings counter** — a background thread reports `[Live] N findings (M confirmed)` every 30 seconds
-- **Rich progress bar** — live ETA, findings counter, and current URL display during scan (falls back to plain text with `--no-rich`)
+- **Rich progress bar** — live ETA, findings counter, current module/URL display during both target-level module execution (`ModuleProgress`) and per-URL scanning (`ScanProgress`). Falls back to plain text with `--no-rich`.
 - **Real-time output** — `[FOUND] [severity] title @ url` for each new finding as it's discovered
 - **Keyboard interrupt safe** — Ctrl+C saves all findings collected so far with no data loss
 
@@ -583,7 +581,7 @@ bugbounty-hunter/
 │   ├── hackerone.py                 # HackerOneReporter — submission-ready format
 │   └── bugcrowd.py                  # BugcrowdReporter — summary + per-finding detail
 ├── tests/
-│   └── run.py                       # 128 standalone tests (zero external dependencies)
+│   └── run.py                       # 214 standalone tests (zero external dependencies)
 └── reports/                         # Output directory (gitignored)
 ```
 

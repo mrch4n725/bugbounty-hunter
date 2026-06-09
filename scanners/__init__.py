@@ -23,7 +23,7 @@ from scanners.idor import IdorScannerAdapter
 from scanners.openapi import OpenAPIScanner
 from scanners.authorization import AuthorizationScanner
 from scanners.cors import CORSScanner
-from scanners.jwt import JWTSanner
+from scanners.jwt import JWTScanner
 
 __all__ = [
     "ScannerBase",
@@ -51,7 +51,7 @@ __all__ = [
     "OpenAPIScanner",
     "AuthorizationScanner",
     "CORSScanner",
-    "JWTSanner",
+    "JWTScanner",
 ]
 
 

@@ -4,11 +4,11 @@
 
 BugBounty Hunter has **two runtimes** that coexist in a layered hybrid:
 the **Legacy Runtime** (`VulnScanner` inline methods in `modules/scanner.py`)
-and the **New Runtime** (22 `ScannerBase` subclasses in `scanners/` +
+and the **New Runtime** (25 `ScannerBase` subclasses in `scanners/` +
 `VerificationEngine` + `EvidenceEngine` + `ApplicationContainer`).
 
-The new runtime is **functionally complete** — all 22 scanners exist, all 127
-tests pass — but `main.py` still routes through the legacy `module_map` dict
+The new runtime is **functionally complete** — all 25 scanners exist, all 214
+tests pass — and `main.py` routes through `module_map` dict
 pointing to `VulnScanner.scan_*` methods. Every `scan_*` method is a router
 that tries `_dispatch_to_scanner()` first, then falls back to its own inline
 legacy logic.
@@ -32,7 +32,7 @@ main.py:main()
   │   │     ├── OOBDetectionFramework
   │   │     ├── BrowserValidator
   │   │     ├── ValidationEngine / EvidenceEngine (from container)
-  │   │     └── ScannerBase lazy instances (22 classes via discover_scanner_classes)
+    │   │     └── ScannerBase lazy instances (25 classes via discover_scanner_classes)
   │   │
   │   ├── Build module_map {name: VulnScanner.scan_*}  ← LEGACY ORCHESTRATION
   │   ├── Run TARGET_LEVEL modules
@@ -81,7 +81,7 @@ engines/oob_poller.py         → (std lib + callable)
 ```
 scanners/base.py          → modules/utils.py, engines/
 scanners/xss.py           → scanners/base.py, modules/utils.py, models/
-  ... (all 22 scanners)     (same pattern)
+  ... (all 25 scanners)     (same pattern)
 ```
 
 ### Layer 4: Application Bootstrap
@@ -109,7 +109,7 @@ main.py                   → all of the above
 - `modules/scanner.py` → `engines/` → `modules/utils.py` → ✅ acyclic but **deeply coupled**
 - `scanners/base.py` → `modules/utils.py` → ✅ clean (shared utils only)
 
-**No circular dependency exists**, but `modules/scanner.py` has 22 tightly
+**No circular dependency exists**, but `modules/scanner.py` has 25 tightly
 coupled inline scan methods that each import from `modules/utils.py` and
 `engines/`.
 
@@ -281,7 +281,7 @@ Bootstrap → Container → Scanner Lifecycle → Validation → Evidence → Re
 
 | Risk | Impact | Likelihood | Mitigation |
 |---|---|---|---|
-| ScannerBase produces different findings than inline | Medium | Medium | Phase 2 cross-check with `--legacy-scanners` comparison mode |
+| ScannerBase produces different findings than inline | Medium | Low | ScannerBase is now the default (`use_new_scanners=True`). `--legacy-scanners` available for comparison. |
 | ApiScanner/IdorScanner depend on VulnScanner | High | Certain | Refactor to standalone classes or mixins (Phase 3) |
 | Shared state (dedup, WAF detection) breaks | Medium | Low | Keep DeduplicationEngine at orchestrator level |
 | `classify_endpoint()` needs ScannerBase metadata | Low | Low | Check `SCANNER_NAME` against classification set |
@@ -295,7 +295,7 @@ Bootstrap → Container → Scanner Lifecycle → Validation → Evidence → Re
 | Phase | Files Changed | Estimated Effort | Dependencies |
 |---|---|---|---|
 | Phase 1: ScanOrchestrator | +`app/orchestrator.py`, main.py | 2-3 days | None |
-| Phase 2: Strip inline logic | 22 scanner .py files + modules/scanner.py | 2-3 days | Phase 1 |
+| Phase 2: Strip inline logic | 25 scanner .py files + modules/scanner.py | 2-3 days | Phase 1 |
 | Phase 3: Eliminate VulnScanner | `modules/scanner.py`, `modules/api_scanner.py`, `modules/idor.py`, `scanners/idor.py` | 3-4 days | Phase 1-2 |
 | Phase 4: Container lifecycle | `app/container.py`, `main.py` | 1-2 days | Phase 3 |
 | **Total** | ~25 files | 8-12 days | — |
@@ -304,7 +304,7 @@ Bootstrap → Container → Scanner Lifecycle → Validation → Evidence → Re
 
 ## 8. Verification Strategy
 
-1. After each phase, run `python3 tests/run.py` (127 tests must pass)
+1. After each phase, run `python3 tests/run.py` (214 tests must pass)
 2. Phase 2 cross-check: add `--compare-scanners` mode that runs both
    `_dispatch_to_scanner()` AND inline logic, diffs findings, warns on mismatches
 3. Full integration: `python3 main.py --target http://testphp.vulnweb.com --auto`
