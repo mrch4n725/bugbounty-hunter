@@ -76,6 +76,9 @@ ROOT_CAUSE_MAP: dict[str, str] = {
 
 UNKNOWN_ROOT_CAUSE = "Uncategorized Vulnerability"
 
+# Pre-sorted keys (longest-first) for most-specific match in classify_root_cause
+_ROOT_CAUSE_KEYS_SORTED: list[str] = sorted(ROOT_CAUSE_MAP, key=len, reverse=True)
+
 
 # ── Endpoint normalization ──────────────────────────────────────────────────
 
@@ -107,12 +110,17 @@ def normalize_endpoint(url: str) -> str:
 # ── Root cause classification ──────────────────────────────────────────────
 
 def classify_root_cause(finding: Finding) -> str:
-    """Determine the root cause label for a finding based on its vuln_type."""
+    """Determine the root cause label for a finding based on its vuln_type.
+
+    Uses longest-keys-first matching to avoid substring collisions.
+    For example, ``openapi`` is matched before ``api``, and
+    ``authorization - ownership violation`` before ``authorization``.
+    """
     if finding.root_cause:
         return finding.root_cause
     vt = (finding.vuln_type or "").lower().strip()
     title = (finding.title or "").lower().strip()
-    for key in ROOT_CAUSE_MAP:
+    for key in _ROOT_CAUSE_KEYS_SORTED:
         if vt == key or vt.startswith(key) or key in vt:
             return ROOT_CAUSE_MAP[key]
         if title == key or title.startswith(key) or key in title:

@@ -800,21 +800,15 @@ def _write_report_and_summary(config, all_findings, recon_data, js_data=None, co
     exploitable = [f for f in all_findings if f.get("verification_stage") == "exploitable"]
     verified = [f for f in all_findings if f.get("verification_stage") == "verified"]
 
-    # Root-cause grouping for terminal summary
-    from engines.root_cause import ROOT_CAUSE_MAP
-    root_causes: dict[str, list] = {}
-    for f in all_findings:
-        vt = (f.get("vuln_type") or f.get("title") or "").lower()
-        for pattern, label in ROOT_CAUSE_MAP.items():
-            if pattern in vt:
-                root_causes.setdefault(label, []).append(f)
-                break
-        else:
-            root_causes.setdefault("Other", []).append(f)
-    if root_causes:
+    # Root-cause grouping for terminal summary using proper aggregator.
+    # adapted findings already have root_cause set by ReporterBase.
+    from engines.root_cause import RootCauseAggregator
+    aggregator = RootCauseAggregator(config)
+    root_cause_groups = aggregator.aggregate(adapted)
+    if root_cause_groups:
         log(f"\n  Root Causes", Colors.BOLD)
-        for label, items in sorted(root_causes.items(), key=lambda x: -len(x[1])):
-            log(f"    {label}: {len(items)} finding(s)", Colors.WHITE)
+        for group in sorted(root_cause_groups, key=lambda g: -g.count):
+            log(f"    {group.root_cause}: {group.count} finding(s) [{group.severity}]", Colors.WHITE)
 
     log(f"\n{'─'*50}", Colors.CYAN)
     log("  SCAN SUMMARY", Colors.BOLD)

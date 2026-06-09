@@ -12,6 +12,7 @@ from pathlib import Path
 
 from modules.utils import log, Colors
 from engines.outcome_feedback import OutcomeEngine
+from engines.root_cause import RootCauseAggregator
 from reporting import (
     ReporterBase, assess_finding_impact,
     HTMLReporter, JSONReporter, TXTReporter,
@@ -128,7 +129,12 @@ class Reporter:
             reporter = self._resolve_format()
             reporter.findings = reporter._dedupe_findings()
 
-            # Apply root-cause grouping when enabled
+            # Re-aggregate root cause groups after dedup (ReporterBase.__init__
+            # computed them from the pre-dedup list, making them stale).
+            aggregator = RootCauseAggregator(self.config)
+            reporter.root_cause_groups = aggregator.aggregate(reporter.findings)
+
+            # Legacy opt-in grouping — adds root_cause_group metadata to findings
             if self.config.get("group_by_root_cause", False):
                 group_by_root_cause(reporter.findings)
 
@@ -185,6 +191,8 @@ class Reporter:
                         "confidence_score":   f.get("confidence_score", 0),
                         "false_positive_risk": f.get("false_positive_risk", ""),
                         "fingerprint":        f.get("fingerprint", ""),
+                        "root_cause":         f.get("root_cause", ""),
+                        "root_cause_fingerprint": f.get("root_cause_fingerprint", ""),
                         "details":            f.get("details", ""),
                         "steps_to_reproduce": steps,
                         "evidence":           evidence_serialised,
