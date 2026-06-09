@@ -711,8 +711,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     from engines.evidence_validator import EvidenceCompletenessValidator
     evidence_validated = []
     for obj in enriched:
-        obj = EvidenceCompletenessValidator.validate(obj)
-        evidence_validated.append(obj.to_dict() if isinstance(obj, Finding) else obj)
+        evidence_validated.append(EvidenceCompletenessValidator.validate(obj))
     updated = evidence_validated
 
     updated = prioritize_findings(updated)
