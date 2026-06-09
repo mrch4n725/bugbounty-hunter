@@ -113,10 +113,10 @@ class ExposedFilesScanner(ScannerBase):
             ),
         ]
 
-    def generate_reproduction(self, detection: DetectionResult,
-                              validation_result: ValidationResult | None = None) -> list[str]:
-        url = detection.url
-        if validation_result and validation_result.confirmed:
+    def generate_reproduction(self, f: dict) -> list[str]:
+        url = f["url"]
+        stage = f.get("verification_stage", "detected")
+        if stage == "validated":
             return [
                 f"Send GET request to {url}",
                 f"Observe: Sensitive file is publicly accessible (HTTP 200, content validated)",
@@ -160,10 +160,11 @@ class ExposedFilesScanner(ScannerBase):
                     evidence=f"HTTP {resp.status_code} — {len(resp.text)} bytes" if resp else "",
                     request=_build_curl("GET", file_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                     response_excerpt=resp.text[:500] if resp else "",
-                    steps_to_reproduce=self.generate_reproduction(detection, validation_result),
                     verification_stage=VerificationStage.VALIDATED.value if (validation_result and validation_result.confirmed) else VerificationStage.DETECTED.value,
                 )
                 if f:
+                    f["steps_to_reproduce"] = self.generate_reproduction(f)
+                    self._enrich_finding(f, len(evidence_list), f["verification_stage"])
                     fingerprint = f.get("fingerprint", "")
                     if fingerprint:
                         for ev in evidence_list:

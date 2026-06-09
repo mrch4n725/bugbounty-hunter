@@ -121,15 +121,33 @@ class ScannerBase:
             "Inspect the response for the expected vulnerability signal",
         ]
 
-    def calculate_confidence(self, detection: bool, validation: bool,
-                             exploitation: bool, extra: int = 0) -> int:
-        from models.finding import calculate_confidence
-        return calculate_confidence(
-            detection=detection,
-            validation=validation,
-            exploitation=exploitation,
-            extra_points=extra,
-        )
+    def calculate_confidence(self, signals: int, stage: "VerificationStage",
+                             evidence_count: int, false_positive_risk: str) -> int:
+        from models.finding import VerificationStage
+
+        if signals >= 3:
+            base = 60
+        elif signals == 2:
+            base = 40
+        else:
+            base = 25
+
+        stage_mult = {
+            VerificationStage.DETECTED: 1.0,
+            VerificationStage.VALIDATED: 1.5,
+            VerificationStage.EXPLOITABLE: 2.0,
+            VerificationStage.VERIFIED: 2.0,
+        }
+        score = int(base * stage_mult.get(stage, 1.0))
+        score = min(score, 100)
+
+        evidence_bonus = min(evidence_count * 5, 20)
+        score += evidence_bonus
+
+        fp_penalty = {"HIGH": -15, "MEDIUM": -5, "LOW": 0}
+        score += fp_penalty.get(false_positive_risk, 0)
+
+        return max(10, min(score, 100))
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         """Main scan entry point. Override to implement scanning logic.
@@ -279,6 +297,35 @@ class ScannerBase:
 
     def _add_capability_confidence_reasons(self, f: Finding) -> None:
         add_capability_confidence_reasons(f)
+
+    def _enrich_finding(self, f, evidence_count: int, verification_stage_value: str) -> None:
+        from models.finding import VerificationStage, EvidenceStrength
+        stage_enum = VerificationStage(verification_stage_value)
+        signal_map = {
+            VerificationStage.DETECTED: 1,
+            VerificationStage.VALIDATED: 2,
+            VerificationStage.EXPLOITABLE: 3,
+            VerificationStage.VERIFIED: 3,
+        }
+        signals = signal_map.get(stage_enum, 1)
+        if self.SCANNER_MATURITY >= 4:
+            fp_risk = "LOW"
+        elif self.SCANNER_MATURITY == 3:
+            fp_risk = "MEDIUM"
+        else:
+            fp_risk = "HIGH"
+        strength_map = {
+            VerificationStage.DETECTED: EvidenceStrength.WEAK,
+            VerificationStage.VALIDATED: EvidenceStrength.MODERATE,
+            VerificationStage.EXPLOITABLE: EvidenceStrength.STRONG,
+            VerificationStage.VERIFIED: EvidenceStrength.VERIFIED,
+        }
+        evidence_strength = strength_map.get(stage_enum, EvidenceStrength.WEAK)
+        score = self.calculate_confidence(signals, stage_enum, evidence_count, fp_risk)
+        if f.get("confidence_score", 0) == 0:
+            f["confidence_score"] = score
+        f["evidence_strength"] = evidence_strength.value
+        f["false_positive_risk"] = fp_risk
 
     def _add_finding(self, f: Finding) -> bool:
         if not f:

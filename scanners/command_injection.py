@@ -195,6 +195,7 @@ class CommandInjectionScanner(ScannerBase):
                             if self.evidence_engine:
                                 self.evidence_engine.store(ev)
                                 self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
+                        self._enrich_finding(f, len(evidence_list), f["verification_stage"])
                         self._add_finding(f)
             except Exception as e:
                 log(f"  [CMD] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
@@ -358,6 +359,7 @@ class CommandInjectionScanner(ScannerBase):
             if f:
                 self.evidence_engine.store(ev)
                 self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
+                self._enrich_finding(f, 1, f["verification_stage"])
                 self._add_finding(f)
                 extra.append(f)
             log(f"  [CMD OOB] {url_str}", Colors.RED, verbose_only=True, verbose=self.verbose)

@@ -58,5 +58,6 @@ class AuthorizationScanner(ScannerBase):
 
         findings = self._engine.run_scans(urls)
         for f in findings:
+            self._enrich_finding(f, 0, f.get("verification_stage", "detected"))
             self._add_finding(f)
         return self._get_findings()

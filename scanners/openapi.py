@@ -133,6 +133,7 @@ class OpenAPIScanner(ScannerBase):
             verification_stage=VerificationStage.VALIDATED.value,
         )
         if f:
+            self._enrich_finding(f, 2, f["verification_stage"])
             fingerprint = f.get("fingerprint", "")
             if fingerprint:
                 self.evidence_engine.store(req_ev)

@@ -24,8 +24,9 @@ modules/
   scanner.py                — Core VulnScanner with scan_* methods, feature-flag dispatchers
   utils.py                  — Finding engine, dedup, OOB, BrowserValidator, helpers
   reporter.py               — Reporter class (HTML, JSON, TXT, HackerOne, Bugcrowd)
-  api_scanner.py            — ApiScanner (subclass of VulnScanner), API-specific checks
-  idor.py                   — IdorScanner (subclass of VulnScanner), param-based IDOR
+  api_scanner.py            — ApiScanner (multiple inheritance: ScannerModuleBase, VulnScanner), API-specific checks
+  idor.py                   — IdorScanner (multiple inheritance: ScannerModuleBase, VulnScanner), param-based IDOR
+  scanner_base.py           — ScannerModuleBase: shared utility methods for ApiScanner/IdorScanner
   recon.py                  — Reconnaissance, crawling, subdomain discovery, JS analysis
 scanners/
   __init__.py               — Exports: all 25 ScannerBase subclasses, discover_scanner_classes()
@@ -161,16 +162,9 @@ HTML reports use `html.escape()` on every user-provided field at render time. Co
 | `modules/scanner.py` | All scan methods, `VulnScanner` class, chain analysis, `_add()`, feature-flag dispatchers | `VulnScanner` (scan methods), `chain_analysis()` |
 | `modules/utils.py` | Shared utilities, finding engine, dedup, OOB, BrowserValidator, curl builder, classify, safe HTTP | `finding()`, `_build_curl()`, `BrowserValidator`, `OOBDetectionFramework`, `RateLimiter`, `DeduplicationEngine`, `SecretValidator`, `safe_get()`, `safe_post()` |
 | `modules/reporter.py` | Legacy wrapper — delegates to `reporting/` package, passes container via `**kwargs` | `Reporter` class |
-| `reporting/__init__.py` | Reporter package exports | Package init |
-| `reporting/base.py` | Shared reporter utilities, impact analysis, root-cause grouping, evidence enrichment | `ReporterBase`, `assess_finding_impact()`, `group_by_root_cause()`, `_enrich_finding_evidence()` |
-| `reporting/html.py` | HTML report generation with type-specific evidence rendering | `HTMLReporter(ReporterBase)`, `_get_evidence_html()` |
-| `reporting/json_report.py` | JSON report generation | `JSONReporter(ReporterBase)` |
-| `reporting/txt.py` | Plain-text report generation | `TXTReporter(ReporterBase)` |
-| `reporting/markdown.py` | Per-finding Markdown files | `MarkdownReporter(ReporterBase)` |
-| `reporting/hackerone.py` | HackerOne submission format with type-specific evidence | `HackerOneReporter(ReporterBase)`, `_vuln_section()` |
-| `reporting/bugcrowd.py` | Bugcrowd submission format with type-specific evidence | `BugcrowdReporter(ReporterBase)` |
-| `modules/api_scanner.py` | API-specific vulnerability scanning | `ApiScanner(VulnScanner)` with role-based sessions, GraphQL auth bypass, query depth |
-| `modules/idor.py` | Parameter-based IDOR detection with AuthorizationComparisonEvidence | `IdorScanner(VulnScanner)` with ownership validation (`verify_ownership()`), role sessions |
+| `modules/scanner_base.py` | ScannerModuleBase — shared utility methods for ApiScanner/IdorScanner | `ScannerModuleBase` |
+| `modules/api_scanner.py` | API-specific vulnerability scanning | `ApiScanner(ScannerModuleBase, VulnScanner)` with role-based sessions, GraphQL auth bypass, query depth |
+| `modules/idor.py` | Parameter-based IDOR detection with AuthorizationComparisonEvidence | `IdorScanner(ScannerModuleBase, VulnScanner)` with ownership validation (`verify_ownership()`), role sessions |
 | `modules/recon.py` | Crawling, subdomain discovery, JS analysis | Recon class |
 | `scanners/base.py` | ScannerBase 5-phase lifecycle | `ScannerBase` (init → prepare → scan → finalize → findings) |
 | `scanners/xss.py` | XSS detection via ScannerBase | `XSSScanner(ScannerBase)`: reflected, stored, DOM, form |
@@ -181,6 +175,7 @@ HTML reports use `html.escape()` on every user-provided field at render time. Co
 | `models/finding.py` | Finding class with dict-compat shim | `Finding` with strict `__getitem__`, content-fingerprinted `to_dict()` |
 | `models/evidence.py` | Evidence type hierarchy (10 subclasses) | `EvidenceBase`, `HttpRequestEvidence`, `BrowserExecutionEvidence`, `ScreenshotEvidence`, `TimingEvidence`, `OOBCallbackEvidence`, `AuthorizationComparisonEvidence`, `GraphQLSchemaEvidence`, `CommandExecutionEvidence`, `ResponseDiffEvidence`, `CompositeEvidence` |
 | `engines/evidence_engine.py` | Evidence storage with SHA-256 content-based dedup | `EvidenceEngine`, `store()`, `get_evidence()` |
+| `engines/evidence_validator.py` | Evidence completeness validation | `EvidenceCompletenessValidator` with `CONFIDENCE_PENALTY` (delta subtraction) |
 
 ---
 
@@ -188,7 +183,7 @@ HTML reports use `html.escape()` on every user-provided field at render time. Co
 
 ### 4a. General
 
-- **Python 3.10+** — use `str \| None` union syntax, `list[dict]` generics
+- **Python 3.10+** — use `str | None` union syntax, `list[dict]` generics
 - **No external AI/ML dependencies** — no OpenAI, no langchain, no transformers
 - **No breaking changes** — all additions must be backward compatible
 - **Thread safety** — `threading.Lock()` for shared state; stateless `requests.post()` per thread in rate-limiting probe
@@ -217,7 +212,7 @@ f = finding("CSRF+XSS->ATO", url, severity, details, evidence,
 
 ### 4d. ApiScanner / IdorScanner
 
-These subclass `VulnScanner` but do **not** call `self._add()`. Instead they use `_append_finding(local_list, f)`. Their findings are merged into final output via fingerprint dedup in main.py.
+These subclass `ScannerModuleBase` (with `VulnScanner` secondary parent for backward-compatible `issubclass` checks). They do **not** call `self._add()`. Instead they use `_append_finding(local_list, f)`. Their findings are merged into final output via fingerprint dedup in main.py.
 
 ### 4e. _build_curl()
 
@@ -324,7 +319,7 @@ Every HTML report includes a `<script type="application/ld+json">` block with al
 ## 8. Important Gotchas
 
 | Gotcha | Detail |
-|---|---|---|
+|---|---|
 | BrowserValidator constructor | Takes `config: Dict[str, Any]` (not just timeout). Uses `_ensure_browser()` lazily. |
 | Dedup key | `(vuln_type, url, parameter or "")` — findings without parameter dedup by `(url, type)` |
 | POST form XSS | Browser validation passes `r.text` via `set_content()`, not `goto()` |

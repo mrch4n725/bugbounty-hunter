@@ -26,5 +26,6 @@ class IdorScannerAdapter(ScannerBase):
             self._impl = _Idor(self.config, self.recon, container=self.container)
         results = self._impl.run_all()
         for f in results:
+            self._enrich_finding(f, 0, f.get("verification_stage", "detected"))
             self._add_finding(f)
         return self._get_findings()

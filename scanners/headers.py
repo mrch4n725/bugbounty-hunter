@@ -231,6 +231,7 @@ class HeadersScanner(ScannerBase):
                     verification_stage=stage,
                 )
                 if f:
+                    self._enrich_finding(f, 0, f["verification_stage"])
                     self._add_finding(f)
                     findings.append(f)
                     fp = f.get("fingerprint", "")

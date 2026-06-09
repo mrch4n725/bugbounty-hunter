@@ -182,6 +182,7 @@ class SensitiveDataScanner(ScannerBase):
                     verification_stage=stage,
                 )
                 if f:
+                    self._enrich_finding(f, len(evidence_list), f["verification_stage"])
                     fingerprint = f.get("fingerprint", "")
                     if fingerprint:
                         for ev in evidence_list:

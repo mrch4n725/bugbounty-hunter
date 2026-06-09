@@ -266,6 +266,7 @@ class XSSScanner(ScannerBase):
                         for ev in evidence:
                             self.evidence_engine.store(ev)
                             self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
+                        self._enrich_finding(f, len(evidence), f["verification_stage"])
                         self._add_finding(f)
             except Exception as e:
                 log(f"  [XSS] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)

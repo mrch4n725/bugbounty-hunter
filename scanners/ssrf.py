@@ -256,11 +256,13 @@ class SSRFScanner(ScannerBase):
                         validation_steps=[f"Cloud metadata signature matched: {s}" for s in all_matched_sigs],
                         confidence_score=confidence_score,
                     )
-                    if f and self._add_finding(f):
-                        fingerprint = f.get("fingerprint", "")
-                        if fingerprint and self.evidence_engine is not None:
-                            for ev in evidence_list:
-                                self.evidence_engine.link_to_finding(ev, fingerprint)
+                    if f:
+                        self._enrich_finding(f, len(evidence_list), f["verification_stage"])
+                        if self._add_finding(f):
+                            fingerprint = f.get("fingerprint", "")
+                            if fingerprint and self.evidence_engine is not None:
+                                for ev in evidence_list:
+                                    self.evidence_engine.link_to_finding(ev, fingerprint)
 
             except Exception as e:
                 log(f"  [SSRF] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
@@ -289,10 +291,12 @@ class SSRFScanner(ScannerBase):
                         f"Escalate: use SSRF to access internal metadata endpoints (169.254.169.254) or internal services",
                     ],
                 )
-                if f and self._add_finding(f):
-                    fingerprint = f.get("fingerprint", "")
-                    if fingerprint and self.evidence_engine is not None:
-                        self.evidence_engine.link_to_finding(oob_ev, fingerprint)
+                if f:
+                    self._enrich_finding(f, 1, f["verification_stage"])
+                    if self._add_finding(f):
+                        fingerprint = f.get("fingerprint", "")
+                        if fingerprint and self.evidence_engine is not None:
+                            self.evidence_engine.link_to_finding(oob_ev, fingerprint)
 
         return self._get_findings()
 

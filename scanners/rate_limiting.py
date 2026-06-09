@@ -222,10 +222,9 @@ class RateLimitingScanner(ScannerBase):
             ),
         ]
 
-    def generate_reproduction(self, detection: DetectionResult,
-                              validation_result: ValidationResult | None = None) -> list[str]:
+    def generate_reproduction(self, f: dict) -> list[str]:
         return [
-            f"Send {PROBE_COUNT} rapid POST requests to {detection.url} in quick succession (with minimal delay between requests)",
+            f"Send {PROBE_COUNT} rapid POST requests to {f['url']} in quick succession (with minimal delay between requests)",
             f"None of the {PROBE_COUNT} requests returned HTTP 429 (rate limited) or showed throttling behavior",
             "Without rate limiting, an attacker can perform brute-force password guessing, credential stuffing, or OTP enumeration at full speed",
         ]
@@ -265,10 +264,11 @@ class RateLimitingScanner(ScannerBase):
                     evidence=detection.evidence_signals[0] if detection.evidence_signals else "",
                     request=_build_curl("POST", test_url, dict(self.session.headers), data=probe_data),
                     response_excerpt=response_excerpt,
-                    steps_to_reproduce=self.generate_reproduction(detection, validation_result),
                     verification_stage=VerificationStage.VALIDATED.value if (validation_result and validation_result.confirmed) else VerificationStage.DETECTED.value,
                 )
                 if f:
+                    f["steps_to_reproduce"] = self.generate_reproduction(f)
+                    self._enrich_finding(f, len(evidence_list), f["verification_stage"])
                     fingerprint = f.get("fingerprint", "")
                     if fingerprint:
                         for ev in evidence_list:

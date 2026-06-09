@@ -98,22 +98,22 @@ class DirectoryFuzzScanner(ScannerBase):
             )
         return evidence
 
-    def generate_reproduction(self, detection: DetectionResult,
-                              validation_result: ValidationResult | None = None) -> list[str]:
-        url = detection.url
-        if detection.context == "directory_listing":
+    def generate_reproduction(self, f: dict) -> list[str]:
+        url = f["url"]
+        vuln_type = f.get("vuln_type", "")
+        if vuln_type == "Directory Listing Enabled":
             return [
                 f"Send GET request to {url}",
                 "Server responds with HTTP 200 — the path exists and is publicly accessible",
                 "Directory listing is enabled — browse available files in the response",
             ]
-        if detection.context == "accessible_path":
+        if vuln_type == "Exposed Common Path":
             return [
                 f"Send GET request to {url}",
                 "Server responds with HTTP 200 — the path exists and is publicly accessible",
                 "Review the returned content for sensitive information",
             ]
-        if detection.context == "forbidden":
+        if vuln_type == "Forbidden Path (Access Control Exists)":
             return [
                 f"Send GET request to {url}",
                 "Server responds with HTTP 403 — the path exists but access is restricted",
@@ -188,10 +188,11 @@ class DirectoryFuzzScanner(ScannerBase):
                     evidence=f"HTTP {resp.status_code}" if resp else "",
                     request=_build_curl("GET", target_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                     response_excerpt=resp.text[:500] if resp else "",
-                    steps_to_reproduce=self.generate_reproduction(detection, validation_result),
+                    steps_to_reproduce=self.generate_reproduction(f),
                     verification_stage=stage,
                 )
                 if f:
+                    self._enrich_finding(f, len(evidence_list), f["verification_stage"])
                     fingerprint = f.get("fingerprint", "")
                     if fingerprint:
                         for ev in evidence_list:

@@ -161,6 +161,7 @@ class OpenRedirectScanner(ScannerBase):
                             )
                             self.evidence_engine.store(req_ev)
                             self.evidence_engine.link_to_finding(req_ev, fp)
+                        self._enrich_finding(f, 0, f["verification_stage"])
                         self._add_finding(f)
                         if fp and self.evidence_engine is not None and resp is not None:
                             resp_ev = ResponseExcerptEvidence(

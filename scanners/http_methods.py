@@ -122,12 +122,11 @@ class HttpMethodsScanner(ScannerBase):
             ),
         ]
 
-    def generate_reproduction(self, detection: DetectionResult,
-                              validation_result: ValidationResult | None = None) -> list[str]:
+    def generate_reproduction(self, f: dict) -> list[str]:
         return [
-            f"Send OPTIONS request to {detection.url} and inspect the Allow header",
-            f"Server advertises dangerous methods: {detection.payload}",
-            f"Test each method (e.g., curl -X PUT {detection.url}) to verify it is actually enabled, not just advertised",
+            f"Send OPTIONS request to {f['url']} and inspect the Allow header",
+            f"Server advertises dangerous methods: {f.get('evidence', '')}",
+            f"Test each method (e.g., curl -X PUT {f['url']}) to verify it is actually enabled, not just advertised",
         ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
@@ -156,10 +155,11 @@ class HttpMethodsScanner(ScannerBase):
                     evidence=f"Allowed methods: {detection.payload}",
                     request=_build_curl("OPTIONS", target, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                     response_excerpt=detection.raw_response.text[:500] if detection.raw_response else "",
-                    steps_to_reproduce=self.generate_reproduction(detection, validation_result),
+                    steps_to_reproduce=self.generate_reproduction(f),
                     verification_stage=stage,
                 )
                 if f:
+                    self._enrich_finding(f, len(evidence_list), f["verification_stage"])
                     fingerprint = f.get("fingerprint", "")
                     if fingerprint:
                         for ev in evidence_list:

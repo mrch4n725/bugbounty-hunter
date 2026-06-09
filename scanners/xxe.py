@@ -174,6 +174,7 @@ class XXEScanner(ScannerBase):
                 if f:
                     for ev in evidence_list:
                         self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
+                    self._enrich_finding(f, len(evidence_list), f["verification_stage"])
                     self._add_finding(f)
                 log(f"  [XXE{' Error' if is_error else ''}] {url}", Colors.RED, verbose_only=True, verbose=self.verbose)
 
@@ -219,6 +220,7 @@ class XXEScanner(ScannerBase):
             if f:
                 self.evidence_engine.store(ev)
                 self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
+                self._enrich_finding(f, 1, f["verification_stage"])
                 self._add_finding(f)
                 extra.append(f)
             log(f"  [XXE OOB] {url_str}", Colors.RED, verbose_only=True, verbose=self.verbose)

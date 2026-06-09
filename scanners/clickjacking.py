@@ -110,13 +110,12 @@ class ClickjackingScanner(ScannerBase):
             ),
         ]
 
-    def generate_reproduction(self, detection: DetectionResult,
-                              validation_result: ValidationResult | None = None) -> list[str]:
+    def generate_reproduction(self, f: dict) -> list[str]:
         return [
-            f"Send GET request to {detection.url} and inspect response headers",
+            f"Send GET request to {f['url']} and inspect response headers",
             "Verify X-Frame-Options header is missing (should be DENY or SAMEORIGIN)",
             "Verify Content-Security-Policy lacks frame-ancestors directive",
-            f"Create an HTML page with <iframe src='{detection.url}'> — the page loads inside the iframe",
+            f"Create an HTML page with <iframe src='{f['url']}'> — the page loads inside the iframe",
         ]
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
@@ -147,10 +146,11 @@ class ClickjackingScanner(ScannerBase):
                 evidence=f"X-Frame-Options: {x_frame or 'missing'}, CSP: {csp or 'missing'}",
                 request=_build_curl("GET", target, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                 response_excerpt=resp.text[:500] if resp else "",
-                steps_to_reproduce=self.generate_reproduction(detection, validation_result),
+                steps_to_reproduce=self.generate_reproduction(f),
                 verification_stage=stage,
             )
             if f:
+                self._enrich_finding(f, len(evidence_list), f["verification_stage"])
                 fingerprint = f.get("fingerprint", "")
                 if fingerprint:
                     for ev in evidence_list:

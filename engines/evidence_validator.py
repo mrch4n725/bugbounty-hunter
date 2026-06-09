@@ -147,8 +147,9 @@ class EvidenceCompletenessValidator:
         missing_names = ", ".join(sorted(m.value for m in missing))
         reason = f"-{cls.CONFIDENCE_PENALTY} evidence incomplete: missing {missing_names}"
 
-        # Reduce confidence (floor at 0)
-        new_score = max(0, (finding.confidence_score or 25) - cls.CONFIDENCE_PENALTY)
+        # Reduce confidence (floor at 0) — delta subtraction from actual score
+        base_score = finding.confidence_score if finding.confidence_score is not None else 25
+        new_score = max(0, base_score - cls.CONFIDENCE_PENALTY)
         finding.confidence_score = new_score
 
         # Mark as partially validated

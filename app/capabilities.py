@@ -231,10 +231,7 @@ class CapabilityRegistry:
             self._oob_auto_host = host
             self.config["oob_host"] = host
             return True, f"auto:{host}"
-        host = "oast.fun"
-        self._oob_auto_host = host
-        self.config["oob_host"] = host
-        return True, f"default:{host}"
+        return False, "configure --oob-host to enable"
 
     def _detect_oob_services(self) -> list[str]:
         """Try to auto-detect available OOB callback services."""

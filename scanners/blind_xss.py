@@ -165,6 +165,7 @@ class BlindXSSScanner(ScannerBase):
             if f:
                 self.evidence_engine.store(ev)
                 self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
+                self._enrich_finding(f, 1, f.get("verification_stage", "verified"))
                 self._add_finding(f)
                 extra.append(f)
             log(f"  [Blind XSS OOB] {url_str}", Colors.RED, verbose_only=True, verbose=self.verbose)

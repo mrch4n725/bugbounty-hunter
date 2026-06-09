@@ -272,23 +272,24 @@ class JWTScanner(ScannerBase):
 
         return results
 
-    def generate_reproduction(self, detection: DetectionResult | None = None) -> list[str]:
-        if detection and detection.context == "jwt_alg_none":
+    def generate_reproduction(self, f: dict) -> list[str]:
+        url = f["url"]
+        vuln_type = f.get("vuln_type", "")
+        if vuln_type == "JWT: alg=none":
             return [
-                f"Capture the JWT from {detection.url}",
+                f"Capture the JWT from {url}",
                 f"The JWT header contains alg=none — no signature is required",
                 "Send a modified JWT with any payload and alg=none, no signature",
                 "Observe that the server accepts the forged token",
             ]
-        if detection and detection.context in ("jwt_in_auth_header", "jwt_in_cookie", "jwt_in_response_body"):
-            location = detection.context.replace("_", " ").replace("jwt", "JWT")
+        if vuln_type == "JWT Token Disclosure":
             return [
-                f"Send request to {detection.url}",
-                f"Observe {location} contains a JWT token",
+                f"Send request to {url}",
+                f"Observe the response contains a JWT token",
                 "Decode the JWT payload to inspect claims",
             ]
         return [
-            f"Send request to {detection.url} and locate JWT tokens",
+            f"Send request to {url} and locate JWT tokens",
             "Inspect JWT header and payload for weak configurations",
         ]
 
@@ -353,10 +354,11 @@ class JWTScanner(ScannerBase):
                     evidence=ev,
                     request=curl_cmd,
                     response_excerpt=resp_text,
-                    steps_to_reproduce=self.generate_reproduction(d),
+                    steps_to_reproduce=self.generate_reproduction(f),
                     verification_stage=stage,
                 )
                 if f:
+                    self._enrich_finding(f, 0, f["verification_stage"])
                     fp = f.get("fingerprint", "")
                     if fp:
                         req_ev = HttpRequestEvidence(

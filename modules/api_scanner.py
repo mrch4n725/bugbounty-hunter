@@ -16,6 +16,7 @@ import yaml
 
 from models.finding import Finding
 from modules.scanner import VulnScanner
+from modules.scanner_base import ScannerModuleBase
 from modules.utils import (
     make_session, safe_get, safe_post, finding, log, Colors, _build_curl,
     build_role_sessions, get_role_session,
@@ -81,7 +82,7 @@ BATCH_SIZE = 100
 
 # ── Scanner class ──────────────────────────────────────────────────────────────
 
-class ApiScanner(VulnScanner):
+class ApiScanner(ScannerModuleBase, VulnScanner):
     """Vulnerability scanner targeting REST and GraphQL APIs."""
 
     def __init__(self, config: dict, recon_data: dict, container=None):

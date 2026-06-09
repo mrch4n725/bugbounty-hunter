@@ -250,11 +250,10 @@ class SubdomainTakeoverScanner(ScannerBase):
             ),
         ]
 
-    def generate_reproduction(self, detection: DetectionResult,
-                              validation_result: ValidationResult | None = None) -> list[str]:
+    def generate_reproduction(self, f: dict) -> list[str]:
         return [
-            f"Send GET request to {detection.url}",
-            f"Response contains takeover fingerprint: '{detection.payload}' (service: {detection.context})",
+            f"Send GET request to {f['url']}",
+            f"Response contains takeover fingerprint: '{f.get('evidence', '')}'",
             "The DNS CNAME points to an unclaimed or expired external service — register the external resource to claim the subdomain",
         ]
 
@@ -286,16 +285,17 @@ class SubdomainTakeoverScanner(ScannerBase):
                         evidence=f"Signature: {detection.payload}",
                         request=_build_curl("GET", target_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                         response_excerpt=detection.raw_response.text[:500] if detection.raw_response else "",
-                        steps_to_reproduce=self.generate_reproduction(detection, validation_result),
                         verification_stage=stage,
                     )
                     if f:
+                        f["steps_to_reproduce"] = self.generate_reproduction(f)
+                        self._enrich_finding(f, len(evidence_list), f["verification_stage"])
                         fingerprint = f.get("fingerprint", "")
                         if fingerprint:
                             for ev in evidence_list:
                                 self.evidence_engine.link_to_finding(ev, fingerprint)
                         self._add_finding(f)
-                        log(f"  [TAKEOVER] {target_url} [{stage}] ({detection.context})", Colors.RED, verbose_only=True, verbose=self.verbose)
+                        log(f"  [TAKEOVER] {target_url} [{stage}]", Colors.RED, verbose_only=True, verbose=self.verbose)
                     break
             except Exception:
                 continue

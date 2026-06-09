@@ -183,6 +183,7 @@ class LFIScanner(ScannerBase):
                         self.evidence_engine.store(resp_ev)
                         self.evidence_engine.link_to_finding(req_ev, f.get("fingerprint", ""))
                         self.evidence_engine.link_to_finding(resp_ev, f.get("fingerprint", ""))
+                        self._enrich_finding(f, 2, f["verification_stage"])
                         self._add_finding(f)
                     log(f"  [LFI] {detection.url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
             except Exception:

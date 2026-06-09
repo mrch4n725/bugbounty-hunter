@@ -125,21 +125,23 @@ class CORSScanner(ScannerBase):
                 continue
         return results
 
-    def generate_reproduction(self, detection: DetectionResult | None = None) -> list[str]:
-        if detection and detection.context == "wildcard_acao":
+    def generate_reproduction(self, f: dict) -> list[str]:
+        url = f["url"]
+        vuln_type = f.get("vuln_type", "")
+        if vuln_type == "CORS: Wildcard ACAO":
             return [
-                f"Send GET request to {detection.url} with Origin header set to https://evil.com",
+                f"Send GET request to {url} with Origin header set to https://evil.com",
                 "Observe Access-Control-Allow-Origin: https://evil.com in the response — origin is reflected",
                 "An attacker can make authenticated cross-origin requests from any domain",
             ]
-        if detection and detection.context == "wildcard_with_credentials":
+        if vuln_type == "CORS: Wildcard ACAO with Credentials":
             return [
-                f"Send GET request to {detection.url} with Origin: https://evil.com",
+                f"Send GET request to {url} with Origin: https://evil.com",
                 "Observe Access-Control-Allow-Origin: https://evil.com and Access-Control-Allow-Credentials: true",
                 "An attacker can make authenticated requests (cookies sent) from any domain via client-side JavaScript",
             ]
         return [
-            f"Send GET request to {detection.url} and inspect CORS headers",
+            f"Send GET request to {url} and inspect CORS headers",
             "Test with non-standard Origin headers to verify reflection patterns",
         ]
 
@@ -197,10 +199,11 @@ class CORSScanner(ScannerBase):
                     evidence=ev,
                     request=curl_cmd,
                     response_excerpt=resp_text,
-                    steps_to_reproduce=self.generate_reproduction(d),
+                    steps_to_reproduce=self.generate_reproduction(f),
                     verification_stage=stage,
                 )
                 if f:
+                    self._enrich_finding(f, 0, f["verification_stage"])
                     if matched_v:
                         # Store validation evidence
                         for v in matched_v:

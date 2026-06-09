@@ -252,6 +252,7 @@ class GraphQLScanner(ScannerBase):
                         verification_stage=stage_map.get(detection.context, VerificationStage.DETECTED.value),
                     )
                     if f:
+                        self._enrich_finding(f, len(evidence_list), f["verification_stage"])
                         fingerprint = f.get("fingerprint", "")
                         if fingerprint:
                             for ev in evidence_list:

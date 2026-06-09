@@ -99,10 +99,9 @@ class CSRFScanner(ScannerBase):
             description=f"CSRF analysis of form at {detection.url}",
         )]
 
-    def generate_reproduction(self, detection: DetectionResult,
-                              validation_result: ValidationResult | None = None) -> list[str]:
+    def generate_reproduction(self, f: dict) -> list[str]:
         return [
-            f"Navigate to the page containing the form at {detection.url}",
+            f"Navigate to the page containing the form at {f['url']}",
             "Using a proxy or curl, submit the same POST request without any anti-CSRF token (remove csrf_token / authenticity_token fields)",
             "Observe that the server accepts the request with HTTP 200 — no token validation enforced",
             "Compare with legitimate request that includes a token — both succeed, confirming missing CSRF protection",
@@ -146,10 +145,11 @@ class CSRFScanner(ScannerBase):
                     evidence=f"Form fields: {[fld.get('name') for fld in form.get('fields', [])]}",
                     request=curl_cmd,
                     response_excerpt="(no request made — detected from form structure)" if stage == VerificationStage.DETECTED.value else validation_result.detail,
-                    steps_to_reproduce=self.generate_reproduction(detection, validation_result),
+                    steps_to_reproduce=self.generate_reproduction(f),
                     verification_stage=stage,
                 )
                 if f:
+                    self._enrich_finding(f, len(evidence_list), f["verification_stage"])
                     for ev in evidence_list:
                         self.evidence_engine.store(ev)
                         self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
