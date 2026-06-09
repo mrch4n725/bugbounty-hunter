@@ -100,6 +100,13 @@ def parse_args():
         help="Path to scan history file for finding correlation (default: scan_history.json in output dir)")
     parser.add_argument("--status", action="store_true",
         help="Show real-time scan status: modules completed, findings, URLs, and progress summary.")
+    parser.add_argument("--disable-engine", nargs="+", default=[],
+        choices=["attack_chains", "investigation", "impact", "evidence_quality",
+                 "scan_budget", "asset_graph", "promotion", "replay",
+                 "duplicate_risk", "metrics"],
+        help="Disable specific analysis engines")
+    parser.add_argument("--rdc-noise", action="store_true",
+        help="Reduce attack-chain noise by filtering same-root-cause / low-value chains.")
     parser.add_argument("--auto", action="store_true",
         help="Auto mode (default): sensible defaults for a quick scan.")
     parser.add_argument("--dry-run", action="store_true",
@@ -110,6 +117,30 @@ def parse_args():
         help="Auth header for a role in format 'role_name:HeaderName:HeaderValue'. "
              "Can be specified multiple times. "
              "E.g. --auth-header user_b:Authorization:'Bearer tok_b'")
+    parser.add_argument("--do-login", default=None,
+        help="Login URL — use Playwright to authenticate before scanning. "
+             "Provide a full URL (e.g. 'https://example.com/login'). "
+             "Requires --login-username and --login-password.")
+    parser.add_argument("--login-username", default=None,
+        help="Username or email for --do-login")
+    parser.add_argument("--login-password", default=None,
+        help="Password for --do-login")
+    parser.add_argument("--login-username-field", default="username",
+        help="Name attribute of the username/email input field (default: 'username')")
+    parser.add_argument("--login-password-field", default="password",
+        help="Name attribute of the password input field (default: 'password')")
+    parser.add_argument("--login-extra-fields", nargs="*", default=[],
+        help="Extra form fields in 'name=value' format (e.g. 'tenant=acme'). "
+             "Can be specified multiple times.")
+    parser.add_argument("--check-default-creds", action="store_true",
+        help="Explicitly force default-credential check even when "
+             "--no-default-creds is set or --do-login is being used.")
+    parser.add_argument("--login-verify-url", default=None,
+        help="URL to probe after login to verify session validity "
+             "(e.g. '/api/v1/user'). Default: checks if page URL changed.")
+    parser.add_argument("--no-default-creds", action="store_true",
+        help="Disable automatic default-credential detection against "
+             "discovered login pages (enabled by default).")
     return parser.parse_args()
 
 
@@ -313,6 +344,17 @@ def build_config(args):
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
         "role": getattr(args, "role", None),
         "auth_header": getattr(args, "auth_header", []),
+        "disabled_engines": set(getattr(args, "disable_engine", [])),
+        "rdc_noise": getattr(args, "rdc_noise", False),
+        "do_login": getattr(args, "do_login", None),
+        "login_username": getattr(args, "login_username", None),
+        "login_password": getattr(args, "login_password", None),
+        "login_username_field": getattr(args, "login_username_field", "username"),
+        "login_password_field": getattr(args, "login_password_field", "password"),
+        "login_extra_fields": getattr(args, "login_extra_fields", []),
+        "check_default_creds": getattr(args, "check_default_creds", False),
+        "login_verify_url": getattr(args, "login_verify_url", None),
+        "no_default_creds": getattr(args, "no_default_creds", False),
         "status": {
             "phase": "initialized",
             "findings_count": 0,
@@ -343,7 +385,14 @@ def _log_startup(config: dict) -> None:
     log(f"Mode        : {' + '.join(mode_parts)}", Colors.CYAN)
     if config.get('scope'):
         log(f"Scope       : {config['scope']}", Colors.CYAN)
-    log(f"Report      : {config['report_format'].upper()}\n", Colors.CYAN)
+    log(f"Report      : {config['report_format'].upper()}", Colors.CYAN)
+    if config.get("do_login"):
+        log(f"Auto-login  : {config['do_login']}", Colors.CYAN)
+    if config.get("no_default_creds"):
+        log(f"Default-creds: disabled (--no-default-creds)", Colors.YELLOW)
+    else:
+        log(f"Default-creds: auto-detect login pages", Colors.CYAN)
+    log("", Colors.CYAN)
 
 
 def _should_run_recon(config: dict, run_all: bool, disabled_modules: set) -> bool:
@@ -354,6 +403,29 @@ def _should_run_recon(config: dict, run_all: bool, disabled_modules: set) -> boo
         or "recon" in config["modules"]
         or "js_secrets" in config["modules"]
     )
+
+
+def _detect_login_pages(forms: list[dict], target: str) -> list[tuple[str, str]]:
+    """Scan recon form data for login forms (those with a password field).
+
+    Returns ``[(page_url, action_url), ...]`` sorted by most specific
+    action URL first (longest path = most likely the actual login form).
+    Deduplicates by action URL.
+    """
+    seen: set[str] = set()
+    results: list[tuple[str, str, int]] = []
+    for form in forms:
+        for field in form.get("fields", []):
+            if field.get("type") == "password":
+                action = form.get("action", "").rstrip("/")
+                if action and action not in seen:
+                    seen.add(action)
+                    page_url = form.get("url", target)
+                    results.append((page_url, action, len(action)))
+                break
+    # Sort by action path specificity (longest first)
+    results.sort(key=lambda x: -x[2])
+    return [(p, a) for p, a, _ in results]
 
 
 def _run_recon_if_needed(config: dict, run_recon: bool, container=None):
@@ -587,14 +659,32 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     # ── Step 3: Score and sort URLs ──────────────────────────────────────
     urls = recon_data.get("urls", [])
     forms = recon_data.get("forms", [])
-    scored = [(compute_endpoint_score(u, forms, recon_data), u) for u in urls]
-    scored.sort(key=lambda x: -x[0])
-    sorted_urls = [u for _, u in scored]
-
-    top_n = scored[:10]
-    log("\n[*] Top 10 scored endpoints (highest attack surface first):", Colors.BOLD)
-    for rank, (score, url) in enumerate(top_n, 1):
-        log(f"    {rank:>2}. [{score:>3}] {url}", Colors.CYAN)
+    disabled_engines = config.get("disabled_engines", set())
+    if "scan_budget" not in disabled_engines and container:
+        budget_engine = container.scan_budget_engine if hasattr(container, 'scan_budget_engine') else None
+        if budget_engine:
+            scores = budget_engine.compute_scores(urls)
+            sorted_urls = budget_engine.sorted_urls()
+            top_n = scores[:10]
+            log("\n[*] Top 10 scored endpoints (budget-aware):", Colors.BOLD)
+            for rank, s in enumerate(top_n, 1):
+                log(f"    {rank:>2}. [{s.score:>3}] budget={s.allocated_budget} {s.url}", Colors.CYAN)
+        else:
+            scored = [(compute_endpoint_score(u, forms, recon_data), u) for u in urls]
+            scored.sort(key=lambda x: -x[0])
+            sorted_urls = [u for _, u in scored]
+            top_n = scored[:10]
+            log("\n[*] Top 10 scored endpoints:", Colors.BOLD)
+            for rank, (score, url) in enumerate(top_n, 1):
+                log(f"    {rank:>2}. [{score:>3}] {url}", Colors.CYAN)
+    else:
+        scored = [(compute_endpoint_score(u, forms, recon_data), u) for u in urls]
+        scored.sort(key=lambda x: -x[0])
+        sorted_urls = [u for _, u in scored]
+        top_n = scored[:10]
+        log("\n[*] Top 10 scored endpoints:", Colors.BOLD)
+        for rank, (score, url) in enumerate(top_n, 1):
+            log(f"    {rank:>2}. [{score:>3}] {url}", Colors.CYAN)
 
     # ── Step 4: Per-URL intelligent module selection ─────────────────────
     # Data-flow: every VulnScanner scan method writes findings via
@@ -631,6 +721,14 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
                 from modules.utils import log as _log
                 _log(f"[STATUS] {idx}/{len(sorted_urls)} URLs scanned, "
                      f"{len(all_findings_local)} findings so far", Colors.CYAN)
+
+            # Periodic session health check (every 25 URLs)
+            if idx > 0 and idx % 25 == 0:
+                try:
+                    from modules.utils import check_session_health
+                    check_session_health(scanner.session, config, log)
+                except Exception:
+                    pass
 
             if url in completed_urls:
                 prog.advance()
@@ -926,12 +1024,84 @@ def run(config: dict) -> int:
     os.makedirs(config["output_dir"], exist_ok=True)
     _log_startup(config)
 
+    # ── Explicit auto-login (--do-login) — runs BEFORE recon ──────────
+    # so that authenticated endpoints are discovered during crawling.
+    do_login_url = config.get("do_login")
+    if do_login_url and config.get("login_username") and config.get("login_password"):
+        from modules.utils import do_playwright_login
+        extra_fields = {}
+        for item in config.get("login_extra_fields", []):
+            if "=" in item:
+                k, v = item.split("=", 1)
+                extra_fields[k.strip()] = v.strip()
+        log(f"[*] Attempting auto-login at {do_login_url} ...", Colors.CYAN)
+        session_cookies = do_playwright_login(
+            login_url=do_login_url,
+            username=config.get("login_username", ""),
+            password=config.get("login_password", ""),
+            username_field=config.get("login_username_field", "username"),
+            password_field=config.get("login_password_field", "password"),
+            extra_fields=extra_fields or None,
+        )
+        if session_cookies:
+            existing = config.get("cookies", {})
+            existing.update(session_cookies)
+            config["cookies"] = existing
+            log(f"[+] Login cookies injected — session authenticated "
+                f"for {len(session_cookies)} cookies", Colors.GREEN)
+        else:
+            log("[!] Auto-login failed — continuing without "
+                "authentication", Colors.YELLOW)
+
     all_findings = []
     run_all = "all" in config["modules"]
     disabled_modules = set(config.get("disable_modules", []))
     recon, recon_data = _run_recon_if_needed(
         config, _should_run_recon(config, run_all, disabled_modules), container=container
     )
+
+    # ── Auto default-credential detection (after recon, before scans) ──
+    # Enabled by default; opt out with --no-default-creds.
+    # Detects login forms from recon data and tries common credentials.
+    should_check = (
+        config.get("check_default_creds", False)
+        or (not config.get("no_default_creds", False)
+            and not config.get("login_password"))
+    )
+    if should_check and not config.get("_default_cred_finding"):
+        from modules.utils import try_default_credentials
+        login_pages = _detect_login_pages(recon_data.get("forms", []), config["target"])
+        if not login_pages and config.get("check_default_creds"):
+            login_pages = [(config["target"], config["target"].rstrip("/") + "/login")]
+        if login_pages:
+            log(f"[*] Detected {len(login_pages)} login page(s) — "
+                f"trying default credentials...", Colors.CYAN)
+            extra_fields = {}
+            for item in config.get("login_extra_fields", []):
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                    extra_fields[k.strip()] = v.strip()
+            for li, (page_url, action_url) in enumerate(login_pages):
+                log(f"  [{li+1}/{len(login_pages)}] {action_url}", Colors.CYAN)
+                dcookies, duser, dpass = try_default_credentials(
+                    login_url=action_url,
+                    username_field=config.get("login_username_field", "username"),
+                    password_field=config.get("login_password_field", "password"),
+                    extra_fields=extra_fields or None,
+                    verify_url=config.get("login_verify_url") or None,
+                )
+                if dcookies and duser and dpass:
+                    existing = config.get("cookies", {})
+                    existing.update(dcookies)
+                    config["cookies"] = existing
+                    config["_default_cred_finding"] = (duser, dpass)
+                    log(f"[!] Default credentials WORK on {action_url}: "
+                        f"{duser}:{dpass} — session injected, "
+                        f"finding will be reported", Colors.RED)
+                    break  # one working session is enough
+            else:
+                log("[*] No default credentials worked on any login page",
+                    Colors.YELLOW)
 
     # ── JS Intelligence scan ─────────────────────────────────────────────
     js_data: dict = {
@@ -1022,6 +1192,43 @@ def run(config: dict) -> int:
         log(f"{'─'*50}\n", Colors.CYAN)
         return 0
 
+    disabled_engines = config.get("disabled_engines", set())
+
+    # ── Asset Graph (Initiative 6) ────────────────────────────────────────
+    if "asset_graph" not in disabled_engines:
+        try:
+            log("[*] Building asset relationship graph...", Colors.CYAN)
+            from engines.asset_graph import build_asset_graph
+            api_endpoints = js_data.get("endpoints", []) + js_data.get("hidden_endpoints", [])
+            api_urls = [ep.get("url", "") if isinstance(ep, dict) else str(ep) for ep in api_endpoints]
+            asset_graph = build_asset_graph(
+                target=config["target"],
+                urls=recon_data.get("urls", []),
+                subdomains=recon_data.get("subdomains", []),
+                forms=recon_data.get("forms", []),
+                js_urls=recon_data.get("js_urls", []),
+                api_endpoints=api_urls,
+            )
+            config["asset_graph"] = asset_graph
+            log(f"[+] Asset graph: {len(asset_graph.nodes)} nodes, {len(asset_graph.edges)} edges", Colors.GREEN)
+        except Exception as e:
+            log(f"[!] Asset graph build failed: {e}", Colors.YELLOW)
+
+    # ── Scan Budget Engine (Initiative 5) ────────────────────────────────-
+    if "scan_budget" not in disabled_engines and container:
+        try:
+            log("[*] Computing scan budget...", Colors.CYAN)
+            budget = container.scan_budget_engine.build_budget(
+                recon_data.get("urls", []),
+                historical_data=None,
+                capabilities=capabilities,
+                asset_graph=config.get("asset_graph"),
+            )
+            config["scan_budget"] = budget
+            log(f"[+] Budget: {budget.total_requests} total requests across {len(budget.allocation)} URLs, load={budget.system_load:.0%}", Colors.GREEN)
+        except Exception as e:
+            log(f"[!] Scan budget failed: {e}", Colors.YELLOW)
+
     all_findings_lock = threading.Lock()
     stop_autosave, autosave_thread = _start_autosave(
         config, recon_data, all_findings, all_findings_lock, js_data=js_data, container=container
@@ -1034,6 +1241,61 @@ def run(config: dict) -> int:
     # Merge JS secret findings AFTER _run_scans (so they appear after scanner findings)
     all_findings.extend(js_findings)
 
+    # ── Convert to Finding instances for engine processing ───────────────
+    all_findings = _findings_to_finding(config, all_findings, recon_data, js_data)
+
+    # ── Default-credential finding ──────────────────────────────────────
+    default_cred = config.pop("_default_cred_finding", None)
+    if default_cred:
+        duser, dpass = default_cred
+        from modules.utils import finding
+        from models.finding import Finding
+        dc_url = login_url or config["target"]
+        df = finding(
+            vuln_type="Default Credentials",
+            url=dc_url,
+            severity="critical",
+            details=(
+                f"The application accepts default / weak credentials: "
+                f"**{duser}** / **{dpass}**. An attacker can use these "
+                f"to gain authenticated access to the application."
+            ),
+            evidence=f"Working credentials: {duser}:{dpass}",
+            verification_stage="verified",
+            steps_to_reproduce=[
+                f"Navigate to {dc_url}",
+                f"Enter username: {duser}",
+                f"Enter password: {dpass}",
+                "Submit the form and observe successful login",
+            ],
+        )
+        if df and not isinstance(df, Finding):
+            df = Finding(df)
+        if df:
+            all_findings = [df] + all_findings  # prepend — most critical
+            log(f"  [FOUND] [CRITICAL] Default Credentials @ {dc_url} "
+                f"({duser}:{dpass})", Colors.RED)
+
+    # ── Evidence Quality Scoring (Initiative 4) ──────────────────────────
+    if "evidence_quality" not in disabled_engines and container:
+        try:
+            log("[*] Scoring evidence quality...", Colors.CYAN)
+            for f in all_findings:
+                quality_scores = container.evidence_quality_engine.assess_finding_evidence(f)
+                from engines.evidence_quality import EvidenceQualityEngine
+                q_reasons = EvidenceQualityEngine.quality_reasons(quality_scores)
+                if q_reasons and f.finding_state != "submission_ready":
+                    existing_reasons = getattr(f, "confidence_reasons", [])
+                    if not isinstance(existing_reasons, list):
+                        existing_reasons = []
+                    for r in q_reasons:
+                        if r not in existing_reasons:
+                            existing_reasons.append(r)
+                    object.__setattr__(f, "confidence_reasons", existing_reasons)
+            log(f"[+] Evidence quality assessed for {len(all_findings)} findings", Colors.GREEN)
+        except Exception as e:
+            log(f"[!] Evidence quality scoring failed: {e}", Colors.YELLOW)
+
     # ── Historical finding correlation ───────────────────────────────────
     if not config.get("no_history", False) and all_findings:
         try:
@@ -1043,6 +1305,108 @@ def run(config: dict) -> int:
             log(f"[+] Historical correlation complete", Colors.GREEN)
         except Exception as e:
             log(f"[!] Historical correlation failed: {e}", Colors.YELLOW)
+
+    # ── Replay cross-scan comparison ───────────────────────────────────
+    if "replay" not in disabled_engines and container:
+        try:
+            history_filename = config.get("history_file", "scan_history.json")
+            output_dir = config.get("output_dir", "reports")
+            history_path = os.path.join(output_dir, history_filename) if not os.path.isabs(history_filename) else history_filename
+            if os.path.isfile(history_path):
+                container.replay_engine.compare_across_scans(
+                    all_findings, history_path, config.get("target", ""),
+                )
+        except Exception as e:
+            log(f"[!] Replay cross-scan comparison failed: {e}", Colors.YELLOW)
+
+    # ── Investigation Engine (Initiative 2) ──────────────────────────────
+    if "investigation" not in disabled_engines and container:
+        try:
+            low_conf = [f for f in all_findings if (f.confidence_score or 0) < 60]
+            if low_conf:
+                log(f"[*] Autonomous investigation: {len(low_conf)} findings below confidence threshold...", Colors.CYAN)
+                results = container.investigation_engine.investigate_all(
+                    all_findings,
+                    budget_per_finding=10,
+                    max_findings=15,
+                )
+                n_promoted = sum(
+                    1 for rlist in results.values()
+                    for r in rlist if r.success
+                )
+                if n_promoted:
+                    log(f"[+] Investigation promoted {n_promoted} signals", Colors.GREEN)
+        except Exception as e:
+            log(f"[!] Investigation engine failed: {e}", Colors.YELLOW)
+
+    # ── Attack Chain Detection (Initiative 1) ────────────────────────────
+    if "attack_chains" not in disabled_engines and container:
+        try:
+            log("[*] Detecting attack chains...", Colors.CYAN)
+            chain_engine = container.attack_chain_engine
+            chains = chain_engine.analyze(
+                all_findings,
+                rdc_noise=config.get("rdc_noise", False),
+                asset_graph=config.get("asset_graph"),
+            )
+            if chains:
+                all_findings = chain_engine.annotate_findings(all_findings, chains)
+                log(f"[+] Found {len(chains)} attack chains", Colors.GREEN)
+                for c in chains:
+                    log(f"  Chain: {c.description} (confidence: {c.overall_confidence:.0f}/100)", Colors.CYAN)
+            else:
+                log("[*] No attack chains detected", Colors.CYAN)
+        except Exception as e:
+            log(f"[!] Attack chain detection failed: {e}", Colors.YELLOW)
+
+    # ── Finding Promotion Pipeline (Initiative 7) ────────────────────────
+    if "promotion" not in disabled_engines:
+        try:
+            log("[*] Running finding promotion pipeline...", Colors.CYAN)
+            from engines.promotion import FindingPromotionEngine
+            all_findings = FindingPromotionEngine.promote_all(all_findings)
+            pipeline_counts = FindingPromotionEngine.pipeline_stage_counts(all_findings)
+            log(f"[+] Pipeline: {pipeline_counts}", Colors.GREEN)
+        except Exception as e:
+            log(f"[!] Finding promotion failed: {e}", Colors.YELLOW)
+
+    # ── Duplicate Risk Estimation (Initiative 9) ─────────────────────────
+    if "duplicate_risk" not in disabled_engines and container:
+        try:
+            log("[*] Estimating duplicate risk...", Colors.CYAN)
+            risks = container.duplicate_risk_engine.estimate_all(all_findings)
+            for f in all_findings:
+                if f.fingerprint and f.fingerprint in risks:
+                    risk = risks[f.fingerprint]
+                    object.__setattr__(f, "duplicate_risk", risk.to_dict())
+            n_novel = sum(
+                1 for r in risks.values()
+                if r.likelihood == "potentially_novel"
+            )
+            log(f"[+] Duplicate risk: {n_novel}/{len(risks)} potentially novel", Colors.GREEN)
+        except Exception as e:
+            log(f"[!] Duplicate risk estimation failed: {e}", Colors.YELLOW)
+
+    # ── Impact Scoring (Initiative 3) ────────────────────────────────────
+    if "impact" not in disabled_engines:
+        try:
+            log("[*] Assessing impact...", Colors.CYAN)
+            from engines.impact import ImpactEngine
+            asset_graph = config.get("asset_graph")
+            for f in all_findings:
+                assessment = ImpactEngine.assess(f, asset_graph=asset_graph)
+                object.__setattr__(f, "impact_assessment", assessment.to_dict())
+        except Exception as e:
+            log(f"[!] Impact scoring failed: {e}", Colors.YELLOW)
+
+    # ── Metrics Collection (Initiative 10) ───────────────────────────────
+    if "metrics" not in disabled_engines and container:
+        try:
+            metrics = container.metrics_collector.collect(all_findings)
+            config["_pipeline_metrics"] = metrics
+            log(container.metrics_collector.summary_string(), Colors.CYAN)
+        except Exception as e:
+            log(f"[!] Metrics collection failed: {e}", Colors.YELLOW)
 
     if autosave_thread:
         stop_autosave.set()

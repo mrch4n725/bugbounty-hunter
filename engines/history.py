@@ -71,6 +71,7 @@ class FindingHistoryRecord:
         "severity", "verification_stage", "confidence_score",
         "root_cause_fingerprint", "asset_fingerprint",
         "evidence_fingerprints",
+        "request", "response_excerpt",
     )
 
     def __init__(
@@ -85,6 +86,8 @@ class FindingHistoryRecord:
         root_cause_fingerprint: str = "",
         asset_fingerprint: str = "",
         evidence_fingerprints: list[str] | None = None,
+        request: str = "",
+        response_excerpt: str = "",
     ):
         self.fingerprint = fingerprint
         self.vuln_type = vuln_type
@@ -96,6 +99,8 @@ class FindingHistoryRecord:
         self.root_cause_fingerprint = root_cause_fingerprint or ""
         self.asset_fingerprint = asset_fingerprint or compute_asset_fingerprint(url)
         self.evidence_fingerprints = evidence_fingerprints or []
+        self.request = request
+        self.response_excerpt = response_excerpt
 
     def to_dict(self) -> dict:
         return {
@@ -109,6 +114,8 @@ class FindingHistoryRecord:
             "root_cause_fingerprint": self.root_cause_fingerprint,
             "asset_fingerprint": self.asset_fingerprint,
             "evidence_fingerprints": self.evidence_fingerprints,
+            "request": self.request,
+            "response_excerpt": self.response_excerpt,
         }
 
     @classmethod
@@ -124,6 +131,8 @@ class FindingHistoryRecord:
             root_cause_fingerprint=d.get("root_cause_fingerprint", ""),
             asset_fingerprint=d.get("asset_fingerprint", ""),
             evidence_fingerprints=d.get("evidence_fingerprints", []),
+            request=d.get("request", ""),
+            response_excerpt=d.get("response_excerpt", ""),
         )
 
 
@@ -480,6 +489,8 @@ class HistoricalCorrelationEngine:
                 stage = f.get("verification_stage", "detected")
                 confidence = f.get("confidence_score", 25)
                 rcf = f.get("root_cause_fingerprint", "")
+                request = f.get("request", "")
+                response_excerpt = f.get("response_excerpt", "")
             else:
                 fp = getattr(f, "fingerprint", "")
                 vuln_type = getattr(f, "vuln_type", "")
@@ -489,6 +500,8 @@ class HistoricalCorrelationEngine:
                 stage = getattr(f, "verification_stage", "detected")
                 confidence = getattr(f, "confidence_score", 25)
                 rcf = getattr(f, "root_cause_fingerprint", "")
+                request = getattr(f, "request", "")
+                response_excerpt = getattr(f, "response_excerpt", "")
 
             if not fp:
                 continue
@@ -502,6 +515,8 @@ class HistoricalCorrelationEngine:
                 verification_stage=stage,
                 confidence_score=confidence,
                 root_cause_fingerprint=rcf,
+                request=request,
+                response_excerpt=response_excerpt,
             ))
 
         return ScanSnapshot(

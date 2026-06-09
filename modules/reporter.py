@@ -181,7 +181,7 @@ class Reporter:
                     if not isinstance(steps, list):
                         steps = [str(steps)] if steps else []
 
-                    findings_export.append({
+                    export = {
                         "title":              f.get("title", ""),
                         "vuln_type":          f.get("vuln_type", ""),
                         "severity":           f.get("severity", "info"),
@@ -203,7 +203,16 @@ class Reporter:
                         "cvss_vector":        reporter._get_cvss_vector(f),
                         "impact":             reporter._build_impact_narrative(f),
                         "remediation":        reporter._build_remediation(f),
-                    })
+                    }
+                    # Engine-enriched fields
+                    for engine_field in ("replay_bundle", "finding_state",
+                                         "impact_assessment", "chains", "chain_impact",
+                                         "duplicate_risk", "confidence_reasons",
+                                         "replay_regression"):
+                        val = f.get(engine_field)
+                        if val is not None:
+                            export[engine_field] = val
+                    findings_export.append(export)
                 with open(findings_path, 'w', encoding='utf-8') as jf:
                     json.dump({
                         "target": self.target,

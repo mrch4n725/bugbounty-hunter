@@ -31,6 +31,25 @@ class VerificationStage(str, enum.Enum):
     VERIFIED = "verified"
 
 
+class FindingState(str, enum.Enum):
+    SIGNAL = "signal"
+    POTENTIAL = "potential"
+    VALIDATED = "validated"
+    VERIFIED = "verified"
+    SUBMISSION_READY = "submission_ready"
+
+    @classmethod
+    def from_verification_stage(cls, stage: str) -> "FindingState":
+        mapping = {
+            "detected": FindingState.SIGNAL,
+            "partially_validated": FindingState.POTENTIAL,
+            "validated": FindingState.VALIDATED,
+            "exploitable": FindingState.VERIFIED,
+            "verified": FindingState.SUBMISSION_READY,
+        }
+        return mapping.get(stage.lower(), FindingState.SIGNAL)
+
+
 class EvidenceStrength(str, enum.Enum):
     WEAK = "weak"
     MODERATE = "moderate"
@@ -131,6 +150,7 @@ class Finding:
     verification_stage: str = "detected"
     evidence_strength: str = "weak"
     false_positive_risk: str = "high"
+    finding_state: str = "signal"
     fingerprint: str = ""
     root_cause_fingerprint: str = ""
     evidence_fingerprint: str = ""
@@ -246,6 +266,8 @@ class Finding:
             self.fingerprint = compute_fingerprint(self.vuln_type, self.url, self.parameter)
         if not self.root_cause_fingerprint and self.root_cause:
             self.root_cause_fingerprint = compute_root_cause_fingerprint(self.vuln_type, self.root_cause)
+        if self.finding_state == "signal" and self.verification_stage:
+            self.finding_state = FindingState.from_verification_stage(self.verification_stage).value
         if self.confidence_score != 25:
             if self.confidence_label == "Unverified":
                 self.confidence_label = ConfidenceLevel.from_score(self.confidence_score).value
@@ -266,6 +288,7 @@ class Finding:
             "confidence_score": self.confidence_score,
             "evidence_strength": self.evidence_strength,
             "verification_stage": self.verification_stage,
+            "finding_state": self.finding_state,
             "false_positive_risk": self.false_positive_risk,
             "fingerprint": self.fingerprint,
             "root_cause_fingerprint": self.root_cause_fingerprint,
@@ -295,6 +318,12 @@ class Finding:
             result["remediation"] = self.remediation
         if self.references:
             result["references"] = self.references
+        if hasattr(self, "replay_bundle"):
+            result["replay_bundle"] = self.replay_bundle
+        if hasattr(self, "chains"):
+            result["chain_data"] = self.chains
+        if hasattr(self, "duplicate_risk"):
+            result["duplicate_risk"] = self.duplicate_risk
         result["evidence"] = [
             {**e.to_dict(), "evidence_type": e.__class__.__name__} if hasattr(e, "to_dict") else {"raw": str(e), "evidence_type": "raw"}
             for e in self.evidence
@@ -318,6 +347,7 @@ class Finding:
             confidence_score=d.get("confidence_score", 25),
             confidence_label=d.get("confidence", ""),
             verification_stage=d.get("verification_stage", "detected"),
+            finding_state=d.get("finding_state", "signal"),
             evidence_strength=d.get("evidence_strength", "weak"),
             false_positive_risk=d.get("false_positive_risk", "high"),
             fingerprint=d.get("fingerprint", ""),

@@ -306,25 +306,53 @@ def prioritize_findings(findings) -> list:
 # ── OOB Detection Framework ───────────────────────────────────────────────
 
 class OOBDetectionFramework:
-    """Out-of-band detection using Interactsh, Burp Collaborator, or custom webhooks.
+    """Out-of-band detection using dnslog.cn (DNS) and subdomain-based callback URLs.
 
-    Generates unique callback tokens, registers expected interactions,
-    and polls for DNS/HTTP callbacks to confirm blind vulnerabilities.
+    Generates unique callback tokens, optionally registers with dnslog.cn for
+    DNS-based polling, and polls for callbacks to confirm blind vulnerabilities.
+
+    If dnslog.cn is reachable, DNS callbacks are confirmed automatically.
+    For HTTP callbacks, set ``--oob-host`` to a service such as interactsh,
+    Burp Collaborator, or a self-hosted listener; unique URLs will be generated
+    but polling requires a compatible backend.
     """
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.oob_host = config.get("oob_host", "") or "oast.fun"
+        self.oob_host = config.get("oob_host", "") or ""
         self.callback_token = str(uuid.uuid4()).replace("-", "")[:16]
         self._interactions: Dict[str, List[Dict[str, Any]]] = {}
         self._lock = threading.Lock()
 
+        # DNS-based polling backend (dnslog.cn)
+        self._dnslog_domain: str | None = None
+        self._dnslog_cookies: dict | None = None
+        self._init_dnslog()
+
+    # ── Backend initialisation ──────────────────────────────────────────
+
+    def _init_dnslog(self) -> None:
+        """Register with dnslog.cn for DNS-based OOB polling."""
+        try:
+            resp = requests.get("http://dnslog.cn/getdomain.php", timeout=10)
+            if resp.status_code == 200:
+                domain = resp.text.strip()
+                if domain:
+                    self._dnslog_domain = domain
+                    self._dnslog_cookies = dict(resp.cookies)
+        except Exception:
+            pass
+
+    # ── Callback URL generation ─────────────────────────────────────────
+
     @property
     def callback_host(self) -> str:
-        """Return the callback host with a unique token subdomain."""
-        if not self.oob_host:
-            return ""
-        return f"{self.callback_token}.{self.oob_host}"
+        """Return the callback host — dnslog domain or token-based subdomain."""
+        if self._dnslog_domain:
+            return f"{self.callback_token}.{self._dnslog_domain}"
+        if self.oob_host:
+            return f"{self.callback_token}.{self.oob_host}"
+        return ""
 
     @property
     def callback_url(self) -> str:
@@ -334,10 +362,12 @@ class OOBDetectionFramework:
         return f"http://{host}/bbh-verify"
 
     def generate_payload(self, placeholder: str = "{oob}") -> str:
-        """Replace {oob} placeholder with the unique callback URL."""
-        if not self.oob_host:
+        """Replace {oob} placeholder with the unique callback host."""
+        if not self.oob_host and not self._dnslog_domain:
             return ""
         return placeholder.replace("{oob}", self.callback_host)
+
+    # ── Interaction tracking ────────────────────────────────────────────
 
     def register_interaction(self, vuln_type: str, payload: str, url: str) -> None:
         with self._lock:
@@ -349,7 +379,7 @@ class OOBDetectionFramework:
 
     def poll(self, timeout: float = 5.0) -> List[Dict[str, Any]]:
         """Poll for callbacks. Returns list of confirmed interactions."""
-        if not self.oob_host:
+        if not self.callback_host:
             return []
         confirmed: List[Dict[str, Any]] = []
         with self._lock:
@@ -364,15 +394,25 @@ class OOBDetectionFramework:
         return confirmed
 
     def _check_callback(self, entry: Dict[str, Any]) -> bool:
-        """Check if a callback has been received for this entry."""
+        """Check if a DNS or HTTP callback has been received."""
+        if self._dnslog_domain:
+            return self._poll_dnslog()
+        return False
+
+    def _poll_dnslog(self) -> bool:
+        """Poll dnslog.cn for DNS records for the registered domain."""
+        if not self._dnslog_cookies:
+            return False
         try:
-            import urllib.request
-            poll_url = f"http://{self.oob_host}/poll?id={self.callback_token}"
-            req = urllib.request.Request(poll_url, method="GET")
-            resp = urllib.request.urlopen(req, timeout=5)
-            if resp.status == 200:
-                data = json.loads(resp.read().decode())
-                return len(data.get("interactions", [])) > 0
+            resp = requests.get(
+                "http://dnslog.cn/getrecords.php",
+                cookies=self._dnslog_cookies,
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                records = resp.text.strip()
+                if records and records != "[]":
+                    return True
         except Exception:
             pass
         return False
@@ -2250,6 +2290,366 @@ def collect_and_link_evidence(finding: Finding, evidence_list: list,
             evidence_engine.link_to_finding(ev, fp)
         except Exception:
             continue
+
+
+# ── Session health check ─────────────────────────────────────────────────
+
+
+def check_session_health(session: Any, config: dict,
+                         log_fn: Any = None) -> bool:
+    """Probe a known endpoint to verify the auth session is still valid.
+
+    Returns True if the session appears healthy, False otherwise.
+    Logs a warning on first detected expiry.
+    """
+    if not session:
+        return True
+    has_auth = bool(session.cookies) or bool(
+        session.headers.get("Authorization")
+    )
+    if not has_auth:
+        return True  # No auth configured — nothing to expire
+    probe_paths = ["/api/v1/user", "/api/v1/me", "/graphql", "/api/graphql"]
+    target = config.get("target", "")
+    for path in probe_paths:
+        try:
+            from urllib.parse import urljoin
+            r = session.get(urljoin(target, path), timeout=10)
+            if r.status_code == 401:
+                msg = ("[!] WARNING: Auth session appears to have expired "
+                       "(HTTP 401 on probe). Findings after this point "
+                       "may be unauthenticated.")
+                if log_fn:
+                    log_fn(msg, Colors.RED)
+                else:
+                    from modules.utils import log as _log
+                    _log(msg, Colors.RED)
+                return False
+            if r.status_code in (200, 403, 404):
+                return True
+        except Exception:
+            continue
+    return True
+
+
+# ── Playwright-based auto-login ─────────────────────────────────────────
+
+
+def do_playwright_login(
+    login_url: str,
+    username: str,
+    password: str,
+    username_field: str = "username",
+    password_field: str = "password",
+    extra_fields: dict[str, str] | None = None,
+    timeout_ms: int = 30000,
+) -> dict[str, str] | None:
+    """Use Playwright to log in and return session cookies.
+
+    Navigates to *login_url*, fills the login form, submits it, and
+    extracts all cookies set by the application.  Returns a
+    ``{cookie_name: cookie_value}`` dict, or ``None`` if Playwright is
+    unavailable or the login attempt fails.
+
+    Handles CSRF tokens automatically (extracts hidden ``csrf_*`` /
+    ``authenticity_token`` inputs before filling the form).  Also
+    attempts to extract a Bearer token from ``localStorage`` after login
+    (for SPA/JWT-based apps).
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log("[!] Playwright not available — cannot auto-login", Colors.RED)
+        return None
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+            )
+            page = context.new_page()
+
+            log(f"[*] Navigating to login page: {login_url}", Colors.CYAN)
+            page.goto(login_url, timeout=timeout_ms, wait_until="networkidle")
+
+            # ── Auto-detect and fill CSRF token if present ────────────
+            csrf_inputs = page.query_selector_all(
+                'input[name^="csrf"], input[name^="authenticity_token"], '
+                'input[name="_token"], input[name="_csrf"]',
+            )
+            for inp in csrf_inputs:
+                name = inp.get_attribute("name") or ""
+                value = inp.get_attribute("value") or ""
+                if name and value:
+                    log(f"  [CSRF] Auto-detected token field: {name}", Colors.YELLOW,
+                        verbose_only=True, verbose=True)
+                    # already present — just leave it
+
+            # ── Fill username / email field ───────────────────────────
+            username_selector = (
+                f'input[name="{username_field}"]'
+            )
+            if not page.query_selector(username_selector):
+                username_selector = 'input[type="email"], input[name="email"]'
+            page.fill(username_selector, username)
+
+            # ── Fill password field ───────────────────────────────────
+            password_selector = f'input[name="{password_field}"]'
+            if not page.query_selector(password_selector):
+                password_selector = 'input[type="password"]'
+            page.fill(password_selector, password)
+
+            # ── Fill extra fields ─────────────────────────────────────
+            for fname, fval in (extra_fields or {}).items():
+                sel = f'input[name="{fname}"]'
+                if page.query_selector(sel):
+                    page.fill(sel, fval)
+
+            # ── Submit via Enter on password field or click submit ────
+            submit_btn = page.query_selector(
+                'button[type="submit"], input[type="submit"]',
+            )
+            if submit_btn:
+                submit_btn.click()
+            else:
+                page.press(password_selector, "Enter")
+
+            # ── Wait for post-login state ─────────────────────────────
+            page.wait_for_load_state("networkidle", timeout=timeout_ms)
+
+            # ── Extract cookies ───────────────────────────────────────
+            cookies_playwright = context.cookies()
+            cookie_dict: dict[str, str] = {}
+            for c in cookies_playwright:
+                if c.get("name") and c.get("value"):
+                    cookie_dict[c["name"]] = c["value"]
+
+            # ── Try to extract JWT from localStorage (SPA apps) ──────
+            jwt_token = None
+            try:
+                jwt_token = page.evaluate(
+                    "() => localStorage.getItem('token') "
+                    "|| localStorage.getItem('access_token') "
+                    "|| localStorage.getItem('jwt')"
+                )
+            except Exception:
+                pass
+
+            browser.close()
+
+            if cookie_dict:
+                log(f"[+] Login successful — {len(cookie_dict)} cookies extracted",
+                    Colors.GREEN)
+                if jwt_token:
+                    log("  [JWT] Bearer token also extracted from localStorage",
+                        Colors.GREEN)
+                return cookie_dict
+
+            if jwt_token:
+                log("[+] JWT token extracted from localStorage (no cookies set)",
+                    Colors.GREEN)
+                return {}  # caller should check for jwt_token separately
+
+            log("[!] Auto-login completed but no session cookies were set — "
+                "login may have failed", Colors.YELLOW)
+            return None
+
+    except Exception as e:
+        log(f"[!] Auto-login failed: {e}", Colors.RED)
+        return None
+
+
+# ── Default-credential detection ──────────────────────────────────────
+
+DEFAULT_CREDENTIALS: list[tuple[str, str]] = [
+    ("admin",   "admin"),
+    ("admin",   "password"),
+    ("admin",   "admin123"),
+    ("admin",   "letmein"),
+    ("admin",   "root"),
+    ("admin",   "123456"),
+    ("admin",   "passw0rd"),
+    ("admin",   "Admin123"),
+    ("admin",   "administrator"),
+    ("test",    "test"),
+    ("test",    "test123"),
+    ("guest",   "guest"),
+    ("user",    "user"),
+    ("user",    "password"),
+    ("user",    "123456"),
+    ("support", "support"),
+    ("demo",    "demo"),
+    ("manager", "manager"),
+    ("backup",  "backup"),
+]
+
+
+def _try_default_credentials_inner(
+    login_url: str,
+    username_field: str = "username",
+    password_field: str = "password",
+    extra_fields: dict[str, str] | None = None,
+    verify_url: str | None = None,
+    credentials: list[tuple[str, str]] | None = None,
+    timeout_ms: int = 12000,
+) -> tuple[dict[str, str] | None, str | None, str | None]:
+    """Inner sync Playwright logic — must run in a thread without an asyncio loop."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None, None, None
+
+    creds = credentials or DEFAULT_CREDENTIALS
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+
+        for i, (uname, pwd) in enumerate(creds):
+            log(f"  [{i+1}/{len(creds)}] Trying {uname}:{pwd}", Colors.YELLOW,
+                verbose_only=True, verbose=True)
+
+            context = browser.new_context()
+            page = context.new_page()
+            page.set_default_timeout(timeout_ms)
+            # Block resource-heavy third-party content that causes hangs
+            page.route("**/*", lambda route: route.abort("blockedbyclient")
+                       if route.request.resource_type in ("image", "font", "media", "stylesheet")
+                       else route.continue_())
+            success = False
+            cookie_dict: dict[str, str] = {}
+
+            try:
+                page.goto(login_url, timeout=timeout_ms,
+                          wait_until="domcontentloaded")
+
+                # ── Fill username ────────────────────────────────
+                usel = f'input[name="{username_field}"]'
+                if not page.query_selector(usel):
+                    usel = 'input[type="email"], input[name="email"]'
+                page.fill(usel, uname)
+
+                # ── Fill password ────────────────────────────────
+                psel = f'input[name="{password_field}"]'
+                if not page.query_selector(psel):
+                    psel = 'input[type="password"]'
+                page.fill(psel, pwd)
+
+                # ── Extra fields ─────────────────────────────────
+                for fname, fval in (extra_fields or {}).items():
+                    sel = f'input[name="{fname}"]'
+                    if page.query_selector(sel):
+                        page.fill(sel, fval)
+
+                # ── Submit ───────────────────────────────────────
+                btn = page.query_selector(
+                    'button[type="submit"], input[type="submit"]'
+                )
+                if btn:
+                    btn.click()
+                else:
+                    page.press(psel, "Enter")
+                page.wait_for_load_state("networkidle",
+                                         timeout=timeout_ms)
+
+                # ── Verify ───────────────────────────────────────
+                if verify_url:
+                    import requests as _req
+                    pw_cookies = context.cookies()
+                    for c in pw_cookies:
+                        if c.get("name") and c.get("value"):
+                            cookie_dict[c["name"]] = c["value"]
+                    if not cookie_dict:
+                        context.close()
+                        continue
+                    jar = _req.cookies.RequestsCookieJar()
+                    for c in pw_cookies:
+                        jar.set(c["name"], c["value"],
+                                domain=c.get("domain", ""),
+                                path=c.get("path", "/"))
+                    r = _req.get(verify_url, cookies=jar, timeout=10,
+                                 allow_redirects=False)
+                    if r.status_code not in (301, 302, 401):
+                        success = True
+                else:
+                    # No verify URL — use URL-change heuristic
+                    current_url = page.url
+                    if current_url.rstrip("/") != login_url.rstrip("/"):
+                        pw_cookies = context.cookies()
+                        for c in pw_cookies:
+                            if c.get("name") and c.get("value"):
+                                cookie_dict[c["name"]] = c["value"]
+                        if cookie_dict:
+                            success = True
+
+            except Exception:
+                context.close()
+                continue
+
+            context.close()
+
+            if success:
+                browser.close()
+                log(f"[!] Default credential FOUND: {uname}:{pwd}",
+                    Colors.RED)
+                return cookie_dict, uname, pwd
+
+        browser.close()
+        return None, None, None
+
+
+def try_default_credentials(
+    login_url: str,
+    username_field: str = "username",
+    password_field: str = "password",
+    extra_fields: dict[str, str] | None = None,
+    verify_url: str | None = None,
+    credentials: list[tuple[str, str]] | None = None,
+    timeout_ms: int = 12000,
+) -> tuple[dict[str, str] | None, str | None, str | None]:
+    """Try default / weak username-password pairs and return the first
+    working set as ``(cookies, username, password)``.
+
+    Each attempt uses a fresh browser context (isolated cookie jar).  A
+    credential is considered successful when *verify_url* returns an HTTP
+    status outside ``{301, 302, 401}``, or when no *verify_url* is given,
+    when the page URL changes after form submission (i.e. the app
+    redirected away from the login page).
+
+    Runs Playwright in a separate thread to avoid conflicts with any
+    asyncio event loop on the main thread.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log("[!] Playwright not available — cannot check default creds", Colors.RED)
+        return None, None, None
+
+    from concurrent.futures import ThreadPoolExecutor, wait
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(
+            _try_default_credentials_inner,
+            login_url=login_url,
+            username_field=username_field,
+            password_field=password_field,
+            extra_fields=extra_fields,
+            verify_url=verify_url,
+            credentials=credentials,
+            timeout_ms=timeout_ms,
+        )
+        done, _ = wait([fut], timeout=300)
+        if not done:
+            log("[!] Default-cred check timed out", Colors.YELLOW)
+            return None, None, None
+        try:
+            return fut.result()
+        except Exception as e:
+            log(f"[!] Default-cred check failed: {e}", Colors.YELLOW)
+            return None, None, None
 
 
 # ── Backward-compatible re-exports ──────────────────────────────────────

@@ -426,6 +426,31 @@ EVIDENCE_CLASSES: dict[EvidenceType, type[EvidenceBase]] = {
 }
 
 
+@dataclass
+class EvidenceQualityScore:
+    evidence_type: EvidenceType = EvidenceType.HTTP_REQUEST
+    strength: str = "weak"
+    completeness: float = 0.0
+    reproducibility: str = "single_request"
+    independence: bool = False
+    reasons: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "evidence_type": self.evidence_type.value,
+            "strength": self.strength,
+            "completeness": round(self.completeness, 2),
+            "reproducibility": self.reproducibility,
+            "independence": self.independence,
+            "reasons": self.reasons[:3],
+        }
+
+    @property
+    def strength_score(self) -> int:
+        scores = {"weak": 0, "medium": 1, "strong": 2, "very_strong": 3}
+        return scores.get(self.strength, 0)
+
+
 def evidence_from_dict(d: dict[str, Any]) -> EvidenceBase:
     etype = EvidenceType(d["evidence_type"])
     cls = EVIDENCE_CLASSES[etype]

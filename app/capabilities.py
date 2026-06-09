@@ -237,8 +237,8 @@ class CapabilityRegistry:
         """Try to auto-detect available OOB callback services."""
         available = []
         for service, check_fn in [
-            ("interactsh", self._check_interactsh),
             ("dnslog", self._check_dnslog),
+            ("interactsh", self._check_interactsh),
         ]:
             try:
                 result = check_fn()

@@ -285,10 +285,27 @@ class ReporterBase:
                 normalized.append(Finding.from_dict({"type": "unknown", "url": str(f)}))
         # Enrich with evidence-engine linked evidence
         enriched = self._enrich_finding_evidence(normalized)
-        # Apply impact assessment (mutates finding in-place for dict-compat fields)
-        impacted: list[Finding] = [assess_finding_impact(f) for f in enriched]
+
+        disabled_engines = config.get("disabled_engines", set())
+
+        # Apply impact assessment
+        if "impact" not in disabled_engines:
+            from engines.impact import ImpactEngine
+            for f in enriched:
+                existing = getattr(f, "impact_assessment", None)
+                if not existing or isinstance(existing, dict) and not existing.get("overall"):
+                    try:
+                        assessment = ImpactEngine.assess(f)
+                        object.__setattr__(f, "impact_assessment", assessment.to_dict())
+                    except Exception:
+                        assess_finding_impact(f)
+                else:
+                    assess_finding_impact(f)
+        else:
+            impacted: list[Finding] = [assess_finding_impact(f) for f in enriched]
+
         # Evidence completeness validation — catches weak findings
-        self.findings: list[Finding] = EvidenceCompletenessValidator.validate_all(impacted)
+        self.findings: list[Finding] = EvidenceCompletenessValidator.validate_all(enriched)
         # Root-cause aggregation
         aggregator = RootCauseAggregator(config)
         self.root_cause_groups: list[RootCauseGroup] = aggregator.aggregate(self.findings)
@@ -470,11 +487,13 @@ class ReporterBase:
         # Compute impact if not set
         if not result.get("impact"):
             result["impact"] = self._build_impact_narrative(f)
-        # Preserve dynamic attributes set by assess_finding_impact / group_by_root_cause
+        # Preserve dynamic attributes set by engines and pipeline
         for attr in ('impact_assessment', 'confirmed', 'priority_score',
                      'group_severity', 'group_verification_stage', 'group_confidence',
                      'component', 'request_response', 'what_is_it', 'grouped_urls',
-                     'business_impact', 'demonstrated_impact', 'historical'):
+                     'business_impact', 'demonstrated_impact', 'historical',
+                     'replay_bundle', 'chains', 'chain_impact', 'duplicate_risk',
+                     'finding_state', 'confidence_reasons'):
             if hasattr(f, attr):
                 val = getattr(f, attr)
                 if val is not None and val != "":
@@ -485,6 +504,36 @@ class ReporterBase:
         if findings is None:
             findings = self.findings
         return [self._finding_to_report_dict(f) for f in findings]
+
+    def _pipeline_metrics_dict(self) -> dict:
+        metrics = self.config.get("_pipeline_metrics")
+        if metrics:
+            return metrics.to_dict() if hasattr(metrics, "to_dict") else {}
+        return {}
+
+    def _finding_stage_breakdown(self) -> dict[str, int]:
+        stages = {"signal": 0, "potential": 0, "validated": 0, "verified": 0, "submission_ready": 0}
+        for f in self.findings:
+            state = getattr(f, "finding_state", None) or f.get("finding_state", "signal")
+            if state in stages:
+                stages[state] += 1
+        return stages
+
+    def _novelty_summary(self) -> dict:
+        return {
+            "potentially_novel": sum(
+                1 for f in self.findings
+                if f.get("duplicate_risk", {}).get("likelihood") == "potentially_novel"
+            ),
+            "likely_duplicate": sum(
+                1 for f in self.findings
+                if f.get("duplicate_risk", {}).get("likelihood") == "likely_duplicate"
+            ),
+            "moderate_risk": sum(
+                1 for f in self.findings
+                if f.get("duplicate_risk", {}).get("likelihood") == "moderate_risk"
+            ),
+        }
 
     def _format_evidence(self, evidence: Any, max_lines: int = 15) -> str:
         if not evidence:
@@ -537,6 +586,37 @@ class ReporterBase:
             if parts:
                 history_line = f"Historical: {' | '.join(parts)}\n"
 
+        # Pipeline metrics
+        pipeline_line = ""
+        metrics = self.config.get("_pipeline_metrics")
+        if metrics:
+            pipeline_line = (
+                f"Pipeline: Signals {metrics.total_signals} → "
+                f"Potential {metrics.promoted_to_potential} → "
+                f"Validated {metrics.promoted_to_validated} → "
+                f"Verified {metrics.promoted_to_verified} → "
+                f"Submission Ready {metrics.submission_ready}\n"
+            )
+
+        # Finding stage breakdown
+        stage_counts: dict[str, int] = {"signal": 0, "potential": 0, "validated": 0, "verified": 0, "submission_ready": 0}
+        for f in self.findings:
+            state = getattr(f, "finding_state", None) or f.get("finding_state", "signal")
+            if state in stage_counts:
+                stage_counts[state] += 1
+        stage_line = (
+            f"Pipeline Stage: Signal {stage_counts['signal']} | Potential {stage_counts['potential']} | "
+            f"Validated {stage_counts['validated']} | Verified {stage_counts['verified']} | "
+            f"Submission Ready {stage_counts['submission_ready']}\n"
+        ) if any(stage_counts.values()) else ""
+
+        # Novelty summary
+        novelty_line = ""
+        n_novel = sum(1 for f in self.findings if f.get("duplicate_risk", {}).get("likelihood") == "potentially_novel")
+        n_dup = sum(1 for f in self.findings if f.get("duplicate_risk", {}).get("likelihood") == "likely_duplicate")
+        if n_novel or n_dup:
+            novelty_line = f"Novelty: {n_novel} potentially novel | {n_dup} likely duplicate\n"
+
         return (
             f"Executive Summary\n"
             f"{'=' * 60}\n"
@@ -551,6 +631,9 @@ class ReporterBase:
             f"Confidence: Confirmed {conf.get('confirmed',0)} | High {conf.get('high',0)} | "
             f"Likely {conf.get('likely',0)} | Unverified {conf.get('unverified',0)}\n"
             f"{history_line}"
+            f"{pipeline_line}"
+            f"{stage_line}"
+            f"{novelty_line}"
             f"Top Critical/High Findings:\n{top_text}\n"
         )
 

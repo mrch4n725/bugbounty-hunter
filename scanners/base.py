@@ -344,6 +344,15 @@ class ScannerBase:
                 Colors.RED if sev in ("CRITICAL", "HIGH") else Colors.YELLOW)
 
             link_finding_evidence(f, self.evidence_engine)
+
+            # ── Replay snapshot capture ──────────────────────────────
+            if self.container and hasattr(self.container, 'replay_engine'):
+                try:
+                    bundle = self.container.replay_engine.build_bundle(f)
+                    object.__setattr__(f, "replay_bundle", bundle.to_dict())
+                except Exception:
+                    pass
+
             return True
 
     def _get_findings(self) -> list[Finding]:
