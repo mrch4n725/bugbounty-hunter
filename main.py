@@ -686,17 +686,33 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     log("[*] Checking self-halting conditions...", Colors.CYAN)
     updated = VulnScanner.check_self_halt(updated)
 
+    log("[*] Enriching findings with engine evidence...", Colors.CYAN)
+    evidence_engine = getattr(container, 'evidence_engine', None) if container else None
+    enriched: list[Finding] = []
+    for f in updated:
+        if isinstance(f, Finding):
+            obj = f
+        else:
+            obj = Finding.from_dict(f)
+        if evidence_engine is not None:
+            fp = obj.fingerprint or obj.get("fingerprint", "")
+            if fp:
+                linked = evidence_engine.get_evidence(fp)
+                if linked:
+                    if isinstance(obj.evidence, str):
+                        obj.evidence = [obj.evidence] if obj.evidence else []
+                    existing_ids = {id(e) for e in (obj.evidence or [])}
+                    for ev in linked:
+                        if id(ev) not in existing_ids:
+                            obj.evidence.append(ev)
+        enriched.append(obj)
+
     log("[*] Validating evidence completeness...", Colors.CYAN)
     from engines.evidence_validator import EvidenceCompletenessValidator
-    from models.finding import Finding
     evidence_validated = []
-    for f in updated:
-        if isinstance(f, dict):
-            obj = Finding.from_dict(f)
-            obj = EvidenceCompletenessValidator.validate(obj)
-            evidence_validated.append(obj.to_dict())
-        else:
-            evidence_validated.append(f)
+    for obj in enriched:
+        obj = EvidenceCompletenessValidator.validate(obj)
+        evidence_validated.append(obj.to_dict() if isinstance(obj, Finding) else obj)
     updated = evidence_validated
 
     updated = prioritize_findings(updated)

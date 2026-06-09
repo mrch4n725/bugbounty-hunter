@@ -18,27 +18,27 @@ Each scanner is assessed across five dimensions (0–5):
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | 1 | **XSS** | 4 | 4 | 5 | 4 | 3 | 1 | HttpRequest, HttpResponse, ResponseExcerpt, BrowserExecution, Screenshot | Yes | Yes | No confidence_score |
 | 2 | **SQLi** | 4 | 4 | 4 | 4 | 2 | 1 | Timing, HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score; timing evidence only for time-based |
-| 3 | **SSRF** | 4 | 4 | 3 | 0 | 2 | 3 | **None** | **No** | **No** | **CRITICAL: No typed evidence at all** — uses only OOB poll but doesn't store OOBCallbackEvidence |
-| 4 | **BlindXSS** | 4 | 3 | 4 | 4 | 3 | 1 | HttpRequest, OOBCallback | Yes | Yes | ⚡ Addressed — Fix 5 added HttpRequestEvidence for injection requests |
+| 3 | **SSRF** | 4 | 4 | 3 | 2 | 2 | 3 | HttpRequest, ResponseExcerpt, OOBCallback | Yes | Yes | collect_evidence stores request+response evidence; OOB callback evidence stored and linked post-poll. Dynamic confidence scoring via _calculate_ssrf_confidence(). |
+| 4 | **BlindXSS** | 4 | 3 | 4 | 4 | 3 | 1 | HttpRequest, OOBCallback | Yes | Yes | Fix 5 added HttpRequestEvidence for injection requests. OOB callback evidence stored and linked. |
 | 5 | **CMDI** | 4 | 4 | 4 | 4 | 2 | 1 | Timing, HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score |
 | 6 | **XXE** | 4 | 4 | 4 | 4 | 2 | 1 | HttpRequest, ResponseExcerpt, OOBCallback | Yes | Yes | No confidence_score |
 | 7 | **Authorization** | 4 | 4 | 4 | 5 | 3 | 1 | AuthorizationComparison | Yes | Yes | No confidence_score |
-| 8 | **SSTI** | 3 | 3 | 3 | 0 | 3 | 1 | **None** | **No** | **No** | **HIGH: No typed evidence at all** — uses 3-stage detect/validate/exploit but stores nothing |
+| 8 | **SSTI** | 4 | 3 | 3 | 2 | 3 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | collect_evidence stores request+response evidence for each stage. 3-stage pipeline (detect→validate→exploit) with evidence per stage. No dynamic confidence. |
 | 9 | **SensitiveData** | 3 | 3 | 1 | 3 | 2 | 1 | HttpRequest, ResponseExcerpt, SecretValidation | Yes | Yes | Only pattern-matching; no validation beyond regex |
 | 10 | **IDOR** | 3 | 3 | 3 | 4 | 3 | 1 | AuthorizationComparison (via modules/idor.py) | Yes | Yes | No confidence_score |
 | 11 | **Headers** | 4 | 4 | 2 | 3 | 3 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | ⚡ Addressed — Fix 4 added HttpRequestEvidence + ResponseExcerptEvidence storage and linking. Multi-signal detection (missing headers, info disclosure, CSP, cookies, CORS). Context-aware reproduction. |
 | 12 | **LFI** | 2 | 3 | 2 | 2 | 3 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score |
-| 13 | **OpenRedirect** | 2 | 3 | 2 | 0 | 3 | 1 | **None** | **No** | **No** | **HIGH: No typed evidence** — Location header stored as string only |
+| 13 | **OpenRedirect** | 3 | 3 | 2 | 2 | 3 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No dynamic confidence_score |
 | 14 | **ExposedFiles** | 2 | 2 | 1 | 2 | 2 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score |
 | 15 | **GraphQL** | 2 | 3 | 1 | 2 | 2 | 1 | GraphQLSchema | Yes | Yes | No validation beyond introspection detection |
 | 16 | **OpenAPI** | 2 | 2 | 1 | 2 | 2 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No validation beyond path discovery |
-| 17 | **CSRF** | 1 | 2 | 0 | 0 | 2 | 1 | **None** | **No** | **No** | **HIGH: No typed evidence** — form structure analysis only, no actual request made |
-| 18 | **Clickjacking** | 1 | 2 | 1 | 2 | 2 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | Header check only |
-| 19 | **HttpMethods** | 1 | 2 | 1 | 2 | 2 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No validation beyond status code |
-| 20 | **InsecureForms** | 1 | 2 | 0 | 0 | 2 | 1 | **None** | **No** | **No** | **HIGH: No typed evidence** — form structure analysis only |
-| 21 | **DirectoryFuzz** | 1 | 2 | 1 | 0 | 2 | 1 | **None** | **No** | **No** | **HIGH: No typed evidence** — status code based only |
-| 22 | **SubdomainTakeover** | 1 | 2 | 0 | 0 | 2 | 1 | **None** | **No** | **No** | **HIGH: No typed evidence** — signature string match only |
-| 23 | **RateLimiting** | 1 | 2 | 1 | 2 | 2 | 1 | Timing | Yes | Yes | No confidence_score; now TARGET_LEVEL (runs once per host, not per URL) |
+| 17 | **CSRF** | 2 | 2 | 0 | 2 | 2 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No actual request made during form analysis (passive); typed evidence stores request metadata and response excerpt |
+| 18 | **Clickjacking** | 2 | 2 | 1 | 2 | 2 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | Header check only |
+| 19 | **HttpMethods** | 2 | 2 | 1 | 2 | 2 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No validation beyond status code |
+| 20 | **InsecureForms** | 2 | 2 | 0 | 2 | 2 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | Typed evidence stores form action metadata and response content |
+| 21 | **DirectoryFuzz** | 3 | 2 | 1 | 2 | 2 | 1 | ResponseExcerpt | Yes | Yes | No HttpRequest evidence; only ResponseExcerpt stored |
+| 22 | **SubdomainTakeover** | 3 | 2 | 0 | 2 | 2 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No dynamic confidence_score |
+| 23 | **RateLimiting** | 3 | 2 | 1 | 2 | 2 | 1 | Timing | Yes | Yes | No dynamic confidence_score; TARGET_LEVEL (runs once per host, not per URL) |
 | 24 | **CORS** | 3 | 3 | 2 | 2 | 2 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score |
 | 25 | **JWT** | 3 | 3 | 2 | 2 | 2 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score |
 
@@ -47,44 +47,54 @@ Each scanner is assessed across five dimensions (0–5):
 | Metric | Count | % |
 |---|---|---|
 | Total scanners | 25 | 100% |
-| Maturity ≥ 4 (skip legacy) | 10 | 40% |
-| Maturity = 3 | 10 | 40% |
-| Maturity = 2 | 5 | 20% |
+| Maturity ≥ 4 (skip legacy) | 9 | 36% |
+| Maturity = 3 | 8 | 32% |
+| Maturity = 2 | 8 | 32% |
 | Maturity = 1 | 0 | 0% |
-| Use evidence_engine | 19 | 76% |
-| Store typed evidence | 18 | 72% |
-| **NO typed evidence** | **7** | **28%** |
-| Link evidence to findings | 18 | 72% |
+| Use evidence_engine | 25 | 100% |
+| Store typed evidence | 25 | 100% |
+| **NO typed evidence** | **0** | **0%** |
+| Link evidence to findings | 25 | 100% |
 | Produce confidence_score | 1 | 4% |
 | Produce evidence_strength | 0 | 0% |
 | Produce false_positive_risk | 0 | 0% |
 
 ## Gap Analysis
 
-### Critical Gap: SSRF (Maturity 4, zero evidence)
+### ✅ Resolved: SSRF (Maturity 4, zero evidence)
 
-SSRF is marked as maturity 4 with OOB verification, but **does not store any typed evidence** via the evidence engine. The OOB detection polls for callbacks but never creates an `OOBCallbackEvidence` object. The findings are created as raw dicts with string evidence. This means:
+SSRF was previously flagged as having no typed evidence, but **this has been resolved**. The scanner now:
 
-- OOB-confirmed SSRF findings have no linkable evidence in the EvidenceEngine
-- Reporters cannot render type-specific evidence blocks for SSRF (no collapsible OOB callback details, no request/response evidence)
-- The OOB poll results are used solely for verification_stage promotion, not for evidence enrichment
-- Compare with BlindXSS (also OOB-based, correctly stores `OOBCallbackEvidence` and links it)
+- Stores `HttpRequestEvidence` and `ResponseExcerptEvidence` via `collect_evidence()` for each metadata detection finding
+- Stores `OOBCallbackEvidence` for OOB-confirmed findings, linked to the finding fingerprint
+- Links all evidence to findings via `evidence_engine.link_to_finding()`
+- Has dynamic confidence scoring via `_calculate_ssrf_confidence()` (the only scanner with non-hardcoded confidence)
+- Reporters render type-specific evidence blocks for SSRF findings (collapsible OOB callback details, request/response evidence)
 
-**Fix**: Add `OOBCallbackEvidence`, `HttpRequestEvidence`, and `ResponseExcerptEvidence` storage + linking in `SSRFScanner.scan()`
+### ✅ Resolved: SSTI (Maturity 4, previously had no evidence)
 
-### High Gap: SSTI (Maturity 3, zero evidence)
+SSTI's evidence gap has been closed. The scanner now:
 
-SSTI has a sophisticated 3-stage detection pipeline (detect → validate → exploit) but **stores no typed evidence**. The raw responses from each stage are discarded after processing. DetectionResults carry raw_response but it's never persisted.
+- Creates `HttpRequestEvidence` and `ResponseExcerptEvidence` per detection via `collect_evidence()`
+- Stores and links evidence for each of the 3 stages (detect, validate, exploit)
+- Creates engine-fingerprint evidence in the validation phase
+- Stores exploitation proof evidence when read-proof payloads succeed
+- Links all evidence to findings via `evidence_engine.link_to_finding()`
 
-**Fix**: Add `HttpRequestEvidence` for each payload sent, `ResponseExcerptEvidence` for each response, and optionally a `CompositeEvidence` packaging all three stages.
+### ✅ Resolved: Evidence-Starved Scanners
 
-### High Gap: 6 Low-Maturity Scanners with No Evidence (1 fixed)
+All scanners now store typed evidence via the evidence engine. The previously flagged gaps:
 
-These scanners produce findings with string evidence only and never touch `evidence_engine`:
+- ~~**SSRF** — now stores HttpRequest + ResponseExcerpt + OOBCallback evidence~~
+- ~~**SSTI** — now stores HttpRequest + ResponseExcerpt evidence per stage~~
+- ~~**Headers** — now stores HttpRequest + ResponseExcerpt evidence~~
+- ~~**OpenRedirect** — now stores HttpRequest + ResponseExcerpt evidence~~
+- ~~**CSRF** — now stores HttpRequest + ResponseExcerpt evidence~~
+- ~~**InsecureForms** — now stores HttpRequest + ResponseExcerpt evidence~~
+- ~~**DirectoryFuzz** — now stores ResponseExcerpt evidence~~
+- ~~**SubdomainTakeover** — now stores HttpRequest + ResponseExcerpt evidence~~
 
-~~- **Headers** (was Maturity 2, now 4): Had CORS validation logic but didn't store evidence~~ ✅ **Fixed in Fix 4** — now stores HttpRequestEvidence + ResponseExcerptEvidence
-- **OpenRedirect** (Maturity 3): Has `detect()` and `generate_reproduction()` but no evidence storage
-- **CSRF** (Maturity 2), **InsecureForms** (Maturity 2), **DirectoryFuzz** (Maturity 3), **SubdomainTakeover** (Maturity 3): No evidence at all
+All 25 scanners import from `models.evidence`, call `evidence_engine.store()` and `evidence_engine.link_to_finding()`.
 
 **Fix**: Add `HttpRequestEvidence` + `ResponseExcerptEvidence` as a baseline for all of them.
 
@@ -103,29 +113,11 @@ All scanners produce `steps_to_reproduce`. Quality varies:
 
 ## Prioritized Remediation Plan
 
-### Phase 1: Critical — SSRF Evidence (est. 1 hour)
+### ✅ Phase 1-3: All Evidence Gaps Closed
 
-1. Add `from models.evidence import OOBCallbackEvidence, HttpRequestEvidence, ResponseExcerptEvidence` to `scanners/ssrf.py`
-2. After metadata signature match: create and store `HttpRequestEvidence` + `ResponseExcerptEvidence`
-3. After OOB callback: create and store `OOBCallbackEvidence` with `raw_data`, `callback_host`, `interaction_time`, `callback_token`
-4. Link all evidence to finding fingerprint
+SSRF, SSTI, Headers, OpenRedirect, CSRF, InsecureForms, DirectoryFuzz, and SubdomainTakeover all now store and link typed evidence via the evidence engine. See [the resolved gaps above](#-resolved-evidence-starved-scanners).
 
-### Phase 2: High — SSTI Evidence (est. 1.5 hours)
-
-1. Import evidence types into `scanners/ssti.py`
-2. Store `HttpRequestEvidence` + `ResponseExcerptEvidence` for each of the 3 stages (detect, validate, exploit)
-3. Consider `CompositeEvidence` to bundle all 3 stages under one finding
-4. Link to fingerprint
-
-### Phase 3: Medium — Evidence-Starved Scanners (est. 30 min each = 2.5 hours)
-
-✅ **Headers** — Fixed in Fix 4 (HttpRequestEvidence + ResponseExcerptEvidence stored and linked)
-
-Remaining (5): OpenRedirect, CSRF, InsecureForms, DirectoryFuzz, SubdomainTakeover:
-
-1. Import `HttpRequestEvidence`, `ResponseExcerptEvidence`
-2. After each probe request: store evidence and link to finding
-3. This is the `ScannerBase.finalize()` auto-evidence pattern already used by `base.py` — extend the pattern or call the base class
+The evidence pipeline in `main.py` has also been fixed: findings are now enriched with linked evidence from the engine **before** `EvidenceCompletenessValidator.validate()` runs, so the validator correctly detects all `EvidenceType` values (including `TIMING_PROOF`, `OOB_CALLBACK`, `BROWSER_EXECUTION`) instead of relying solely on `request`/`response_excerpt` string fallbacks.
 
 ### Phase 4: Medium — Confidence Scoring (est. 2 hours)
 
