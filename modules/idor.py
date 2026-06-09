@@ -577,6 +577,40 @@ class IdorScanner(VulnScanner):
                 log(f"  [IDOR Owner] {test_url[:80]} — {default_role} vs {alt_role}",
                     Colors.RED, verbose_only=True, verbose=self.verbose)
 
+    # ── Passive scan (zero additional requests) ────────────────────────────
+
+    def scan_passive(self, findings: list[dict], candidates: list[dict]) -> None:
+        """Report discovered ID-like parameters without making additional requests.
+        
+        Useful for passive-mode bounty scans where payload injection is prohibited.
+        Produces lower-confidence findings but avoids any active probing."""
+        for c in candidates:
+            url = c["url"]
+            param = c["param"]
+            id_type = c["type"]
+            value = c["value"]
+
+            f_dict = finding(
+                "IDOR - Potential Insecure Direct Object Reference",
+                url, "medium",
+                f"Parameter '{param}' contains {id_type} identifier: {value[:50]} — "
+                f"suggests direct object reference pattern that may allow unauthorized access",
+                f"Parameter '{param}'={value[:80]} (type: {id_type})",
+                verification_stage="detected",
+                parameter=param,
+                response_excerpt=f"Discovered via passive URL analysis: {param}={value[:80]} (type: {id_type})",
+                steps_to_reproduce=[
+                    f"Identify the endpoint at {url}",
+                    f"Note parameter '{param}' with value '{value[:60]}' (type: {id_type})",
+                    "If the application uses numeric or UUID-based references, try replacing with another user's value",
+                    "Compare responses to check if different users' data is accessible",
+                ],
+            )
+            if f_dict:
+                self._append_finding(findings, f_dict)
+                log(f"  [IDOR Passive] {param}={value[:40]} @ {url[:60]} ({id_type})",
+                    Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+
     # ── Orchestrator ──────────────────────────────────────────────────────
 
     def run_all(self) -> list[dict]:
@@ -588,10 +622,12 @@ class IdorScanner(VulnScanner):
             log(f"  [IDOR] Found {len(candidates)} ID candidate(s)", Colors.CYAN,
                 verbose_only=True, verbose=self.verbose)
 
-        self.scan_horizontal_privesc(findings, candidates)
-        self.scan_sequential_enum(findings, candidates)
-        self.scan_encoded_id_manipulation(findings, candidates)
-        self.verify_ownership(findings, candidates)
+        self.scan_passive(findings, candidates)
+        if not self.config.get("passive"):
+            self.scan_horizontal_privesc(findings, candidates)
+            self.scan_sequential_enum(findings, candidates)
+            self.scan_encoded_id_manipulation(findings, candidates)
+            self.verify_ownership(findings, candidates)
 
         # Bundle evidence items per finding into CompositeEvidence
         for fdict in findings:

@@ -22,6 +22,8 @@ from scanners.graphql import GraphQLScanner
 from scanners.idor import IdorScannerAdapter
 from scanners.openapi import OpenAPIScanner
 from scanners.authorization import AuthorizationScanner
+from scanners.cors import CORSScanner
+from scanners.jwt import JWTSanner
 
 __all__ = [
     "ScannerBase",
@@ -48,6 +50,8 @@ __all__ = [
     "IdorScannerAdapter",
     "OpenAPIScanner",
     "AuthorizationScanner",
+    "CORSScanner",
+    "JWTSanner",
 ]
 
 

@@ -426,6 +426,35 @@ EXPOSED_FILES = [
     "/.htpasswd", "/web.xml", "/pom.xml", "/.aws/credentials",
     "/.ssh/id_rsa", "/Dockerfile", "/.dockerignore", "/docker-compose.yml",
     "/secrets.txt", "/passwords.txt", "/.env.example",
+    # CMS-specific
+    "/wp-admin", "/wp-admin/admin-ajax.php", "/wp-json/", "/wp-json/wp/v2/users",
+    "/xmlrpc.php", "/wp-content/debug.log", "/wp-content/uploads/",
+    "/wp-includes/", "/wp-config.php~", "/wp-config.php.old",
+    "/wp-config.php.save", "/wp-config.php.bak",
+    "/administrator/manifests/files/joomla.xml", "/administrator/",
+    "/components/", "/modules/", "/plugins/",
+    "/sites/default/settings.php", "/sites/default/files/",
+    "/CHANGELOG.txt", "/INSTALL.txt", "/UPGRADE.txt",
+    # Additional sensitive files
+    "/logs/", "/error.log", "/access.log", "/debug.log",
+    "/dump.sql", "/db_dump.sql", "/database.sql",
+    "/appsettings.json", "/appsettings.Development.json",
+    "/configuration.json", "/settings.json", "/config.json",
+    "/local.xml", "/parameters.yml", "/parameters.yaml",
+    "/Procfile", "/requirements.txt", "/composer.json", "/composer.lock",
+    "/package.json", "/package-lock.json", "/yarn.lock",
+    "/npm-debug.log", "/yarn-error.log",
+    "/sftp-config.json", "/.ftpconfig", "/.remote-sync.json",
+    "/credentials", "/.credentials", "/credentials.json",
+    "/api/keys", "/api-key", "/api_key",
+    "/swagger.json", "/openapi.json", "/api-docs",
+    "/oauth/token", "/oauth/authorize",
+    "/_debug/", "/debug/", "/dev/", "/test/",
+    "/server-status", "/server-info",
+    "/actuator/health", "/actuator/info", "/actuator/env", "/actuator/beans",
+    "/actuator/mappings", "/actuator/configprops",
+    "/metrics", "/health", "/info", "/env", "/beans",
+    "/console/", "/manager/", "/jmx/",
 ]
 
 SECURITY_HEADERS = {
@@ -448,6 +477,43 @@ TAKEOVER_SIGNATURES = [
 CLICKJACKING_SAFE_DIRECTIVES = [
     "frame-ancestors 'none'", "frame-ancestors 'self'", "frame-ancestors https:",
 ]
+
+# ── CMS-specific vulnerability checks ────────────────────────────────────────
+
+CMS_CHECKS: dict[str, list[dict]] = {
+    "WordPress": [
+        {"path": "/wp-json/wp/v2/users", "name": "WordPress User Enumeration", "severity": "medium",
+         "check": lambda b: '"id"' in b and '"name"' in b},
+        {"path": "/wp-json/", "name": "WordPress REST API Exposure", "severity": "low",
+         "check": lambda b: '"namespaces"' in b},
+        {"path": "/xmlrpc.php", "name": "WordPress XML-RPC Enabled", "severity": "medium",
+         "check": lambda b: "XML-RPC" in b or "system.listMethods" in b},
+        {"path": "/wp-content/debug.log", "name": "WordPress Debug Log Exposed", "severity": "high",
+         "check": lambda b: "PHP" in b or "Stack trace" in b or "WordPress" in b},
+        {"path": "/wp-content/uploads/", "name": "WordPress Uploads Directory Listing", "severity": "medium",
+         "check": lambda b: "Index of" in b or "wp-content/uploads" in b},
+        {"path": "/readme.html", "name": "WordPress Version Disclosure", "severity": "low",
+         "check": lambda b: "WordPress" in b},
+        {"path": "/wp-admin/admin-ajax.php", "name": "WordPress Unauthenticated AJAX", "severity": "low",
+         "check": lambda b: "0" in b or "error" not in b.lower()},
+        {"path": "/?author=1", "name": "WordPress Author Enumeration", "severity": "low",
+         "check": lambda b: "author" in b.lower() and ("/author/" in b or "author-1" in b)},
+    ],
+    "Drupal": [
+        {"path": "/user/register", "name": "Drupal Registration Open", "severity": "medium",
+         "check": lambda b: "form" in b and ("register" in b or "password" in b)},
+        {"path": "/node/1", "name": "Drupal Node Access", "severity": "medium",
+         "check": lambda b: "node" in b and "not found" not in b.lower()},
+        {"path": "/CHANGELOG.txt", "name": "Drupal Version Disclosure", "severity": "low",
+         "check": lambda b: "Drupal" in b},
+    ],
+    "Joomla": [
+        {"path": "/administrator/", "name": "Joomla Admin Panel Exposed", "severity": "medium",
+         "check": lambda b: "joomla" in b.lower() or "administration" in b.lower()},
+        {"path": "/components/", "name": "Joomla Components Directory Listing", "severity": "low",
+         "check": lambda b: "Index of" in b or "/components/" in b},
+    ],
+}
 
 # ── Scanner class ─────────────────────────────────────────────────────────────
 
@@ -3587,6 +3653,85 @@ class VulnScanner:
         if result := self._dispatch_to_scanner("authorization", target_urls):
             return result
         return []
+
+    def scan_cors(self, target_urls: list[str] | None = None) -> list[dict]:
+        """Dispatch to CORSScanner (ScannerBase)."""
+        if result := self._dispatch_to_scanner("cors"):
+            return result
+        return []
+
+    def scan_jwt(self, target_urls: list[str] | None = None) -> list[dict]:
+        """Dispatch to JWTSanner (ScannerBase)."""
+        if result := self._dispatch_to_scanner("jwt"):
+            return result
+        return []
+
+    def scan_cms_checks(self, target_urls: list[str] | None = None) -> list[dict]:
+        """Scan for CMS-specific vulnerabilities based on technology fingerprint.
+
+        Uses technology fingerprint from recon to detect known-vulnerable
+        CMS endpoints (WordPress, Drupal, Joomla, etc.).
+        """
+        findings: list[dict] = []
+        technology = self.recon.get("technology", {})
+        if not technology:
+            return findings
+
+        target_base = self.config.get("target", "").rstrip("/")
+        all_cms = technology.get("cms", [])
+        all_frameworks = technology.get("framework", [])
+
+        detected_platforms = set(all_cms + all_frameworks)
+
+        for platform in detected_platforms:
+            checks = CMS_CHECKS.get(platform, [])
+            if not checks:
+                # Check partial matches (e.g. "WordPress" in detected name)
+                for key, value in CMS_CHECKS.items():
+                    if key.lower() in platform.lower():
+                        checks = value
+                        break
+
+            for check in checks:
+                try:
+                    path = check["path"]
+                    test_url = urljoin(target_base, path) if not path.startswith("http") else path
+                    if not self._in_scope(test_url):
+                        continue
+                    resp = safe_get(self.session, test_url, self.timeout, raise_for_status=False)
+                    if not resp or resp.status_code not in (200, 403, 401):
+                        continue
+                    if resp.status_code == 200 and check.get("check", lambda b: True)(resp.text):
+                        f = finding(
+                            vuln_type=check["name"],
+                            url=test_url,
+                            severity=check["severity"],
+                            details=f"{platform} specific check: {check['name']}",
+                            evidence=f"HTTP {resp.status_code} — {len(resp.text)} bytes",
+                            request=_build_curl("GET", test_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
+                            response_excerpt=resp.text[:500],
+                            steps_to_reproduce=[f"Send GET request to {test_url}", f"Observe the response content"],
+                            verification_stage=VerificationStage.VALIDATED.value,
+                        )
+                        if f and self._add(f):
+                            findings.append(f)
+                    elif resp.status_code in (403, 401):
+                        f = finding(
+                            vuln_type=f"{platform} Admin/Auth Endpoint ({check['name']})",
+                            url=test_url,
+                            severity="low",
+                            details=f"{platform} authenticated endpoint accessible: {check['name']} (HTTP {resp.status_code})",
+                            evidence=f"HTTP {resp.status_code} — endpoint exists but requires auth",
+                            request=_build_curl("GET", test_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
+                            response_excerpt=resp.text[:500],
+                            steps_to_reproduce=[f"Send GET request to {test_url}", f"Observe HTTP {resp.status_code} response"],
+                            verification_stage=VerificationStage.DETECTED.value,
+                        )
+                        if f and self._add(f):
+                            findings.append(f)
+                except Exception:
+                    continue
+        return findings
 
     # ═════════════════════════════════════════════════════════════════════
     # Verify-only mode

@@ -3,12 +3,14 @@ HttpMethodsScanner — discovers dangerous HTTP methods (TRACE, PUT, DELETE, etc
 
 Lifecycle:
   DETECTED:   OPTIONS response reveals dangerous HTTP methods
-  VALIDATED:  (not applicable)
+  VALIDATED:  Per-method probe confirms method is actually enabled
   EXPLOITABLE: (not applicable)
   VERIFIED:   (not applicable)
 
-Maturity: Level 1 (Detection only)
+Maturity: Level 2 (Detect + Validate)
 """
+
+import json
 
 from modules.utils import (
     safe_get, finding, VerificationStage, log, Colors, _build_curl,
@@ -21,7 +23,7 @@ from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
 
 class HttpMethodsScanner(ScannerBase):
     SCANNER_NAME = "http_methods"
-    SCANNER_MATURITY = 1
+    SCANNER_MATURITY = 2
     TARGET_LEVEL = True
     SCANNER_ORDER = 10
 
@@ -59,7 +61,47 @@ class HttpMethodsScanner(ScannerBase):
             return None
 
     def validate(self, detection: DetectionResult) -> ValidationResult | None:
-        return ValidationResult(confirmed=False, method="options_probe", detail="HTTP methods detected via OPTIONS response; actual enablement should be verified per-method")
+        url = detection.url
+        methods = [m.strip() for m in detection.payload.split(",")]
+        confirmed_methods: list[str] = []
+
+        for method in methods:
+            try:
+                if method.upper() == "TRACE":
+                    resp = self.session.request("TRACE", url, timeout=self.timeout)
+                    if resp and resp.status_code in (200, 201, 202):
+                        confirmed_methods.append(method)
+                elif method.upper() == "PUT":
+                    resp = self.session.put(url, data="test", timeout=self.timeout)
+                    if resp and resp.status_code not in (405, 501, 403):
+                        confirmed_methods.append(method)
+                elif method.upper() == "DELETE":
+                    resp = self.session.delete(url, timeout=self.timeout)
+                    if resp and resp.status_code not in (405, 501, 403):
+                        confirmed_methods.append(method)
+                elif method.upper() == "PATCH":
+                    resp = self.session.patch(url, data="test", timeout=self.timeout)
+                    if resp and resp.status_code not in (405, 501, 403):
+                        confirmed_methods.append(method)
+                elif method.upper() == "PROPFIND":
+                    resp = self.session.request("PROPFIND", url, timeout=self.timeout)
+                    if resp and resp.status_code not in (405, 501, 403):
+                        confirmed_methods.append(method)
+            except Exception:
+                continue
+
+        if confirmed_methods:
+            return ValidationResult(
+                confirmed=True,
+                signals=confirmed_methods,
+                method="per_method_probe",
+                detail=f"Dangerous HTTP methods confirmed enabled: {', '.join(confirmed_methods)}",
+            )
+        return ValidationResult(
+            confirmed=False,
+            method="per_method_probe",
+            detail="Methods advertised in OPTIONS but not confirmed via per-method probes",
+        )
 
     def collect_evidence(self, detection: DetectionResult,
                          validation_result: ValidationResult | None = None) -> list:
@@ -104,6 +146,8 @@ class HttpMethodsScanner(ScannerBase):
                 for ev in evidence_list:
                     self.evidence_engine.store(ev)
 
+                stage = VerificationStage.VALIDATED.value if (validation_result and validation_result.confirmed) else VerificationStage.DETECTED.value
+
                 f = finding(
                     vuln_type="Dangerous HTTP Methods Enabled",
                     url=target,
@@ -113,7 +157,7 @@ class HttpMethodsScanner(ScannerBase):
                     request=_build_curl("OPTIONS", target, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
                     response_excerpt=detection.raw_response.text[:500] if detection.raw_response else "",
                     steps_to_reproduce=self.generate_reproduction(detection, validation_result),
-                    verification_stage=VerificationStage.DETECTED.value,
+                    verification_stage=stage,
                 )
                 if f:
                     fingerprint = f.get("fingerprint", "")

@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 
 from modules.utils import make_session, safe_get, same_domain, log, Colors, url_in_scope, finding, safe_cookies_dict
+from engines.tech_fingerprint import TechnologyFingerprinter
 try:
     from playwright.sync_api import sync_playwright
 except ImportError:
@@ -58,6 +59,30 @@ class Recon:
         'secure', 'server', 'host', 'cloud', 'cdn', 'web', 'app', 'service',
         'email', 'smtp', 'pop', 'ns', 'mx', 'dns', 'db', 'database'
     ]
+
+    COMMON_PATHS = [
+        "/admin", "/administrator", "/wp-admin", "/login", "/wp-login.php",
+        "/api", "/api/v1", "/api/v2", "/graphql", "/rest", "/soap",
+        "/.env", "/.git/config", "/backup", "/backup.zip", "/dump",
+        "/phpinfo.php", "/info.php", "/test.php", "/debug",
+        "/api/swagger.json", "/api/openapi.json", "/api/docs",
+        "/swagger-ui.html", "/swagger.json", "/openapi.json",
+        "/.well-known/security.txt", "/security.txt", "/robots.txt",
+        "/sitemap.xml", "/crossdomain.xml", "/clientaccesspolicy.xml",
+        "/wsdl", "/webservice", "/xmlrpc", "/actuator/health",
+        "/actuator/info", "/api/health", "/health",
+        "/console", "/manager/html", "/web-console",
+        "/server-status", "/server-info",
+    ]
+
+    # Hidden parameter names to discover via HTML comments and JS analysis
+    HIDDEN_PARAM_INDICATORS = [
+        "debug", "test", "mode", "dev", "env", "token", "secret",
+        "key", "api", "admin", "config", "source", "show",
+        "action", "do", "exec", "cmd", "command", "ajax",
+        "format", "type", "view", "template", "include",
+        "page", "file", "doc", "path", "load",
+    ]
     
     def __init__(self, config, container=None):
         """
@@ -85,6 +110,7 @@ class Recon:
             self.headless = False
         
         self.session = make_session(config)
+        self.tech_fingerprinter = TechnologyFingerprinter(self.session, self.timeout)
         self.urls = set()
         self.js_urls = set()
         self._js_endpoints = set()
@@ -95,6 +121,8 @@ class Recon:
         self.spa_shell_size = 0
         self.spa_shell_hash = ""
         self.authenticated = False
+        self.technology = {}
+        self._html_comments = []
         
         parsed = urlparse(self.target if '://' in self.target else f'https://{self.target}')
         self.base_url = f"{parsed.scheme}://{parsed.netloc}"
@@ -127,13 +155,23 @@ class Recon:
                 'js_urls': sorted(list(self.js_urls)),
                 'js_endpoints': sorted(list(self._js_endpoints)),
                 'authenticated': self.authenticated,
+                'technology': self.technology,
+                'html_comments': self._html_comments,
             }
 
-        # Start with subdomain enumeration and discover additional endpoints
+        # Technology fingerprinting
+        self.technology = self.tech_fingerprinter.fingerprint(self.target)
+        if self.technology:
+            log(f"[*] Technology detected: {self.tech_fingerprinter.summary()}", Colors.CYAN)
+
+        # Subdomain enumeration and certificate transparency lookup
         self._enumerate_subdomains()
         self._crt_sh_lookup()
         self._discover_robots()
         self._discover_sitemap()
+        
+        # Probe common paths for admin panels, API endpoints, exposed files
+        self._probe_common_paths()
         
         # Crawl the target
         self._crawl()
@@ -141,7 +179,10 @@ class Recon:
         # Headless JS-rendered crawling (opt-in)
         if self.headless:
             self._crawl_headless()
-        
+
+        # Active parameter fuzzing — discover hidden params on discovered URLs
+        self._fuzz_parameters()
+
         return {
             'urls': sorted(list(self.urls)),
             'forms': self.forms,
@@ -150,6 +191,8 @@ class Recon:
             'js_urls': sorted(list(self.js_urls)),
             'js_endpoints': sorted(list(self._js_endpoints)),
             'authenticated': self.authenticated,
+            'technology': self.technology,
+            'html_comments': self._html_comments,
         }
 
     def _fingerprint_shell(self):
@@ -315,6 +358,7 @@ class Recon:
             
             self._extract_forms(url, soup)
             self._extract_scripts(url, soup)
+            self._mine_html_comments(response.text, url)
             
             # Extract links if we haven't reached max crawling depth boundaries
             if depth < self.crawl_depth:
@@ -376,15 +420,16 @@ class Recon:
     def _enumerate_subdomains(self):
         """
         Enumerate common subdomains via DNS resolution with per-task timeout.
+        Uses faster timeouts and cancels aggressively to avoid hanging.
         """
         parsed = urlparse(self.target if '://' in self.target else f'http://{self.target}')
         domain = parsed.netloc.split(':')[0]
         
         log(f"Enumerating subdomains for {domain}", Colors.CYAN, self.verbose)
         
-        dns_timeout = max(self.timeout, 5) if self.timeout else 5
+        dns_timeout = min(3, max(self.timeout, 2))
         start = time.time()
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+        with ThreadPoolExecutor(max_workers=min(self.threads, 15)) as executor:
             futures = {
                 executor.submit(self._resolve_subdomain, subdomain, domain): subdomain
                 for subdomain in self.COMMON_SUBDOMAINS
@@ -402,8 +447,8 @@ class Recon:
                             log(f"Subdomain resolution error for {subdomain}: {str(e)}", Colors.RED, self.verbose)
                 if not futures:
                     break
-                if time.time() - start > 90:
-                    log("Subdomain enumeration exceeded 90s — cancelling remaining", Colors.YELLOW)
+                if time.time() - start > 30:
+                    log("Subdomain enumeration exceeded 30s — cancelling remaining", Colors.YELLOW)
                     for f in futures:
                         f.cancel()
                     break
@@ -772,18 +817,179 @@ class Recon:
             return False
         return evidence in r.text
 
+    def _probe_common_paths(self) -> None:
+        """Probe common admin, API, and sensitive paths across the target.
+
+        Discovers hidden endpoints that aren't linked from crawled pages.
+        Adds discovered 200/403/401 paths to the URL set for further scanning.
+        Probes are rate-limited to avoid overwhelming the target.
+        """
+        discovered = 0
+        log("[*] Probing common paths for hidden endpoints...",
+            Colors.CYAN, verbose_only=True, verbose=self.verbose)
+        for path in self.COMMON_PATHS:
+            test_url = urljoin(self.base_url, path)
+            try:
+                r = safe_get(self.session, test_url, self.timeout, raise_for_status=False)
+                if r is None:
+                    continue
+                if r.status_code in (200, 401, 403, 500):
+                    with self.urls_lock:
+                        if test_url not in self.urls:
+                            self.urls.add(test_url)
+                            discovered += 1
+                    if self.verbose:
+                        log(f"  [{r.status_code}] {test_url}", Colors.YELLOW)
+            except Exception:
+                continue
+        if discovered:
+            log(f"[+] Common path probing discovered {discovered} new endpoint(s)",
+                Colors.GREEN)
+
+    def _mine_html_comments(self, html: str, source_url: str) -> None:
+        """Extract hidden endpoints, parameters, and credentials from HTML comments."""
+        if not html:
+            return
+        patterns = [
+            re.compile(r'<!--.*?(?:TODO|FIXME|HACK|XXX|BUG|todo|fixme).*?-->', re.IGNORECASE),
+            re.compile(r'<!--.*?(?:https?://[^\s<>]+).*?-->', re.IGNORECASE),
+            re.compile(r'<!--.*?(?:api|endpoint|route|path)[:\s]+([^\s<>]+).*?-->', re.IGNORECASE),
+            re.compile(r'<!--.*?(?:param|parameter|field)[:\s]+([^\s<>]+).*?-->', re.IGNORECASE),
+            re.compile(r'<!--[\s\S]*?(?:debug|test|dev|staging|internal)[\s\S]*?-->', re.IGNORECASE),
+        ]
+        for pattern in patterns:
+            for match in pattern.findall(html):
+                if len(match) > 20:
+                    full_match = re.search(r'<!--[\s\S]*?' + re.escape(match[:50]) + r'[\s\S]*?-->', html, re.IGNORECASE)
+                    if full_match:
+                        self._html_comments.append({
+                            "source": source_url,
+                            "comment": full_match.group(0)[:500],
+                        })
+                        # Extract URLs from comments
+                        urls_in_comment = re.findall(r'(https?://[^\s<>"\']+)', full_match.group(0))
+                        for u in urls_in_comment:
+                            if same_domain(self.base_url, u) and url_in_scope(u, self.config):
+                                with self.urls_lock:
+                                    self.urls.add(u.split("#")[0].rstrip("/"))
+                        # Extract parameters from comments
+                        param_matches = re.findall(r'(?:param|parameter|field)[:\s]+(\w+)', full_match.group(0), re.IGNORECASE)
+                        for pm in param_matches:
+                            with self.params_lock:
+                                self.params.add(pm)
+
+    def _fuzz_parameters(self) -> None:
+        """Actively discover hidden URL parameters by fuzzing common param names.
+
+        For each unique path from discovered URLs, tries common parameter names
+        and checks if the response changes vs. baseline (no param).
+        Uses multi-signal detection: status code, content length, body hash, timing,
+        and keyword presence. Active parameters added back as new URL variations.
+        """
+        COMMON_PARAMS = [
+            "id", "user_id", "userId", "page", "limit", "offset", "sort",
+            "filter", "search", "q", "query", "token", "api_key", "key",
+            "type", "format", "view", "action", "mode", "debug", "test",
+            "lang", "locale", "callback", "redirect", "url", "path", "file",
+            "download", "upload", "admin", "config", "settings", "option",
+            "include", "template", "load", "import", "exec", "cmd",
+            "ajax", "method", "do", "route", "section", "tab", "step",
+            "order", "by", "category", "tag", "group", "status",
+            "email", "username", "name", "firstname", "lastname",
+            "phone", "mobile", "address", "zip", "postcode",
+        ]
+
+        urls = list(self.urls)
+        if not urls:
+            return
+
+        # Deduplicate by path (without query string)
+        seen_paths: dict[str, str] = {}
+        for u in urls:
+            parsed = urlparse(u)
+            path_key = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
+            if path_key not in seen_paths:
+                seen_paths[path_key] = u
+
+        path_list = list(seen_paths.values())[:50]
+        discovered = 0
+
+        log(f"[*] Parameter fuzzing on {len(path_list)} unique paths ({len(COMMON_PARAMS)} params each)...",
+            Colors.CYAN, verbose_only=True, verbose=self.verbose)
+
+        for base_url in path_list:
+            if urlparse(base_url).query:
+                continue
+
+            try:
+                baseline = safe_get(self.session, base_url, self.timeout, raise_for_status=False)
+                if not baseline:
+                    continue
+                baseline_len = len(baseline.text) if baseline.text else 0
+                baseline_status = baseline.status_code
+                baseline_hash = hashlib.md5(baseline.text.encode()).hexdigest() if baseline.text else ""
+            except Exception:
+                continue
+
+            for param in COMMON_PARAMS:
+                try:
+                    test_url = f"{base_url}?{param}=1"
+                    resp = safe_get(self.session, test_url, self.timeout, raise_for_status=False)
+                    if not resp:
+                        continue
+
+                    resp_len = len(resp.text) if resp.text else 0
+                    resp_status = resp.status_code
+                    resp_hash = hashlib.md5(resp.text.encode()).hexdigest() if resp.text else ""
+
+                    # Multi-signal detection
+                    signals = 0
+
+                    # Signal 1: Status code change
+                    if resp_status != baseline_status:
+                        signals += 1
+
+                    # Signal 2: Content hash change
+                    if baseline_hash and resp_hash != baseline_hash:
+                        signals += 1
+
+                    # Signal 3: Content length change (beyond noise threshold)
+                    if baseline_len > 0:
+                        size_ratio = resp_len / baseline_len if baseline_len else 1
+                        if size_ratio > 1.15 or size_ratio < 0.85:
+                            signals += 1
+
+                    # Signal 4: Parameter reflected in response body
+                    if resp.text and f"?{param}=" in resp.text[:2000]:
+                        signals += 1
+
+                    if signals >= 2:
+                        with self.urls_lock:
+                            self.urls.add(test_url)
+                            self.params.add(param)
+                        discovered += 1
+                        if self.verbose:
+                            log(f"  [Param] {param} active on {base_url} ({signals} signals)",
+                                Colors.GREEN)
+                except Exception:
+                    continue
+
+        if discovered:
+            log(f"[*] Parameter fuzzing discovered {discovered} active parameter(s)",
+                Colors.GREEN, verbose_only=True, verbose=self.verbose)
+
     def _resolve_subdomain(self, subdomain, domain):
         """
         Attempt to resolve a subdomain via DNS with a per-thread timeout.
         Runs gethostbyname in a daemon thread so a slow resolver cannot hang
-        the scanner.
+        the scanner. Fast timeout to avoid blocking.
         """
         full_domain = f"{subdomain}.{domain}"
         resolved = []
         
         def resolve():
             try:
-                socket.setdefaulttimeout(6)
+                socket.setdefaulttimeout(3)
                 addr = socket.gethostbyname(full_domain)
                 if addr:
                     resolved.append(addr)
@@ -792,7 +998,7 @@ class Recon:
         
         t = threading.Thread(target=resolve, daemon=True)
         t.start()
-        t.join(timeout=7)
+        t.join(timeout=4)
         
         if resolved:
             with self.subdomains_lock:

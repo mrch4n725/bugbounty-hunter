@@ -222,6 +222,7 @@ expected_methods = [
     "scan_sensitive_data", "scan_exposed_files", "scan_clickjacking",
     "scan_http_methods", "scan_insecure_forms", "scan_subdomain_takeover",
     "scan_graphql", "scan_rate_limiting", "scan_openapi",
+    "scan_cors", "scan_jwt",
     "chain_analysis",
 ]
 for m in expected_methods:
@@ -658,9 +659,10 @@ expected_maturity = {
     "xss": 4, "sqli": 4, "ssrf": 4, "blind_xss": 4, "cmd_injection": 4,
     "xxe": 4, "authorization": 4, "ssti": 4, "headers": 4, "sensitive": 4,
     "lfi": 3, "open_redirect": 3, "exposed_files": 3, "graphql": 3,
-    "idor": 3,     "clickjacking": 1, "csrf": 1, "http_methods": 1,
-    "insecure_forms": 1, "dirb": 3, "subdomain_takeover": 1,
+    "idor": 3,     "clickjacking": 2, "csrf": 2, "http_methods": 2,
+    "insecure_forms": 2, "dirb": 3, "subdomain_takeover": 3,
     "rate_limiting": 3, "openapi": 2,
+    "cors": 3, "jwt": 3,
 }
 for scanner_name, expected in expected_maturity.items():
     cls = cls_map.get(scanner_name)

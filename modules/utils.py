@@ -73,6 +73,7 @@ _MASK_SENSITIVE_DEFAULT: bool = True
 class ScanProgress:
     """Rich-based scan progress bar with ETA, findings count, and module tracking.
 
+    Uses the same Console singleton as log() to avoid display corruption.
     Falls back to no-op when Rich is unavailable or --no-rich is set.
     Usage:
         with ScanProgress(total_urls, config) as prog:
@@ -92,15 +93,20 @@ class ScanProgress:
         no_rich = self._config.get("no_rich", False) or not _rich_available()
         if no_rich:
             return self
+        console = _get_console()
+        if console is None:
+            return self
         from rich.progress import (
-            BarColumn, Progress, TextColumn, TimeRemainingColumn,
+            BarColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn,
         )
         self._progress = Progress(
+            SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
             TimeRemainingColumn(),
             TextColumn("[bold]{task.fields[findings]} findings"),
+            console=console,
         )
         self._progress.start()
         self._task_id = self._progress.add_task(
@@ -122,6 +128,44 @@ class ScanProgress:
         self._findings_count = count
         if self._progress and self._task_id is not None:
             self._progress.update(self._task_id, findings=count)
+
+
+class ModuleProgress:
+    """Simpler spinner + label for tracking TARGET_LEVEL module execution.
+
+    Shows a spinner and the current module name while it runs.
+    Falls back to plain print when Rich is unavailable.
+    """
+
+    def __init__(self, config: dict, desc: str = "Running modules"):
+        self._config = config
+        self._desc = desc
+        self._status: Optional["Status"] = None
+        self._task_id = None
+
+    def __enter__(self):
+        if self._config.get("no_rich", False) or not _rich_available():
+            return self
+        console = _get_console()
+        if console is None:
+            return self
+        from rich.status import Status
+        self._status = Status(self._desc, console=console, spinner="dots")
+        self._status.start()
+        return self
+
+    def __exit__(self, *args):
+        if self._status:
+            self._status.stop()
+
+    def update(self, msg: str):
+        if self._status:
+            self._status.update(msg)
+
+    def stop(self):
+        if self._status:
+            self._status.stop()
+            self._status = None
 
 
 def set_mask_sensitive_default(enabled: bool) -> None:
@@ -2027,6 +2071,7 @@ def _get_signal_set(
 # Modules that run on every URL regardless of signals
 _CLASSIFY_ALWAYS: set[str] = {
     "headers", "sensitive", "exposed_files", "clickjacking",
+    "cors", "jwt",
 }
 
 

@@ -35,7 +35,7 @@ def parse_args():
     parser.add_argument("--config", "-C", help="Path to YAML configuration file")
     parser.add_argument("--target", "-t", help="Target URL (e.g. https://example.com)")
     parser.add_argument("--modules", "-m", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization", "all"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization", "cors", "jwt", "cms", "all"],
         default=["all"])
     parser.add_argument("--output", "-o", default="reports")
     parser.add_argument("--format", "-f", choices=["json", "html", "txt", "markdown-report", "hackerone", "bugcrowd", "chatgpt"], default="chatgpt")
@@ -58,7 +58,7 @@ def parse_args():
         help="Out-of-band callback host for SSRF and SQLi OOB verification (e.g. Burp Collaborator or interactsh URL)")
     parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
     parser.add_argument("--disable-modules", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization", "cors", "jwt", "cms"],
         default=[], help="Disable specific modules when scanning all or default modules")
     parser.add_argument("--module-param", action="append", default=[],
         help="Override module settings using module.key=value")
@@ -98,6 +98,8 @@ def parse_args():
         help="Disable historical finding correlation (scan history tracking)")
     parser.add_argument("--history-file", default="scan_history.json",
         help="Path to scan history file for finding correlation (default: scan_history.json in output dir)")
+    parser.add_argument("--status", action="store_true",
+        help="Show real-time scan status: modules completed, findings, URLs, and progress summary.")
     parser.add_argument("--auto", action="store_true",
         help="Auto mode (default): sensible defaults for a quick scan.")
     parser.add_argument("--dry-run", action="store_true",
@@ -311,6 +313,13 @@ def build_config(args):
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
         "role": getattr(args, "role", None),
         "auth_header": getattr(args, "auth_header", []),
+        "status": {
+            "phase": "initialized",
+            "findings_count": 0,
+            "urls_scanned": 0,
+            "total_urls": 0,
+            "modules_completed": [],
+        },
     }
 
 
@@ -420,7 +429,7 @@ def _run_module_with_timeout(mod_fn, module_timeout):
     return result
 
 
-def _collect_module_findings(modules, config, run_all, disabled_modules, all_findings, lock):
+def _collect_module_findings(modules, config, run_all, disabled_modules, all_findings, lock, prog=None):
     module_timeout = int(config.get("module_timeout", 120))
     total = len(modules)
     for i, (mod_name, mod_fn) in enumerate(modules.items(), 1):
@@ -429,7 +438,10 @@ def _collect_module_findings(modules, config, run_all, disabled_modules, all_fin
             continue
         if not (run_all or mod_name in config["modules"]):
             continue
-        log(f"[{i}/{total}] Running {mod_name.upper()}...", Colors.CYAN)
+        if prog:
+            prog.update(f"[{i}/{total}] {mod_name.upper()}...")
+        else:
+            log(f"[{i}/{total}] Running {mod_name.upper()}...", Colors.CYAN)
         findings = _run_module_with_timeout(mod_fn, module_timeout)
         if findings:
             log(f"[!] {len(findings)} finding(s) from {mod_name.upper()}", Colors.RED)
@@ -437,6 +449,8 @@ def _collect_module_findings(modules, config, run_all, disabled_modules, all_fin
                 all_findings.extend(findings)
         else:
             log(f"[+] {mod_name.upper()} — nothing found", Colors.GREEN)
+    if prog:
+        prog.stop()
 
 
 def _selected_module_names(config: dict, run_all: bool, disabled_modules: set, candidates: list[str]) -> list[str]:
@@ -511,6 +525,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         "headers", "dirb", "exposed_files", "clickjacking",
         "subdomain_takeover", "graphql", "blind_xss", "api", "openapi",
         "http_methods", "authorization",
+        "cors", "jwt", "cms",
     }
 
     if config["passive"]:
@@ -552,6 +567,9 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         "graphql": scanner.scan_graphql,
         "rate_limiting": scanner.scan_rate_limiting,
         "openapi": scanner.scan_openapi,
+        "cors": scanner.scan_cors,
+        "jwt": scanner.scan_jwt,
+        "cms": scanner.scan_cms_checks,
     }
     _api_scanner = ApiScanner(scanner.config, scanner.recon, container=container)
     module_map["api"] = _api_scanner.run_all
@@ -560,7 +578,10 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
 
     # ── Step 2: Run TARGET_LEVEL modules first ───────────────────────────
     target_modules = {k: v for k, v in module_map.items() if k in TARGET_LEVEL}
-    _collect_module_findings(target_modules, config, run_all, disabled_modules, all_findings_local, lock)
+    from modules.utils import ModuleProgress
+    with ModuleProgress(config, "Running target-level modules") as mp:
+        _collect_module_findings(target_modules, config, run_all, disabled_modules, all_findings_local, lock, prog=mp)
+    config.setdefault("status", {})["modules_completed"] = list(target_modules.keys())
 
     # ── Step 3: Score and sort URLs ──────────────────────────────────────
     urls = recon_data.get("urls", [])
@@ -597,7 +618,19 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
             log("[*] No scan state found, starting fresh", Colors.CYAN)
 
     with ScanProgress(len(sorted_urls), config, "Scanning URLs") as prog:
+        status = config.setdefault("status", {})
+        status["total_urls"] = len(sorted_urls)
+        status["phase"] = "scanning"
         for idx, url in enumerate(sorted_urls):
+            status["urls_scanned"] = idx + 1
+            status["current_url"] = url
+
+            # Periodic status print (every 25 URLs)
+            if config.get("status_print", False) and idx > 0 and idx % 25 == 0:
+                from modules.utils import log as _log
+                _log(f"[STATUS] {idx}/{len(sorted_urls)} URLs scanned, "
+                     f"{len(all_findings_local)} findings so far", Colors.CYAN)
+
             if url in completed_urls:
                 prog.advance()
                 continue
@@ -782,10 +815,58 @@ def _write_report_and_summary(config, all_findings, recon_data, js_data=None, co
     return 0 if not critical and not high else 1
 
 
+def print_scan_status(config: dict, all_findings: list | None = None,
+                       recon_data: dict | None = None,
+                       phase: str = "initializing") -> None:
+    """Print a detailed status report of the current scan.
+
+    Called when --status is passed or via SIGINFO/SIGUSR1.
+    """
+    sep = Colors.CYAN + "─" * 50 + Colors.END
+    log("", Colors.WHITE)
+    log(sep, Colors.CYAN)
+    log("  SCAN STATUS", Colors.BOLD)
+    log(sep, Colors.CYAN)
+    log(f"  Target      : {config.get('target', 'N/A')}", Colors.CYAN)
+    log(f"  Phase       : {phase}", Colors.CYAN)
+    log(f"  Modules     : {', '.join(config.get('modules', ['all']))}", Colors.CYAN)
+    log(f"  Threads     : {config.get('threads', 5)}", Colors.CYAN)
+    log(f"  RPS         : {config.get('rps', 3.0)}", Colors.CYAN)
+    log(f"  Timeout     : {config.get('timeout', 10)}s", Colors.CYAN)
+    log(f"  Crawl depth : {config.get('crawl_depth', 2)}", Colors.CYAN)
+    log(f"  Max URLs    : {config.get('max_urls', 200)}", Colors.CYAN)
+    log(f"  Delay       : {config.get('delay', 0.1)}s", Colors.CYAN)
+    if config.get('oob_host'):
+        log(f"  OOB Host    : {config['oob_host']}", Colors.CYAN)
+    log(f"  Report      : {config.get('report_format', 'html')}", Colors.CYAN)
+    log(f"  Output dir  : {config.get('output_dir', 'reports')}", Colors.CYAN)
+    if all_findings is not None:
+        confirmed = sum(1 for f in all_findings if f.get("confidence_score", 0) >= 86)
+        log(f"  Findings    : {len(all_findings)} total, {confirmed} confirmed", Colors.BOLD)
+        if all_findings:
+            by_sev: dict[str, int] = {}
+            for f in all_findings:
+                s = f.get("severity", "unknown")
+                by_sev[s] = by_sev.get(s, 0) + 1
+            parts = [f"    {s}: {c}" for s, c in sorted(by_sev.items(), key=lambda x: -ord(x[0][0]))]
+            for p in parts:
+                log(p, Colors.WHITE)
+    if recon_data:
+        urls = recon_data.get("urls", [])
+        subdomains = recon_data.get("subdomains", [])
+        forms = recon_data.get("forms", [])
+        log(f"  URLs        : {len(urls)}", Colors.CYAN)
+        log(f"  Subdomains  : {len(subdomains)}", Colors.CYAN)
+        log(f"  Forms       : {len(forms)}", Colors.CYAN)
+    log(sep, Colors.CYAN)
+    log("", Colors.WHITE)
+
+
 def main():
     reset_seen_findings()
     banner()
     args = parse_args()
+
     if getattr(args, "no_rich", False):
         from modules.utils import set_rich_enabled, safe_cookies_dict
         set_rich_enabled(False)
@@ -801,6 +882,12 @@ def main():
         sys.exit(1)
 
     config = build_config(args)
+
+    # ── Status flag: show config summary before scan, print periodic status during ──
+    if getattr(args, "status", False):
+        config["status_print"] = True
+        print_scan_status(config, phase="pre-scan")
+
     set_mask_sensitive_default(not config.get("no_mask_curl", False))
     return run(config)
 
@@ -953,6 +1040,12 @@ def run(config: dict) -> int:
     if autosave_thread:
         stop_autosave.set()
         autosave_thread.join(timeout=2)
+
+    # ── Final status print if --status was requested ──────────────────────
+    if config.get("status_print", False):
+        config.setdefault("status", {})["phase"] = "complete"
+        print_scan_status(config, all_findings=all_findings, recon_data=recon_data, phase="complete")
+
     return _write_report_and_summary(config, all_findings, recon_data, js_data=js_data, container=container)
 
 

@@ -3,26 +3,27 @@ InsecureFormsScanner — detects insecure form actions and cross-origin password
 
 Lifecycle:
   DETECTED:   Form action uses HTTP, or password form submits cross-origin
-  VALIDATED:  (not applicable)
+  VALIDATED:  HTTP form submission confirmed reachable over cleartext
   EXPLOITABLE: (not applicable)
   VERIFIED:   (not applicable)
 
-Maturity: Level 1 (Detection only)
+Maturity: Level 2 (Detect + Validate)
 """
 
 from urllib.parse import urlparse, urljoin
 
 from models.finding import Finding
-from models.evidence import ResponseExcerptEvidence
+from models.evidence import ResponseExcerptEvidence, HttpRequestEvidence
 from modules.utils import (
-    finding, VerificationStage, log, Colors, _build_curl,
+    finding, VerificationStage, log, Colors, _build_curl, safe_post, safe_get,
+    safe_cookies_dict,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
 
 class InsecureFormsScanner(ScannerBase):
     SCANNER_NAME = "insecure_forms"
-    SCANNER_MATURITY = 1
+    SCANNER_MATURITY = 2
     TARGET_LEVEL = False
 
     def _same_origin(self, action_url: str) -> bool:
@@ -59,6 +60,43 @@ class InsecureFormsScanner(ScannerBase):
         return None
 
     def validate(self, detection: DetectionResult) -> ValidationResult | None:
+        action = detection.url
+        context = detection.context
+
+        if self.config.get("passive"):
+            return ValidationResult(confirmed=False, method="form_structure_analysis",
+                                    detail="Insecure form detection based on static form structure analysis")
+
+        if context == "insecure_form_action":
+            try:
+                test_data = {"test": "test"}
+                resp = safe_post(self.session, action, test_data, self.timeout, raise_for_status=False)
+                if resp is not None:
+                    return ValidationResult(
+                        confirmed=True,
+                        signals=[f"HTTP POST to {action} returned HTTP {resp.status_code}"],
+                        method="http_submission_probe",
+                        detail=f"Form action over HTTP confirmed reachable — data submitted in cleartext (HTTP {resp.status_code})",
+                    )
+            except Exception as e:
+                return ValidationResult(
+                    confirmed=False,
+                    method="http_submission_error",
+                    detail=f"HTTP submission test failed: {e}",
+                )
+            return ValidationResult(
+                confirmed=False,
+                method="http_submission_unreachable",
+                detail="Form action uses HTTP but endpoint appears unreachable",
+            )
+
+        if context == "password_cross_origin_submission":
+            return ValidationResult(
+                confirmed=False,
+                method="origin_analysis",
+                detail="Cross-origin password submission detected via form structure analysis — confirm manually by inspecting the form action",
+            )
+
         return ValidationResult(confirmed=False, method="form_structure_analysis",
                                 detail="Insecure form detection based on static form structure analysis")
 
@@ -123,27 +161,39 @@ class InsecureFormsScanner(ScannerBase):
                     self.evidence_engine.store(ev)
 
                 vuln_type = "Insecure Form Action" if detection.context == "insecure_form_action" else "Password Form Cross-Origin Submission"
+                stage = VerificationStage.VALIDATED.value if (validation_result and validation_result.confirmed) else VerificationStage.DETECTED.value
+
+                curl_cmd = _build_curl("POST", action, {}, data={
+                    field.get("name", "field"): field.get("value", "test")
+                    for field in form.get("fields", [])[:5]
+                })
+
                 f = finding(
                     vuln_type=vuln_type,
                     url=action,
                     severity="high",
                     details=detection.evidence_signals[0] if detection.evidence_signals else "Insecure form detected",
                     evidence=detection.evidence_signals[0] if detection.evidence_signals else "",
-                    request=_build_curl("POST", action, {}, data={
-                        field.get("name", "field"): field.get("value", "test")
-                        for field in form.get("fields", [])[:5]
-                    }),
-                    response_excerpt="(no request made — vulnerability detected from form structure)",
+                    request=curl_cmd,
+                    response_excerpt="(no request made — vulnerability detected from form structure)" if stage == VerificationStage.DETECTED.value else validation_result.detail,
                     steps_to_reproduce=self.generate_reproduction(detection, validation_result),
-                    verification_stage=VerificationStage.DETECTED.value,
+                    verification_stage=stage,
                 )
                 if f:
                     fingerprint = f.get("fingerprint", "")
                     if fingerprint:
                         for ev in evidence_list:
                             self.evidence_engine.link_to_finding(ev, fingerprint)
+                    if stage == VerificationStage.VALIDATED.value and fingerprint:
+                        req_ev = HttpRequestEvidence(
+                            method="POST",
+                            url=action,
+                            curl_command=curl_cmd,
+                        )
+                        self.evidence_engine.store(req_ev)
+                        self.evidence_engine.link_to_finding(req_ev, fingerprint)
                     self._add_finding(f)
-                    log(f"  [FORM] {action}", Colors.RED, verbose_only=True, verbose=self.verbose)
+                    log(f"  [FORM] {action} [{stage}]", Colors.RED, verbose_only=True, verbose=self.verbose)
             except Exception:
                 continue
         return self._get_findings()
