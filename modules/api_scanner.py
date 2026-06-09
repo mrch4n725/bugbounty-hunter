@@ -14,6 +14,7 @@ from urllib.parse import urljoin
 
 import yaml
 
+from models.finding import Finding
 from modules.scanner import VulnScanner
 from modules.utils import (
     make_session, safe_get, safe_post, finding, log, Colors, _build_curl,
@@ -90,9 +91,9 @@ class ApiScanner(VulnScanner):
 
     # ── Orchestrator ──────────────────────────────────────────────────────
 
-    def run_all(self) -> list[dict]:
+    def run_all(self) -> list[Finding]:
         """Run all API-specific scans and return combined findings."""
-        findings: list[dict] = []
+        findings: list[Finding] = []
 
         endpoints = self.discover_openapi()
         if endpoints:
@@ -112,7 +113,7 @@ class ApiScanner(VulnScanner):
         findings.extend(self.scan_mass_assignment(endpoints))
 
         # Final scope filter on all results
-        in_scope = [f for f in findings if self._in_scope(f.get("url", ""))]
+        in_scope = [f for f in findings if self._in_scope(f.url)]
         return self._deduplicate(in_scope)
 
     # ── OpenAPI / Swagger Discovery ────────────────────────────────────────

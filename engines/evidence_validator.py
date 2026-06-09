@@ -112,11 +112,20 @@ class EvidenceCompletenessValidator:
     def validate(cls, finding: Finding) -> Finding:
         """Validate a single finding's evidence completeness.
 
+        Idempotent: if the finding was already penalised (has an ``evidence
+        incomplete`` reason), returns immediately to prevent double-penalty
+        when called from both the pipeline (``main.py``) and the reporter
+        (``ReporterBase``).
+
         Mutates the Finding in place (confidence_score, verification_stage,
         confidence_reasons) and returns it.
         """
-        vuln_type = (finding.get("vuln_type") or finding.get("title") or "").lower()
+        vuln_type = (finding.vuln_type or finding.title or "").lower()
         if not vuln_type:
+            return finding
+
+        # Idempotency: skip if already penalised
+        if any("evidence incomplete" in r for r in finding.confidence_reasons):
             return finding
 
         # Check exemption

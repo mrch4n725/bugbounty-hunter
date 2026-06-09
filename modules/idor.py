@@ -12,6 +12,7 @@ import re
 from typing import Any, Optional
 from urllib.parse import urlparse, parse_qs
 
+from models.finding import Finding
 from modules.scanner import VulnScanner
 from modules.utils import (
     make_session, safe_get, safe_post, finding, log, Colors, _build_curl,
@@ -613,9 +614,9 @@ class IdorScanner(VulnScanner):
 
     # ── Orchestrator ──────────────────────────────────────────────────────
 
-    def run_all(self) -> list[dict]:
+    def run_all(self) -> list[Finding]:
         """Run all IDOR detection scans."""
-        findings: list[dict] = []
+        findings: list[Finding] = []
         candidates = self._find_id_parameters()
 
         if candidates:

@@ -276,20 +276,20 @@ def compute_priority_score(finding) -> int:
     - OOB bonus (+15)
     - Signal count (+5 per signal, cap 10)
     """
-    severity = finding.get("severity", "low").lower()
-    stage = finding.get("verification_stage", "detected").lower()
-    evidence = finding.get("evidence_strength", "weak").lower()
+    severity = finding.severity.lower() if finding.severity else "low"
+    stage = finding.verification_stage.lower() if finding.verification_stage else "detected"
+    evidence = finding.evidence_strength.lower() if finding.evidence_strength else "weak"
 
     sev_score = SEVERITY_PRIORITY.get(severity, 25)
     stage_score = STAGE_PRIORITY.get(stage, 30)
     evidence_map = {"verified": 20, "strong": 15, "moderate": 10, "weak": 5}
     ev_score = evidence_map.get(evidence, 5)
 
-    ev_list = finding.get("evidence", [])
+    ev_list = finding.evidence
     if not isinstance(ev_list, list):
         ev_list = [str(ev_list)] if ev_list else []
     oob_bonus = 15 if any("oob" in str(ev).lower() for ev in ev_list) else 0
-    validation_steps = finding.get("validation_steps", [])
+    validation_steps = finding.reproduction_steps
     signal_bonus = min(len(validation_steps) * 5, 10)
 
     raw = sev_score * 0.25 + stage_score * 0.35 + ev_score * 0.20 + oob_bonus + signal_bonus
@@ -2137,18 +2137,18 @@ def enrich_finding_confidence(f: Finding) -> None:
     """Recalculate confidence score if below threshold; populate reasons."""
     from models.finding import calculate_confidence as calc_conf
     from models.finding import evidence_strength_from_score, false_positive_risk_from_score
-    stage = f.get("verification_stage", "").lower()
-    score = f.get("confidence_score", 0)
+    stage = (f.verification_stage or "").lower()
+    score = f.confidence_score or 0
     if score < 25:
         new_score = calc_conf(
             detection=True,
             validation=stage in ("validated", "exploitable", "verified"),
             exploitation=stage in ("exploitable", "verified"),
         )
-        f["confidence_score"] = new_score
-        f["evidence_strength"] = evidence_strength_from_score(new_score).value
-        f["false_positive_risk"] = false_positive_risk_from_score(new_score).value
-    reasons = f.get("confidence_reasons")
+        f.confidence_score = new_score
+        f.evidence_strength = evidence_strength_from_score(new_score).value
+        f.false_positive_risk = false_positive_risk_from_score(new_score).value
+    reasons = f.confidence_reasons
     if not reasons or not isinstance(reasons, list) or len(reasons) == 0:
         reasons = []
         if stage == "detected":
@@ -2166,7 +2166,7 @@ def enrich_finding_confidence(f: Finding) -> None:
             reasons.append("+ Secondary validation confirmed")
             reasons.append("+ Exploitation proof demonstrated")
             reasons.append("+ Independently verified (OOB/browser/evidence)")
-        f["confidence_reasons"] = reasons
+        f.confidence_reasons = reasons
 
 
 def add_capability_confidence_reasons(f: Finding) -> None:
@@ -2176,10 +2176,10 @@ def add_capability_confidence_reasons(f: Finding) -> None:
         caps = CapabilityRegistry.get_global()
     except Exception:
         return
-    reasons = f.get("confidence_reasons")
+    reasons = f.confidence_reasons
     if not isinstance(reasons, list):
         reasons = []
-    score = f.get("confidence_score", 0)
+    score = f.confidence_score or 0
     has_browser = caps.has("playwright") and caps.has("chromium")
     has_oob = caps.has("oob_validation")
     has_esprima = caps.has("esprima")
@@ -2190,7 +2190,7 @@ def add_capability_confidence_reasons(f: Finding) -> None:
     if not has_browser:
         if not any("No browser" in r for r in reasons):
             reasons.append("- No browser validation (XSS/JS findings unverifiable via Playwright)")
-            if f.get("vuln_type", "").lower() in ("xss", "dom xss", "blind xss"):
+            if (f.vuln_type or "").lower() in ("xss", "dom xss", "blind xss"):
                 reasons.append("- XSS confidence limited without browser execution")
     if has_oob and score < 80:
         if not any("OOB" in r for r in reasons):
@@ -2205,15 +2205,15 @@ def add_capability_confidence_reasons(f: Finding) -> None:
         reasons.append("+ High confidence score achieved (score >= 80)")
     if score >= 25 and not any("score >= 25" in r for r in reasons):
         reasons.append("+ Base confidence threshold met (score >= 25)")
-    f["confidence_reasons"] = reasons
+    f.confidence_reasons = reasons
 
 
 def link_finding_evidence(finding: Finding, evidence_engine: Any,
                           session: Any = None) -> None:
     """Auto-create and link HttpRequestEvidence from finding request data."""
-    fp = finding.get("fingerprint", "")
-    url = finding.get("url", "")
-    request_str = finding.get("request", "")
+    fp = finding.fingerprint
+    url = finding.url
+    request_str = finding.request
     if not fp or not request_str or evidence_engine is None:
         return
     try:
@@ -2241,7 +2241,7 @@ def collect_and_link_evidence(finding: Finding, evidence_list: list,
     """Store and link typed evidence objects for a finding."""
     if evidence_engine is None:
         return
-    fp = finding.get("fingerprint", "")
+    fp = finding.fingerprint
     if not fp:
         return
     for ev in evidence_list:

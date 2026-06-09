@@ -690,10 +690,7 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     evidence_engine = getattr(container, 'evidence_engine', None) if container else None
     enriched: list[Finding] = []
     for f in updated:
-        if isinstance(f, Finding):
-            obj = f
-        else:
-            obj = Finding.from_dict(f)
+        obj = f
         if evidence_engine is not None:
             fp = obj.fingerprint or obj.get("fingerprint", "")
             if fp:
@@ -718,18 +715,18 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
 
     # Merge TARGET_LEVEL findings (ApiScanner/IdorScanner don't use self._add())
     # by fingerprint to avoid duplicating VulnScanner entries already in dedup.
-    seen_fingerprints = {f.get("fingerprint") for f in updated if f.get("fingerprint")}
+    seen_fingerprints = {f.fingerprint for f in updated if f.fingerprint}
     seen_urls_types: set[tuple] = {
-        (f.get("url", ""), f.get("vuln_type", "")) for f in updated
+        (f.url, f.vuln_type) for f in updated
     }
     for f in all_findings_local:
-        fp = f.get("fingerprint")
+        fp = f.fingerprint
         if fp:
             if fp not in seen_fingerprints:
                 seen_fingerprints.add(fp)
                 updated.append(f)
         else:
-            key = (f.get("url", ""), f.get("vuln_type", ""))
+            key = (f.url, f.vuln_type)
             if key not in seen_urls_types:
                 seen_urls_types.add(key)
                 updated.append(f)
@@ -790,14 +787,14 @@ def _write_report_and_summary(config, all_findings, recon_data, js_data=None, co
     log("  Then paste into ChatGPT, Claude, or your preferred AI tool.", Colors.WHITE)
     log("=" * 60, Colors.CYAN)
 
-    critical = [f for f in all_findings if f.get("severity") == "critical"]
-    high = [f for f in all_findings if f.get("severity") == "high"]
-    medium = [f for f in all_findings if f.get("severity") == "medium"]
-    low = [f for f in all_findings if f.get("severity") == "low"]
-    confirmed = [f for f in all_findings if f.get("confidence_score", 0) >= 86]
-    validated = [f for f in all_findings if f.get("verification_stage") == "validated"]
-    exploitable = [f for f in all_findings if f.get("verification_stage") == "exploitable"]
-    verified = [f for f in all_findings if f.get("verification_stage") == "verified"]
+    critical = [f for f in all_findings if f.severity == "critical"]
+    high = [f for f in all_findings if f.severity == "high"]
+    medium = [f for f in all_findings if f.severity == "medium"]
+    low = [f for f in all_findings if f.severity == "low"]
+    confirmed = [f for f in all_findings if (f.confidence_score or 0) >= 86]
+    validated = [f for f in all_findings if f.verification_stage == "validated"]
+    exploitable = [f for f in all_findings if f.verification_stage == "exploitable"]
+    verified = [f for f in all_findings if f.verification_stage == "verified"]
 
     # Root-cause grouping for terminal summary using proper aggregator.
     # adapted findings already have root_cause set by ReporterBase.
