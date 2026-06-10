@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.1 (2026-06-10)
+
+### Candidate Exploitation & Outcome Feedback Loop Closure
+
+- **Candidate exploitation** — Top 10 `LogicAbuseCandidate` abuse URLs are now routed to `BusinessLogicScanner` testers (`RaceConditionTester`, `PriceManipulationTester`, `FlowBypassTester`) for same-scan exploitation. Uses candidate's `likely_patterns` to pick the right tester and `abuse_parameter` for targeted probes. Race condition, price override, negative quantity, and coupon stacking patterns are exercised directly. Findings are tagged with `_from_candidate` for traceability.
+- **OutcomeFeedbackEngine loop closed** — `record_outcome()` now called for every finding in the orchestrator post-scan pipeline (after confidence scoring). Records all findings as `"detected"` outcomes so future scans benefit from `has_positive_outcome()` checks. `outcomes.jsonl` is now populated automatically.
+- **SPA recon bugs fixed** — `_run_spa_recon()` in `main.py` had 3 bugs preventing SPA data from merging into `recon_data`: (1) wrong key `xhr_endpoints` → `xhr_calls`, (2) wrong key `config_objects` → `js_endpoints` (list, not dict), (3) non-existent method `detect_frameworks()` → now reads `tech_stack` from spider results directly. XHR/API endpoint URLs are now extracted from their dict structures.
+- **AGENTS.md updated** — Gotchas for candidate exploitation, outcome recording, and SPA recon fixes added.
+
+## 1.2.0 (2026-06-10)
+
+### Business Logic Discovery & Abuse Pattern Consolidation
+
+- **BusinessLogicDiscoveryEngine wired into orchestrator** — `BusinessLogicDiscoveryEngine.run()` now runs in post-scan pipeline after ownership discovery, generating ranked `LogicAbuseCandidate` objects from URL patterns, form analysis, redirect chains, and DiscoveryStore intelligence.
+- **Candidate auto-investigation** — `InvestigationEngine.investigate_candidate()` method added; high-yield candidates (yield_rank >= 0.5) are auto-investigated using their suggested strategies in `main.py` after regular investigation completes.
+- **AbusePattern consolidation** — `BusinessLogicScanner` finding builders (`_bypass_to_finding`, `_race_to_finding`, `_price_finding`) now annotate findings with `abuse_pattern` field mapping to `AbusePattern` enum values (`step_skip`, `step_reorder`, `step_repeat`, `race_condition`, `price_override`, `negative_quantity`, `coupon_stacking`).
+- **Abuse pattern serialization** — `Finding.to_dict()` now includes `abuse_pattern` dynamic attribute for all report formats.
+- **55 new tests** — covers business flow models (WorkflowCategory, AbusePattern, WorkflowRiskModel, LogicAbuseCandidate), BusinessLogicDiscoveryEngine (URL patterns, form analysis, risk assessment, candidate generation, redirect chains, DiscoveryStore persistence), AbusePattern consolidation (all finding builder mappings), and InvestigationEngine.investigate_candidate. Total: 321/321 passing.
+
 ## 1.1.0 (2026-06-10)
 
 ### Authorization Intelligence Platform

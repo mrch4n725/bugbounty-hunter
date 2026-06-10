@@ -578,6 +578,142 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
             log(f"[!] Ownership discovery failed: {e}", Colors.YELLOW,
                 verbose_only=True, verbose=config.get("verbose", False))
 
+    # ── Business Logic Discovery (workflow identification + abuse candidate generation) ──
+    if container and hasattr(container, 'discovery_store'):
+        try:
+            from engines.business_discovery import BusinessLogicDiscoveryEngine
+            blde = BusinessLogicDiscoveryEngine(
+                discovery_store=container.discovery_store,
+                relationship_graph=getattr(container, 'relationship_graph', None),
+            )
+            blde_urls = recon_data.get("urls", [])
+            blde_forms = recon_data.get("forms", [])
+            blde_role_sessions = config.get("_role_sessions", {})
+            candidates = blde.run(
+                urls=blde_urls,
+                forms=blde_forms,
+                role_sessions=blde_role_sessions if len(blde_role_sessions) >= 2 else None,
+                recon_data=recon_data,
+            )
+            config["_business_logic_candidates"] = candidates
+            if candidates:
+                log(f"[+] Business logic discovery: {len(candidates)} abuse candidate(s) "
+                    f"across {len({c.workflow.name for c in candidates})} workflows",
+                    Colors.GREEN)
+                top_candidates = sorted(candidates, key=lambda c: -c.yield_rank)[:5]
+                for c in top_candidates:
+                    log(f"    [{c.yield_rank:.2f}] {c.workflow.category.value}: "
+                        f"{c.abuse_url or c.workflow.name} "
+                        f"→ {', '.join(c.suggested_strategies[:2])}",
+                        Colors.CYAN, verbose_only=True, verbose=config.get("verbose", False))
+            else:
+                config["_business_logic_candidates"] = []
+                log("[+] Business logic discovery — no abuse candidates found",
+                    Colors.GREEN, verbose_only=True, verbose=config.get("verbose", False))
+        except Exception as e:
+            log(f"[!] Business logic discovery failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
+
+    # ── Business Logic Candidate Exploitation (route candidates to BL scanner testers) ──
+    bl_candidates = config.get("_business_logic_candidates", [])
+    if bl_candidates and not config.get("passive", False):
+        try:
+            from scanners.business_logic import (
+                BusinessLogicScanner, RaceConditionTester, PriceManipulationTester,
+                FlowBypassTester,
+            )
+            from models.business_flow import AbusePattern
+            bl_candidate_session = getattr(scanner, 'session', None)
+            if bl_candidate_session:
+                bl_for_candidates = BusinessLogicScanner(
+                    config, session=bl_candidate_session, recon=recon_data)
+                race_tester = RaceConditionTester(bl_candidate_session, timeout=10)
+                price_tester = PriceManipulationTester(bl_candidate_session, timeout=10)
+                # Build a form-lookup map for resolving abuse URLs to form data
+                forms_by_action: dict[str, dict] = {}
+                for form in recon_data.get("forms", []):
+                    action = form.get("action", "")
+                    if action:
+                        from urllib.parse import urljoin
+                        base = (recon_data.get("urls") or [""])[0]
+                        resolved = urljoin(base, action) if not action.startswith("http") else action
+                        forms_by_action[resolved] = form
+
+                candidate_findings: list[dict] = []
+                for c in bl_candidates[:10]:  # Top 10 candidates
+                    abuse_url = c.abuse_url or (c.workflow.source_urls or [""])[0]
+                    abuse_param = c.abuse_parameter or ""
+                    patterns = c.risk_model.likely_patterns if c.risk_model else []
+
+                    for pattern in patterns:
+                        if pattern in (AbusePattern.RACE_CONDITION,):
+                            # Look up form data for race condition testing
+                            form_data = None
+                            for action_url, form in forms_by_action.items():
+                                if action_url == abuse_url or abuse_url.endswith(action_url):
+                                    form_data = {f.get("name", ""): f.get("value", "")
+                                                 for f in form.get("fields", []) if f.get("name")}
+                                    break
+                            race_result = race_tester.test_race_condition(
+                                abuse_url, data=form_data, session=bl_candidate_session)
+                            f = BusinessLogicScanner._race_to_finding(race_result)
+                            if f:
+                                f["_from_candidate"] = c.workflow.name
+                                candidate_findings.append(f)
+
+                        elif pattern in (AbusePattern.PRICE_OVERRIDE,):
+                            if abuse_param:
+                                found = price_tester.test_price_override(abuse_url, abuse_param, bl_candidate_session)
+                            else:
+                                # Try all price fields
+                                for pf in PriceManipulationTester.PRICE_FIELDS:
+                                    if price_tester.test_price_override(abuse_url, pf, bl_candidate_session):
+                                        found = True
+                                        break
+                                else:
+                                    found = False
+                            if found:
+                                f = BusinessLogicScanner._price_finding(
+                                    "Price Override", abuse_url, {abuse_param or "price": "0"})
+                                if f:
+                                    f["_from_candidate"] = c.workflow.name
+                                    candidate_findings.append(f)
+
+                        elif pattern in (AbusePattern.NEGATIVE_QUANTITY,):
+                            for action_url, form in forms_by_action.items():
+                                if action_url == abuse_url or abuse_url.endswith(action_url):
+                                    form_data = {f.get("name", ""): f.get("value", "")
+                                                 for f in form.get("fields", []) if f.get("name")}
+                                    if form_data and price_tester.test_negative_quantity(abuse_url, form_data, bl_candidate_session):
+                                        f = BusinessLogicScanner._price_finding(
+                                            "Negative Quantity", abuse_url, form_data)
+                                        if f:
+                                            f["_from_candidate"] = c.workflow.name
+                                            candidate_findings.append(f)
+                                    break
+
+                        elif pattern in (AbusePattern.COUPON_STACKING,):
+                            for action_url, form in forms_by_action.items():
+                                if action_url == abuse_url or abuse_url.endswith(action_url):
+                                    form_data = {f.get("name", ""): f.get("value", "")
+                                                 for f in form.get("fields", []) if f.get("name")}
+                                    if form_data and price_tester.test_coupon_stacking(abuse_url, form_data, bl_candidate_session):
+                                        f = BusinessLogicScanner._price_finding(
+                                            "Coupon Stacking", abuse_url, form_data)
+                                        if f:
+                                            f["_from_candidate"] = c.workflow.name
+                                            candidate_findings.append(f)
+                                    break
+
+                if candidate_findings:
+                    log(f"[!] {len(candidate_findings)} finding(s) from CANDIDATE_EXPLOITATION",
+                        Colors.RED)
+                    with lock:
+                        all_findings_local.extend(candidate_findings)
+        except Exception as e:
+            log(f"[!] Candidate exploitation failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
+
     # ── GQL Authorization Intelligence (feed stored GQL types into discovery) ──
     if container and hasattr(container, 'discovery_store'):
         try:
@@ -706,6 +842,27 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
             log(f"[+] Confidence scored for {len(updated)} findings", Colors.GREEN)
         except Exception as e:
             log(f"[!] Confidence scoring failed: {e}", Colors.YELLOW)
+
+    # ── Outcome Recording (record every finding for future feedback loop) ──
+    if container and hasattr(container, 'outcome_feedback_engine'):
+        try:
+            ofe = container.outcome_feedback_engine
+            recorded = 0
+            for obj in updated:
+                fp = obj.fingerprint or ""
+                if fp:
+                    ofe.record_outcome(
+                        finding_fingerprint=fp,
+                        outcome="detected",
+                        notes=f"{obj.vuln_type} @ {obj.url}",
+                    )
+                    recorded += 1
+            if recorded:
+                log(f"[*] Recorded {recorded} outcome(s) for future feedback", Colors.CYAN,
+                    verbose_only=True, verbose=config.get("verbose", False))
+        except Exception as e:
+            log(f"[!] Outcome recording failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
 
     # ── Impact Escalation Analysis (Initiative 4) ────────────────────────
     if "impact_escalation" not in disabled_engines and container:

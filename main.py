@@ -523,17 +523,19 @@ def _run_spa_recon(config: dict, recon_data: dict) -> None:
         if spider_results:
             discovered_urls = spider_results.get("urls", [])
             discovered_forms = spider_results.get("forms", [])
-            discovered_xhr = spider_results.get("xhr_endpoints", [])
-            config_objects = spider_results.get("config_objects", {})
+            discovered_xhr = spider_results.get("xhr_calls", [])
+            js_endpoints = spider_results.get("js_endpoints", [])
+            tech_stack = spider_results.get("tech_stack", [])
 
             added_urls = 0
             for u in discovered_urls:
                 if u not in recon_data.get("urls", []):
                     recon_data.setdefault("urls", []).append(u)
                     added_urls += 1
-            for ep in discovered_xhr:
-                if ep not in recon_data.get("urls", []):
-                    recon_data.setdefault("urls", []).append(ep)
+            for xhr in discovered_xhr:
+                ep_url = xhr.get("url", "")
+                if ep_url and ep_url not in recon_data.get("urls", []):
+                    recon_data.setdefault("urls", []).append(ep_url)
                     added_urls += 1
 
             added_forms = 0
@@ -542,22 +544,27 @@ def _run_spa_recon(config: dict, recon_data: dict) -> None:
                     recon_data.setdefault("forms", []).append(f)
                     added_forms += 1
 
-            if config_objects:
-                recon_data.setdefault("spa_config", {}).update(config_objects)
+            if js_endpoints:
+                for js_ep in js_endpoints:
+                    ep_urls = js_ep.get("endpoints", [])
+                    for eu in ep_urls:
+                        if eu not in recon_data.get("urls", []):
+                            recon_data.setdefault("urls", []).append(eu)
+                            added_urls += 1
 
             api_endpoints = spider_results.get("api_endpoints", [])
             for ep in api_endpoints:
-                if ep not in recon_data.get("urls", []):
-                    recon_data.setdefault("urls", []).append(ep)
+                ep_url = ep.get("url", "")
+                if ep_url and ep_url not in recon_data.get("urls", []):
+                    recon_data.setdefault("urls", []).append(ep_url)
                     added_urls += 1
+
+            if tech_stack:
+                recon_data.setdefault("technology", {}).setdefault("framework", []).extend(tech_stack)
+                log(f"[+] SPA framework(s): {', '.join(tech_stack)}", Colors.CYAN)
 
             log(f"[+] SPA recon: {added_urls} URL(s), {added_forms} form(s) discovered",
                 Colors.GREEN)
-
-        spa_framework = spa_recon.detect_frameworks(target)
-        if spa_framework:
-            log(f"[+] SPA framework(s): {', '.join(spa_framework)}", Colors.CYAN)
-            recon_data.setdefault("technology", {}).setdefault("framework", []).extend(spa_framework)
 
         spa_params = spa_recon.discover_runtime_params(target)
         if spa_params:
@@ -1236,6 +1243,32 @@ def run(config: dict) -> int:
                     log(f"[+] Investigation promoted {n_promoted} signals", Colors.GREEN)
         except Exception as e:
             log(f"[!] Investigation engine failed: {e}", Colors.YELLOW)
+
+    # ── Business Logic Candidate Auto-Investigation ─────────────────────
+    if "investigation" not in disabled_engines and container:
+        bl_candidates = config.get("_business_logic_candidates", [])
+        if bl_candidates and hasattr(container, 'investigation_engine'):
+            try:
+                ie = container.investigation_engine
+                high_yield = [c for c in bl_candidates if c.yield_rank >= 0.5]
+                for c in high_yield[:5]:
+                    abuse_url = c.abuse_url or (c.workflow.source_urls or [""])[0]
+                    log(f"[*] Auto-investigating biz-logic candidate: "
+                        f"{c.workflow.category.value} @ {abuse_url} "
+                        f"(yield={c.yield_rank:.2f})",
+                        Colors.CYAN, verbose_only=True,
+                        verbose=config.get("verbose", False))
+                    results = ie.investigate_candidate(c, budget=5)
+                    n_success = sum(1 for r in results if r.success)
+                    if n_success:
+                        log(f"  [+] {n_success}/{len(results)} investigation signals "
+                            f"confirmed for {c.workflow.name}",
+                            Colors.GREEN, verbose_only=True,
+                            verbose=config.get("verbose", False))
+            except Exception as e:
+                log(f"[!] Business logic candidate investigation failed: {e}",
+                    Colors.YELLOW, verbose_only=True,
+                    verbose=config.get("verbose", False))
 
     # ── Feed investigation results back into DiscoveryStore ─────────────
     if "investigation" not in disabled_engines and container:

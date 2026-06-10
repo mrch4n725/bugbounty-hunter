@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 
+from models.business_flow import AbusePattern, WorkflowCategory
+
 from modules.utils import (
     finding, safe_get, safe_post, log, Colors,
     VerificationStage,
@@ -861,6 +863,13 @@ class BusinessLogicScanner:
         f["step_skipped"] = r.step_skipped
         f["step_expected"] = r.step_expected
         f["accessibility"] = r.accessibility
+        # Map to AbusePattern based on title/type
+        if "step-skip" in r.title.lower() or "step_skip" in r.title.lower():
+            f["abuse_pattern"] = AbusePattern.STEP_SKIP.value
+        elif "step-reorder" in r.title.lower() or "step_reorder" in r.title.lower():
+            f["abuse_pattern"] = AbusePattern.STEP_REORDER.value
+        elif "step-repeat" in r.title.lower() or "step_repeat" in r.title.lower():
+            f["abuse_pattern"] = AbusePattern.STEP_REPEAT.value
         return f.to_dict()
 
     @staticmethod
@@ -882,6 +891,7 @@ class BusinessLogicScanner:
             return None
         f["success_count"] = r.success_count
         f["concurrent_count"] = r.concurrent_count
+        f["abuse_pattern"] = AbusePattern.RACE_CONDITION.value
         return f.to_dict()
 
     @staticmethod
@@ -937,4 +947,10 @@ class BusinessLogicScanner:
         )
         if f is None:
             return None
+        pattern_map = {
+            "Negative Quantity": AbusePattern.NEGATIVE_QUANTITY,
+            "Price Override": AbusePattern.PRICE_OVERRIDE,
+            "Coupon Stacking": AbusePattern.COUPON_STACKING,
+        }
+        f["abuse_pattern"] = pattern_map.get(subtype, AbusePattern.BILLING_PARAMETER_INJECTION).value
         return f.to_dict()

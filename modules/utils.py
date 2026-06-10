@@ -29,17 +29,22 @@ from urllib3.util.retry import Retry
 _rich_console: Optional["Console"] = None
 _use_rich: bool = True
 _log_lock = threading.Lock()
+_rich_available_cache: bool | None = None
 _seen_findings = set()
 _seen_findings_lock = threading.Lock()
 
 
 def _rich_available() -> bool:
-    """Check if Rich terminal library is available via CapabilityRegistry."""
+    """Check if Rich terminal library is available via CapabilityRegistry (cached)."""
+    global _rich_available_cache
+    if _rich_available_cache is not None:
+        return _rich_available_cache
     try:
         from app.capabilities import CapabilityRegistry
-        return CapabilityRegistry.get_global().has("rich")
+        _rich_available_cache = CapabilityRegistry.get_global().has("rich")
     except Exception:
-        return False
+        _rich_available_cache = False
+    return _rich_available_cache
 
 
 def reset_seen_findings() -> None:
@@ -1472,7 +1477,7 @@ class RateLimiter:
 
     def wait(self) -> None:
         with self._lock:
-            now = time.time()
+            now = time.monotonic()
             total_sleep = 0.0
             if now < self._backoff_until:
                 total_sleep = self._backoff_until - now
@@ -1481,14 +1486,14 @@ class RateLimiter:
             elapsed = now - self._last_request
             if elapsed < min_interval:
                 total_sleep += min_interval - elapsed
-            self._last_request = time.time() + total_sleep
+            self._last_request = now + total_sleep
         if total_sleep > 0:
             time.sleep(total_sleep)
 
     def report_429(self) -> None:
         with self._lock:
             self.current_rps = max(0.1, self.current_rps / 2)
-            self._backoff_until = time.time() + 5.0
+            self._backoff_until = time.monotonic() + 5.0
             self._success_count = 0
         log(f"  [RateLimit] 429 received — throttled to {self.current_rps:.1f} RPS", Colors.YELLOW)
 

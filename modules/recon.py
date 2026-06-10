@@ -6,7 +6,7 @@ import time
 import hashlib
 import re
 from urllib.parse import urljoin, urlparse, parse_qs
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, Future
 from bs4 import BeautifulSoup
 
 from modules.utils import make_session, safe_get, same_domain, log, Colors, url_in_scope, finding, safe_cookies_dict
@@ -243,8 +243,8 @@ class Recon:
         probe_paths = ["/api/v1/user", "/api/v1/me", "/graphql", "/api/graphql"]
         for path in probe_paths:
             try:
-                r = self.session.get(urljoin(self.base_url, path), timeout=self.timeout)
-                if r.status_code in (200, 403) and r.status_code != 401:
+                r = safe_get(self.session, urljoin(self.base_url, path), self.timeout, raise_for_status=False)
+                if r and r.status_code in (200, 403) and r.status_code != 401:
                     self.authenticated = True
                     return
             except Exception:
@@ -291,8 +291,10 @@ class Recon:
         depth_map[start_url] = 0
         visited.add(start_url)
         
+        max_wait = self.timeout * 2  # Cap total crawl time per URL
         with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = {}
+            futures: dict[Future, str] = {}
+            deadline = time.monotonic() + max_wait
             
             while True:
                 # 1. Feed the pool up to capacity limits
@@ -329,10 +331,20 @@ class Recon:
                     except Exception as e:
                         if self.verbose:
                             log(f"Task error: {str(e)}", Colors.RED, self.verbose)
+                    deadline = time.monotonic() + max_wait  # Reset deadline on progress
                 
-                # 4. If nothing finished this loop and we are waiting on IO, yield execution cleanly
+                # 4. Force-cancel stuck workers that exceed deadline
+                if futures and time.monotonic() > deadline:
+                    stuck = [f for f in futures.keys() if not f.done()]
+                    for f in stuck:
+                        f.cancel()
+                        url = futures.pop(f, "unknown")
+                        log(f"[!] Crawl worker timed out on {url}", Colors.YELLOW,
+                            verbose_only=True, verbose=self.verbose)
+                    deadline = time.monotonic() + max_wait
+                
+                # 5. If nothing finished this loop and we are waiting on IO, yield execution cleanly
                 if not completed_futures and futures:
-                    # ---> LIVE TRACKING DEBUG LOGS <---
                     if self.verbose:
                         print(f"[DEBUG] Active Workers: {len(futures)} | Remaining Queue: {to_visit.qsize()} | Discovered URLs: {len(self.urls)}")
                     time.sleep(0.02)
@@ -924,8 +936,9 @@ class Recon:
                 if r.status_code in (401, 403):
                     for headers in BYPASS_HEADERS:
                         try:
-                            br = self.session.get(test_url, headers={**dict(self.session.headers), **headers}, timeout=self.timeout)
-                            if br.status_code == 200:
+                            br = safe_get(self.session, test_url, self.timeout, raise_for_status=False,
+                                          headers={**dict(self.session.headers), **headers})
+                            if br and br.status_code == 200:
                                 with self.urls_lock:
                                     if test_url not in self.urls:
                                         self.urls.add(test_url)

@@ -3,7 +3,17 @@
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
-from models.finding import Finding
+from models.finding import Finding, FindingState
+
+
+# Stage ordering for merge priority
+_STAGE_ORDER = {
+    "detected": 0,
+    "partially_validated": 1,
+    "validated": 2,
+    "exploitable": 3,
+    "verified": 4,
+}
 
 
 class DeduplicationEngine:
@@ -22,6 +32,19 @@ class DeduplicationEngine:
             if fp in self._groups:
                 existing = self._groups[fp]
                 existing.grouped_urls.append(finding.url)
+                # Merge _from_candidate tag from incoming finding
+                if hasattr(finding, "_from_candidate") and not hasattr(existing, "_from_candidate"):
+                    object.__setattr__(existing, "_from_candidate",
+                                        getattr(finding, "_from_candidate"))
+                # Prefer higher verification stage
+                incoming_stage = getattr(finding, "verification_stage", "detected")
+                existing_stage = getattr(existing, "verification_stage", "detected")
+                if _STAGE_ORDER.get(incoming_stage, 0) > _STAGE_ORDER.get(existing_stage, 0):
+                    existing.verification_stage = incoming_stage
+                    existing.finding_state = FindingState.from_verification_stage(incoming_stage).value
+                    if (finding.confidence_score or 0) > (existing.confidence_score or 0):
+                        existing.confidence_score = finding.confidence_score
+                        existing.confidence_label = getattr(finding, "confidence_label", "")
                 return None
             self._groups[fp] = finding
             return finding

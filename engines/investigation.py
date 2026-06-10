@@ -897,6 +897,35 @@ class InvestigationEngine:
                 evidence_fp=fp)
         return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
 
+    def investigate_candidate(
+        self,
+        candidate: Any,
+        budget: int = 5,
+    ) -> list[InvestigationResult]:
+        """Investigate a LogicAbuseCandidate directly.
+
+        Creates a lightweight investigation context from the candidate's
+        abuse URL and suggested strategies. Results are stored under
+        the candidate's abuse_url fingerprint.
+        """
+        from models.finding import Finding
+        abuse_url = candidate.abuse_url or (candidate.workflow.source_urls or [""])[0]
+        fake_finding = Finding(
+            vuln_type="business_logic",
+            url=abuse_url,
+            severity="medium",
+            details=f"Business logic abuse candidate: {candidate.workflow.name}",
+            evidence="",
+            fingerprint=hashlib.sha256(abuse_url.encode()).hexdigest()[:16],
+            confidence_score=25,
+        )
+        object.__setattr__(fake_finding, "_from_candidate", candidate.workflow.name)
+        return self.investigate(
+            fake_finding,
+            budget=budget,
+            available_strategies=candidate.suggested_strategies,
+        )
+
     def _apply_result(self, finding: Finding, result: InvestigationResult) -> None:
         new_score = min(100, (finding.confidence_score or 25) + result.confidence_delta)
         object.__setattr__(finding, "confidence_score", new_score)

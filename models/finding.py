@@ -359,6 +359,10 @@ class Finding:
             result["escalation_result"] = self._escalation_result
         if hasattr(self, "_best_escalation_path"):
             result["best_escalation_path"] = self._best_escalation_path
+        if hasattr(self, "abuse_pattern"):
+            result["abuse_pattern"] = self.abuse_pattern
+        if hasattr(self, "_from_candidate"):
+            result["_from_candidate"] = self._from_candidate
         result["evidence"] = [
             {**e.to_dict(), "evidence_type": e.__class__.__name__} if hasattr(e, "to_dict") else {"raw": str(e), "evidence_type": "raw"}
             for e in self.evidence
@@ -407,6 +411,9 @@ class Finding:
             confidence_reasons=d.get("confidence_reasons", []),
         )
         f.evidence = evidence_list
+        # Restore dynamic attributes
+        if "_from_candidate" in d:
+            object.__setattr__(f, "_from_candidate", d["_from_candidate"])
         # Preserve legacy keys as dynamic attributes for backward compat
         for legacy_key in Finding._DICT_LEGACY_KEYS:
             if legacy_key in d and d[legacy_key]:
