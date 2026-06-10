@@ -20,7 +20,8 @@ class EvidenceEngine:
     manager.
     """
 
-    def __init__(self, config: Any | None = None, capabilities: Any | None = None):
+    def __init__(self, config: Any | None = None, capabilities: Any | None = None,
+                 force_in_memory: bool = False):
         self.config = config or {}
         self.capabilities = capabilities
         self._lock = threading.Lock()
@@ -29,7 +30,7 @@ class EvidenceEngine:
         self._db_path = self.config.get("evidence_db_path", "")
         self._db_conn: sqlite3.Connection | None = None
         self._batch_depth = 0
-        if self._db_path:
+        if self._db_path and not force_in_memory:
             self._init_db()
 
     def _init_db(self) -> None:

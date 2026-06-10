@@ -616,9 +616,14 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         oob_poller = OOBBackgroundPoller(
             scanner.oob,
             scanner._promote_finding_by_oob,
+            interval=config.get("oob_poll_interval", 4.0),
+            max_duration=config.get("oob_poll_max_duration", 300.0),
+            max_polls=config.get("oob_poll_max_polls", 0),
+            initial_interval=config.get("oob_poll_initial_interval", 2.0),
+            max_interval=config.get("oob_poll_max_interval", 30.0),
         )
         oob_poller.start()
-        log(f"[*] OOB background poller started (interval={oob_poller.interval}s)", Colors.CYAN)
+        log(f"[*] OOB background poller started (interval={oob_poller.interval}s, max_duration={oob_poller.max_duration}s, max_polls={oob_poller.max_polls})", Colors.CYAN)
 
     # ── Step 1: Build module map (same keys as original _active_module_map) ──
     module_map: dict[str, Any] = {
@@ -788,9 +793,6 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
     updated = scanner._get_findings()
 
     log("[*] Running verification engine...", Colors.CYAN)
-    from engines.verification_engine import VerificationEngine
-    v_engine = VerificationEngine(config, container=container, capabilities=capabilities)
-    updated = v_engine.verify_all(updated)
 
     log("[*] Running chain analysis...", Colors.CYAN)
     updated = VulnScanner.chain_analysis(updated)
@@ -823,6 +825,84 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
         evidence_validated.append(EvidenceCompletenessValidator.validate(obj))
     updated = evidence_validated
 
+    # ── Ownership Validation ──────────────────────────────────────────────
+    if "ownership" not in disabled_engines:
+        try:
+            log("[*] Validating ownership...", Colors.CYAN)
+            from engines.ownership_validator import OwnershipValidator
+            for obj in updated:
+                ownership_ev = OwnershipValidator.validate(obj)
+                if ownership_ev:
+                    if isinstance(obj.evidence, str):
+                        obj.evidence = [obj.evidence] if obj.evidence else []
+                    obj.evidence.append(ownership_ev)
+                    if evidence_engine is not None:
+                        fp = obj.fingerprint or ""
+                        if fp:
+                            evidence_engine.link_to_finding(ownership_ev, fp)
+            log(f"[+] Ownership validated for {len(updated)} findings", Colors.GREEN)
+        except Exception as e:
+            log(f"[!] Ownership validation failed: {e}", Colors.YELLOW)
+
+    # ── Impact Validation ────────────────────────────────────────────────
+    if "impact" not in disabled_engines:
+        try:
+            log("[*] Validating impact...", Colors.CYAN)
+            from engines.impact_validator import ImpactValidator
+            for obj in updated:
+                impact_ev = ImpactValidator.validate(obj)
+                if impact_ev:
+                    if isinstance(obj.evidence, str):
+                        obj.evidence = [obj.evidence] if obj.evidence else []
+                    obj.evidence.append(impact_ev)
+                    if evidence_engine is not None:
+                        fp = obj.fingerprint or ""
+                        if fp:
+                            evidence_engine.link_to_finding(impact_ev, fp)
+            log(f"[+] Impact validated for {len(updated)} findings", Colors.GREEN)
+        except Exception as e:
+            log(f"[!] Impact validation failed: {e}", Colors.YELLOW)
+
+    # ── Evidence Bundle ──────────────────────────────────────────────────
+    log("[*] Building evidence bundles...", Colors.CYAN)
+    from models.evidence_bundle import EvidenceBundle
+    bundle_count = 0
+    for obj in updated:
+        bundle = EvidenceBundle.from_finding(obj)
+        object.__setattr__(obj, "_evidence_bundle", bundle)
+        object.__setattr__(obj, "submission_ready", bundle.submission_ready)
+        object.__setattr__(obj, "evidence_bundle_strength", bundle.overall_strength)
+        object.__setattr__(obj, "evidence_bundle_completeness", bundle.completeness_score)
+        object.__setattr__(obj, "_pipeline_validation_complete", True)
+        bundle_count += 1
+    log(f"[+] Evidence bundles built for {bundle_count} findings", Colors.GREEN)
+
+    # ── Submission Readiness ─────────────────────────────────────────────
+    if "submission_readiness" not in disabled_engines:
+        try:
+            log("[*] Assessing submission readiness...", Colors.CYAN)
+            from engines.submission_readiness import SubmissionReadinessEngine
+            SubmissionReadinessEngine.assess_all(updated)
+            log(f"[+] Submission readiness assessed for {len(updated)} findings", Colors.GREEN)
+        except Exception as e:
+            log(f"[!] Submission readiness assessment failed: {e}", Colors.YELLOW)
+
+    # ── Validation Consensus (opt-in) ────────────────────────────────────
+    if "consensus" not in disabled_engines:
+        try:
+            log("[*] Computing validation consensus...", Colors.CYAN)
+            from engines.consensus_engine import ValidationConsensusEngine
+            consensus_for = 0
+            for obj in updated:
+                result = ValidationConsensusEngine.evaluate(obj)
+                object.__setattr__(obj, "consensus_result", result)
+                if result.consensus_level in ("strong", "moderate"):
+                    consensus_for += 1
+            log(f"[+] Consensus: {consensus_for}/{len(updated)} findings meet threshold",
+                Colors.GREEN)
+        except Exception as e:
+            log(f"[!] Validation consensus failed: {e}", Colors.YELLOW)
+
     updated = prioritize_findings(updated)
 
     # Merge TARGET_LEVEL findings (ApiScanner/IdorScanner don't use self._add())
@@ -854,8 +934,10 @@ def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_finding
             Colors.CYAN, verbose_only=True, verbose=config.get("verbose", False))
 
     if oob_poller:
+        cbs = oob_poller.callback_count
         oob_poller.stop()
-        log("[*] OOB background poller stopped", Colors.CYAN)
+        reason = oob_poller.termination_reason or "stopped"
+        log(f"[*] OOB background poller stopped: {reason} ({cbs} callback(s))", Colors.CYAN)
 
 
 def _findings_to_finding(config, all_findings, recon_data, js_data):
@@ -1331,6 +1413,9 @@ def run(config: dict) -> int:
     # ── Replay cross-scan comparison ───────────────────────────────────
     if "replay" not in disabled_engines and container:
         try:
+            # Build replay bundles for all findings so compare_across_scans has data
+            for f in all_findings:
+                container.replay_engine.build_bundle(f)
             history_filename = config.get("history_file", "scan_history.json")
             output_dir = config.get("output_dir", "reports")
             history_path = os.path.join(output_dir, history_filename) if not os.path.isabs(history_filename) else history_filename

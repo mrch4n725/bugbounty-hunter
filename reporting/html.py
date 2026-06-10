@@ -366,6 +366,40 @@ class HTMLReporter(ReporterBase):
                         f'<details><summary>{e_desc} ({q_count} queries, {m_count} mutations)</summary>'
                         f'<pre class="evidence">{e_schema}</pre></details>'
                     )
+                elif ev_type == "OwnershipEvidence":
+                    violated = getattr(ev, 'ownership_violated', False)
+                    orig_owner = html.escape(getattr(ev, 'original_owner', ''))
+                    claiming = html.escape(getattr(ev, 'claiming_identity', ''))
+                    proof_type = html.escape(getattr(ev, 'proof_type', ''))
+                    resource = html.escape(getattr(ev, 'resource_identifier', ''))
+                    badge = '✓ Violation' if violated else 'No violation'
+                    parts.append(
+                        f'<details open><summary>{e_desc} — {badge}</summary>'
+                        f'<div class="evidence">'
+                        f'<p><strong>Original owner:</strong> {html.escape(orig_owner)}</p>'
+                        f'<p><strong>Claiming identity:</strong> {html.escape(claiming)}</p>'
+                        f'<p><strong>Proof type:</strong> {proof_type}</p>'
+                        f'<p><strong>Resource:</strong> {resource}</p>'
+                        f'</div></details>'
+                    )
+                elif ev_type == "ImpactEvidence":
+                    impact_type = html.escape(getattr(ev, 'impact_type', ''))
+                    demonstrated = getattr(ev, 'demonstrated', False)
+                    severity_confirmed = getattr(ev, 'severity_confirmed', False)
+                    business_impact = html.escape(getattr(ev, 'business_impact', ''))
+                    exploit_proof = html.escape(getattr(ev, 'exploitation_proof', ''))
+                    attack_scenario = html.escape(getattr(ev, 'attack_scenario', ''))
+                    badge = 'Demonstrated' if demonstrated else 'Theoretical'
+                    parts.append(
+                        f'<details open><summary>{e_desc} — {badge}</summary>'
+                        f'<div class="evidence">'
+                        f'<p><strong>Impact type:</strong> {impact_type}</p>'
+                        f'<p><strong>Severity confirmed:</strong> {severity_confirmed}</p>'
+                        f'<p><strong>Business impact:</strong> {business_impact}</p>'
+                        f'<p><strong>Attack scenario:</strong> {attack_scenario}</p>'
+                        f'<p><strong>Exploitation proof:</strong> {exploit_proof}</p>'
+                        f'</div></details>'
+                    )
                 else:
                     if hasattr(ev, 'to_dict'):
                         ev_text = json.dumps(ev.to_dict(), indent=2)

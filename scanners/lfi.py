@@ -154,12 +154,40 @@ class LFIScanner(ScannerBase):
         return None
 
     @staticmethod
+    def _context_excerpt(body: str, sigs: list[str], context_len: int = 100) -> str:
+        """Return a context-aware excerpt around the first matching signature.
+
+        Extracts *context_len* characters before the match, the match itself
+        (with highlighting), and *context_len* characters after.
+        Falls back to the first *context_len* characters when no signature
+        is present in the body.
+        """
+        if not body:
+            return ""
+        best_pos = None
+        best_sig = None
+        for sig in sigs:
+            pos = body.find(sig)
+            if pos != -1:
+                if best_pos is None or pos < best_pos:
+                    best_pos = pos
+                    best_sig = sig
+        if best_pos is None or not best_sig:
+            return body[:context_len * 2]
+        start = max(0, best_pos - context_len)
+        end = min(len(body), best_pos + len(best_sig) + context_len)
+        before = body[start:best_pos]
+        match = body[best_pos:best_pos + len(best_sig)]
+        after = body[best_pos + len(best_sig):end]
+        return f"{before}[LFI_MATCH]{match}[/LFI_MATCH]{after}"
+
+    @staticmethod
     def _verify_file_content(body: str, sigs: list[str]) -> dict:
         """Verify response contains genuine file content, not just a signature reflex."""
         result = {"valid": False, "excerpt": "", "context": "unknown"}
         if not body:
             return result
-        result["excerpt"] = body[:200]
+        result["excerpt"] = LFIScanner._context_excerpt(body, sigs)
         lines = [l for l in body.split("\n") if l.strip()]
         line_count = len(lines)
         avg_line_len = sum(len(l) for l in lines) / max(line_count, 1)

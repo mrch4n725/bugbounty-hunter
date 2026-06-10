@@ -10,6 +10,10 @@ from engines.replay import ReplayEngine
 from engines.scan_budget import ScanBudgetEngine
 from engines.duplicate_risk import DuplicateRiskEngine
 from engines.metrics import MetricsCollector
+from engines.ownership_validator import OwnershipValidator
+from engines.impact_validator import ImpactValidator
+from engines.submission_readiness import SubmissionReadinessEngine
+from engines.consensus_engine import ValidationConsensusEngine
 from modules.utils import BrowserValidator, OOBDetectionFramework
 
 from app.capabilities import CapabilityRegistry
@@ -42,6 +46,10 @@ class ApplicationContainer:
         self._scan_budget_engine: ScanBudgetEngine | None = None
         self._duplicate_risk_engine: DuplicateRiskEngine | None = None
         self._metrics_collector: MetricsCollector | None = None
+        self._ownership_validator: OwnershipValidator | None = None
+        self._impact_validator: ImpactValidator | None = None
+        self._submission_readiness_engine: SubmissionReadinessEngine | None = None
+        self._validation_consensus_engine: ValidationConsensusEngine | None = None
 
     # ── Service accessors (lazy, cached) ─────────────────────────────────
 
@@ -135,6 +143,30 @@ class ApplicationContainer:
         if self._metrics_collector is None:
             self._metrics_collector = MetricsCollector()
         return self._metrics_collector
+
+    @property
+    def ownership_validator(self) -> OwnershipValidator:
+        if self._ownership_validator is None:
+            self._ownership_validator = OwnershipValidator()
+        return self._ownership_validator
+
+    @property
+    def impact_validator(self) -> ImpactValidator:
+        if self._impact_validator is None:
+            self._impact_validator = ImpactValidator()
+        return self._impact_validator
+
+    @property
+    def submission_readiness_engine(self) -> SubmissionReadinessEngine:
+        if self._submission_readiness_engine is None:
+            self._submission_readiness_engine = SubmissionReadinessEngine()
+        return self._submission_readiness_engine
+
+    @property
+    def validation_consensus_engine(self) -> ValidationConsensusEngine:
+        if self._validation_consensus_engine is None:
+            self._validation_consensus_engine = ValidationConsensusEngine()
+        return self._validation_consensus_engine
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 

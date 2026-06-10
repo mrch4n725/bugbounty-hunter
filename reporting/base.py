@@ -312,31 +312,36 @@ class ReporterBase:
         self.findings: list[Finding] = EvidenceCompletenessValidator.validate_all(enriched)
 
         # Ownership and impact validation (guarded by disabled_engines)
-        if "ownership" not in disabled_engines:
-            for f in self.findings:
-                ownership_ev = OwnershipValidator.validate(f)
-                if ownership_ev:
+        # Skip if the pipeline in main.py already ran these steps.
+        pipeline_done = getattr(next(iter(self.findings), None), "_pipeline_validation_complete", False)
+
+        if not pipeline_done:
+            if "ownership" not in disabled_engines:
+                for f in self.findings:
+                    ownership_ev = OwnershipValidator.validate(f)
+                    if ownership_ev:
+                        if isinstance(f.evidence, str):
+                            f.evidence = [f.evidence] if f.evidence else []
+                        f.evidence.append(ownership_ev)
+
+            if "impact" not in disabled_engines:
+                for f in self.findings:
+                    impact_ev = ImpactValidator.validate(f)
                     if isinstance(f.evidence, str):
                         f.evidence = [f.evidence] if f.evidence else []
-                    f.evidence.append(ownership_ev)
-
-        if "impact" not in disabled_engines:
-            for f in self.findings:
-                impact_ev = ImpactValidator.validate(f)
-                if isinstance(f.evidence, str):
-                    f.evidence = [f.evidence] if f.evidence else []
-                f.evidence.append(impact_ev)
+                    f.evidence.append(impact_ev)
 
         # Build evidence bundles for submission-ready packaging
-        for f in self.findings:
-            bundle = EvidenceBundle.from_finding(f)
-            object.__setattr__(f, "_evidence_bundle", bundle)
-            object.__setattr__(f, "submission_ready", bundle.submission_ready)
-            object.__setattr__(f, "evidence_bundle_strength", bundle.overall_strength)
-            object.__setattr__(f, "evidence_bundle_completeness", bundle.completeness_score)
+        if not pipeline_done:
+            for f in self.findings:
+                bundle = EvidenceBundle.from_finding(f)
+                object.__setattr__(f, "_evidence_bundle", bundle)
+                object.__setattr__(f, "submission_ready", bundle.submission_ready)
+                object.__setattr__(f, "evidence_bundle_strength", bundle.overall_strength)
+                object.__setattr__(f, "evidence_bundle_completeness", bundle.completeness_score)
 
         # Submission readiness assessment — overrides mechanical state
-        if "submission_readiness" not in disabled_engines:
+        if not pipeline_done and "submission_readiness" not in disabled_engines:
             SubmissionReadinessEngine.assess_all(self.findings)
 
         # Root-cause aggregation

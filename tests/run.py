@@ -1023,8 +1023,8 @@ with tempfile.TemporaryDirectory() as sqlite_tmp:
     check("sqlite batch insert stores", fp2 in ee2.all_fingerprints())
     check("sqlite batch insert links", len(ee2.get_evidence("finding_batch")) == 2)
 
-    # Test error handling: invalid config silently falls back to in-memory
-    ee3 = EvidenceEngine({"evidence_db_path": "/nonexistent/deep/db/test.db"})
+    # Test error handling: force_in_memory silently falls back to in-memory
+    ee3 = EvidenceEngine({"evidence_db_path": "/nonexistent/deep/db/test.db"}, force_in_memory=True)
     check("sqlite invalid path fallback", ee3._db_conn is None)
     # In-memory operations should still work
     te4 = TimingEvidence(triggered_time_ms=100, baseline_time_ms=50)

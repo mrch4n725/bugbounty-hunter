@@ -124,6 +124,32 @@ class HackerOneReporter(ReporterBase):
                     q_count = getattr(ev, 'query_count', 0)
                     m_count = getattr(ev, 'mutation_count', 0)
                     evidence_parts.append(f"> **{desc}** ({q_count} queries, {m_count} mutations)\n```\n{str(schema)[:800]}\n```")
+                elif ev_type == "OwnershipEvidence":
+                    violated = getattr(ev, 'ownership_violated', False)
+                    orig_owner = getattr(ev, 'original_owner', '')
+                    claiming = getattr(ev, 'claiming_identity', '')
+                    proof = getattr(ev, 'proof_type', '')
+                    resource = getattr(ev, 'resource_identifier', '')
+                    evidence_parts.append(
+                        f"> **{desc}** — {'⚠️ Ownership Violation' if violated else 'No violation'}\n"
+                        f"> Original owner: `{orig_owner}`\n"
+                        f"> Claiming: `{claiming}`\n"
+                        f"> Proof: {proof}\n"
+                        f"> Resource: `{resource}`"
+                    )
+                elif ev_type == "ImpactEvidence":
+                    demonstrated = getattr(ev, 'demonstrated', False)
+                    itype = getattr(ev, 'impact_type', '')
+                    sev_conf = getattr(ev, 'severity_confirmed', False)
+                    biz = getattr(ev, 'business_impact', '')
+                    scenario = getattr(ev, 'attack_scenario', '')
+                    evidence_parts.append(
+                        f"> **{desc}** — {'✅ Demonstrated' if demonstrated else 'Theoretical'}\n"
+                        f"> Impact type: {itype}\n"
+                        f"> Severity confirmed: {sev_conf}\n"
+                        f"> Business impact: {biz}\n"
+                        f"> Attack scenario: {scenario}"
+                    )
                 else:
                     if hasattr(ev, 'to_dict'):
                         ev_text = json.dumps(ev.to_dict(), indent=2)

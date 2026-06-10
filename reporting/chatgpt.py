@@ -10,6 +10,8 @@ from models.evidence import (
     ScreenshotEvidence,
     AuthorizationComparisonEvidence,
     GraphQLSchemaEvidence,
+    OwnershipEvidence,
+    ImpactEvidence,
 )
 from reporting.base import ReporterBase
 
@@ -91,6 +93,26 @@ class ChatGPTReporter(ReporterBase):
                 f"> **{evidence_raw.description}** ({q_count} queries, {m_count} mutations)\n"
                 f"```\n{str(schema)[:800]}\n```"
             )
+        if isinstance(evidence_raw, OwnershipEvidence):
+            violated = evidence_raw.ownership_violated
+            lines = [
+                f"> **{evidence_raw.description}** — {'⚠️ Ownership Violation' if violated else 'No violation'}",
+                f"> Original owner: `{evidence_raw.original_owner}`",
+                f"> Claiming identity: `{evidence_raw.claiming_identity}`",
+                f"> Proof type: `{evidence_raw.proof_type}`",
+                f"> Resource: `{evidence_raw.resource_identifier}`",
+            ]
+            return "\n".join(lines)
+        if isinstance(evidence_raw, ImpactEvidence):
+            lines = [
+                f"> **{evidence_raw.description}** — {'✅ Demonstrated' if evidence_raw.demonstrated else 'Theoretical'}",
+                f"> Impact type: `{evidence_raw.impact_type}`",
+                f"> Severity confirmed: {evidence_raw.severity_confirmed}",
+                f"> Business impact: {evidence_raw.business_impact}",
+                f"> Attack scenario: {evidence_raw.attack_scenario}",
+                f"> Exploitation proof: {evidence_raw.exploitation_proof}",
+            ]
+            return "\n".join(lines)
         if isinstance(evidence_raw, EvidenceBase):
             if hasattr(evidence_raw, 'to_dict'):
                 return f"> **{evidence_raw.description}**\n```json\n{json.dumps(evidence_raw.to_dict(), indent=2)}\n```"

@@ -102,6 +102,16 @@ class ExposedFilesScanner(ScannerBase):
         if ".ssh/id_rsa" in ext:
             return body.startswith("-----BEGIN") or "PRIVATE KEY" in body or "OPENSSH" in body
 
+        # .gitignore — common gitignore patterns
+        if ".gitignore" in ext:
+            return any(p in body for p in ("node_modules", "*.log", "vendor/", ".env", "dist/",
+                                            "build/", ".next", "__pycache__", "*.pyc", "target/",
+                                            ".DS_Store", "*.swp", ".idea", "*.class"))
+
+        # .DS_Store — Apple metadata file (binary magic)
+        if ".ds_store" in ext.lower():
+            return len(raw) > 4 and raw[:4] == b"\x00\x00\x00\x01"
+
         # Generic secret / password files
         if "secrets" in ext or "password" in ext:
             return "=" in body or ":" in body
@@ -116,9 +126,10 @@ class ExposedFilesScanner(ScannerBase):
         if ext.endswith(".sql"):
             return any(body.lstrip().startswith(w) for w in ("-- ", "CREATE", "INSERT", "DROP", "ALTER", "SELECT"))
 
-        # Catch-all: for paths without a specific validator, still check that
-        # the body has meaningful content (not just whitespace/empty)
-        return bool(body.strip())
+        # Catch-all: only report when a path-specific validator matches.
+        # Generic catch-all caused excessive false positives from arbitrary
+        # HTTP-200 responses on common file paths.
+        return False
 
     def detect(self, url: str, parameter: str | None = None) -> DetectionResult | None:
         resp = safe_get(self.session, url, self.timeout, raise_for_status=False)
