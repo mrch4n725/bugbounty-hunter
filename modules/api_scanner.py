@@ -114,11 +114,24 @@ class ApiScanner(ScannerModuleBase):
         if endpoints:
             log(f"  [API] Discovered {len(endpoints)} endpoint(s) from OpenAPI specs", Colors.CYAN,
                 verbose_only=True, verbose=self.verbose)
+            # Feed OpenAPI endpoint URLs back into recon_data URL pool
+            for ep in endpoints:
+                ep_url = self.base_url + ep.get("path", "")
+                if ep_url and self._in_scope(ep_url):
+                    urls_list = self.recon.setdefault("urls", [])
+                    if ep_url not in urls_list:
+                        urls_list.append(ep_url)
 
         gql_endpoints = self._find_gql_endpoints()
         if gql_endpoints:
             log(f"  [API] Found {len(gql_endpoints)} GraphQL endpoint(s)", Colors.CYAN,
                 verbose_only=True, verbose=self.verbose)
+            # Feed GQL endpoints back into recon_data URL pool
+            for gql_url in gql_endpoints:
+                if gql_url and self._in_scope(gql_url):
+                    urls_list = self.recon.setdefault("urls", [])
+                    if gql_url not in urls_list:
+                        urls_list.append(gql_url)
 
         findings.extend(self.scan_graphql_introspection(gql_endpoints))
         findings.extend(self.scan_graphql_injection(gql_endpoints))

@@ -43,6 +43,71 @@ class ImportResult:
             "status_counts": self.status_counts,
         }
 
+    def merge_into_recon(self, recon_data: dict[str, Any]) -> dict[str, Any]:
+        """Merge this ImportResult into a Recon run() result dict.
+
+        Handles key name differences (parameters→params, tech_stack→technology)
+        and feeds api_endpoints as URLs so downstream scanners can discover them.
+        """
+        recon = dict(recon_data)
+
+        # urls: merge with dedup (api_endpoints also contribute URLs)
+        existing_urls = set(recon.get("urls", []))
+        existing_urls.update(self.urls)
+        for ep in self.api_endpoints:
+            ep_url = ep.get("url", "")
+            if ep_url:
+                existing_urls.add(ep_url)
+        recon["urls"] = sorted(existing_urls)
+
+        # params (Recon key) ← parameters (ImportResult key)
+        existing_params = set(recon.get("params", []))
+        existing_params.update(self.parameters)
+        recon["params"] = sorted(existing_params)
+
+        # forms: append
+        recon.setdefault("forms", []).extend(self.forms)
+
+        # js_endpoints: merge
+        existing_js_ep = set(recon.get("js_endpoints", []))
+        existing_js_ep.update(self.js_endpoints)
+        recon["js_endpoints"] = sorted(existing_js_ep)
+
+        # technology ← tech_stack
+        existing_tech = dict(recon.get("technology", {}))
+        for tech in self.tech_stack:
+            existing_tech[tech] = True
+        recon["technology"] = existing_tech
+
+        # Store extra intelligence that Recon doesn't produce natively
+        if self.api_endpoints:
+            existing_api = recon.setdefault("_imported_api_endpoints", [])
+            seen_urls = {e.get("url", "") for e in existing_api}
+            for ep in self.api_endpoints:
+                if ep.get("url", "") not in seen_urls:
+                    existing_api.append(ep)
+                    seen_urls.add(ep.get("url", ""))
+
+        if self.auth_headers:
+            existing_auth = recon.setdefault("_imported_auth_headers", {})
+            existing_auth.update(self.auth_headers)
+
+        if self.response_patterns:
+            existing_rp = recon.setdefault("_imported_response_patterns", [])
+            seen_patterns = {(p["url"], p["pattern"]) for p in existing_rp}
+            for p in self.response_patterns:
+                key = (p["url"], p["pattern"])
+                if key not in seen_patterns:
+                    existing_rp.append(p)
+                    seen_patterns.add(key)
+
+        if self.status_counts:
+            existing_sc = recon.setdefault("_imported_status_counts", {})
+            for code, count in self.status_counts.items():
+                existing_sc[code] = existing_sc.get(code, 0) + count
+
+        return recon
+
     def merge(self, other: "ImportResult") -> "ImportResult":
         merged = ImportResult()
         merged.urls = list(set(self.urls + other.urls))

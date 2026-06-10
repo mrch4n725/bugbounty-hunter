@@ -409,6 +409,18 @@ class ScannerBase:
 
             link_finding_evidence(f, self.evidence_engine)
 
+            # ── Harvest objects from response excerpt ────────────────
+            if self.container and hasattr(self.container, 'object_harvester'):
+                try:
+                    excerpt = f.get("response_excerpt", "") or getattr(f, "response_excerpt", "")
+                    if excerpt and len(excerpt) > 50:
+                        self.container.object_harvester.harvest(
+                            url=f.get("url", ""),
+                            response_text=excerpt,
+                        )
+                except Exception:
+                    pass
+
             # ── Record payload effectiveness ─────────────────────────
             if self.container and hasattr(self.container, 'payload_intelligence'):
                 try:

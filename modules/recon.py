@@ -813,6 +813,46 @@ class Recon:
                 log(f"  [Env Var] {ev['reference']}: {ev['variable']}", Colors.YELLOW,
                     verbose_only=True, verbose=self.verbose)
 
+            # ── Report feature flags ────────────────────────────────────────
+            for ff in analysis.get("feature_flags", []):
+                log(f"  [JS Feature Flag] {ff['type']}: {ff['match'][:60]}", Colors.YELLOW,
+                    verbose_only=True, verbose=self.verbose)
+
+            # ── Report hardcoded values ──────────────────────────────────────
+            for hv in analysis.get("hardcoded_values", []):
+                log(f"  [JS Hardcoded] {hv['type']}: {hv['match'][:80]}", Colors.YELLOW,
+                    verbose_only=True, verbose=self.verbose)
+
+            # ── Report internal APIs ─────────────────────────────────────────
+            for ia in analysis.get("internal_apis", []):
+                ia_url = ia.get("url", "")
+                if ia_url and same_domain(self.base_url, ia_url):
+                    with self.urls_lock:
+                        if ia_url not in self.urls:
+                            self.urls.add(ia_url)
+                log(f"  [JS Internal API] {ia.get('match', '')[:60]}", Colors.CYAN,
+                    verbose_only=True, verbose=self.verbose)
+
+            # ── Report suspicious patterns ───────────────────────────────────
+            for sp in analysis.get("suspicious_patterns", []):
+                log(f"  [JS Suspicious] {sp['type']}: {sp['match'][:80]}", Colors.RED,
+                    verbose_only=True, verbose=self.verbose)
+
+            # ── Report tokens (verbose only) ─────────────────────────────────
+            for tk in analysis.get("tokens", []):
+                log(f"  [JS Token] {tk['type']}: {tk['value'][:60]}", Colors.YELLOW,
+                    verbose_only=True, verbose=self.verbose)
+
+            # ── Report GraphQL endpoints ─────────────────────────────────────
+            for gql_ref in analysis.get("graphql_endpoints", []):
+                gql_url = gql_ref.get("url", "")
+                if gql_url and same_domain(self.base_url, gql_url):
+                    with self.urls_lock:
+                        if gql_url not in self.urls:
+                            self.urls.add(gql_url)
+                log(f"  [JS GQL] {gql_ref.get('match', '')[:60]}", Colors.CYAN,
+                    verbose_only=True, verbose=self.verbose)
+
             # ── Feed discovered endpoints into scanner URL pool ────────────
             for ep in analysis.get("endpoints", []):
                 ep_url = ep.get("url", "")

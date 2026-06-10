@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import threading
 from typing import Any
 
@@ -242,6 +243,30 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
         except Exception as e:
             log(f"[!] BUSINESS_LOGIC error: {e}", Colors.YELLOW)
 
+    # ── Consume html_comments: extract URLs and params, feed into URL pool ──
+    html_comments = recon_data.get("html_comments", [])
+    if html_comments:
+        from urllib.parse import urlparse
+        comment_urls_added = 0
+        for hc in html_comments:
+            comment_text = hc.get("comment", "")
+            source_url = hc.get("source", "")
+            if not comment_text:
+                continue
+            # Extract URLs from HTML comments
+            for match in re.findall(r'(https?://[^\s<>"\']+)', comment_text):
+                u = match.split("#")[0].rstrip("/")
+                if u not in recon_data.get("urls", []):
+                    recon_data.setdefault("urls", []).append(u)
+                    comment_urls_added += 1
+            # Extract params from comments (e.g., parameter names, field names)
+            param_matches = re.findall(r'(?:param|parameter|field|var|variable)[:\s]+(\w+)', comment_text, re.IGNORECASE)
+            for p in param_matches:
+                if p not in recon_data.get("params", []):
+                    recon_data.setdefault("params", []).append(p)
+        log(f"[*] HTML comments: extracted {comment_urls_added} URL(s) to scan pool",
+            Colors.CYAN, verbose_only=True, verbose=config.get("verbose", False))
+
     # ── Step 3: Score and sort URLs ──────────────────────────────────────
     urls = recon_data.get("urls", [])
     forms = recon_data.get("forms", [])
@@ -421,6 +446,30 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
                             Colors.YELLOW, verbose_only=True, verbose=config.get("verbose", False))
         except Exception as e:
             log(f"[!] Semantic classification failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
+
+    # ── Object Harvesting (extract IDs/emails/roles from responses) ─────
+    if container and hasattr(container, 'object_harvester'):
+        try:
+            harvester = container.object_harvester
+            harvest_count = 0
+            for obj in enriched:
+                excerpt = obj.get("response_excerpt", "") or getattr(obj, "response_excerpt", "")
+                if excerpt and len(excerpt) > 50:
+                    harvested = harvester.harvest(url=obj.url, response_text=excerpt)
+                    harvest_count += len(harvested)
+            if harvest_count:
+                log(f"[+] Object harvester: {harvest_count} objects extracted across {len(enriched)} findings",
+                    Colors.GREEN)
+            # Log DiscoveryStore stats
+            if hasattr(container, 'discovery_store'):
+                ds_stats = container.discovery_store.get_stats()
+                if ds_stats["total_records"]:
+                    log(f"[*] Discovery store: {ds_stats['total_records']} records in "
+                        f"{ds_stats['num_categories']} categories",
+                        Colors.CYAN, verbose_only=True, verbose=config.get("verbose", False))
+        except Exception as e:
+            log(f"[!] Object harvesting failed: {e}", Colors.YELLOW,
                 verbose_only=True, verbose=config.get("verbose", False))
 
     log("[*] Validating evidence completeness...", Colors.CYAN)

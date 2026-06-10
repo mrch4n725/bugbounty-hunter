@@ -193,6 +193,10 @@ class JSIntelligence:
         self._extract_feature_flags(js_code, results)
         self._extract_hidden(js_code, results, source_url)
         self._extract_env_vars(js_code, results)
+        self._extract_graphql(js_code, results, source_url)
+        self._extract_tokens(js_code, results, source_url)
+        self._extract_internal_apis(js_code, results, source_url)
+        self._extract_suspicious(js_code, results, source_url)
 
         return results
 
@@ -211,6 +215,62 @@ class JSIntelligence:
                     "url": full,
                     "source": match.group(0)[:80],
                     "type": label,
+                })
+
+    def _extract_graphql(self, js_code: str, results: Dict[str, Any], source_url: str) -> None:
+        for match in re.finditer(r'(?i)(?:graphql|gql|mutation|query)\s*[`"\'{]', js_code):
+            results["graphql_endpoints"].append({
+                "match": match.group(0)[:80],
+                "source_url": source_url,
+            })
+        for ep in results.get("hidden_endpoints", []):
+            if "graphql" in ep.get("url", "").lower() or "gql" in ep.get("url", "").lower():
+                results["graphql_endpoints"].append({
+                    "url": ep["url"],
+                    "match": ep.get("match", "")[:80],
+                    "source_url": source_url,
+                })
+
+    def _extract_tokens(self, js_code: str, results: Dict[str, Any], source_url: str) -> None:
+        seen: Set[str] = set()
+        for label, pattern in SECRET_PATTERNS_JS:
+            for match in pattern.finditer(js_code):
+                value = match.group(0)[:120]
+                fp = hashlib.sha256(f"{label}:{value}".encode()).hexdigest()
+                if fp in seen:
+                    continue
+                seen.add(fp)
+                results["tokens"].append({"type": label, "value": value, "source_url": source_url})
+
+    def _extract_internal_apis(self, js_code: str, results: Dict[str, Any], source_url: str) -> None:
+        internal_patterns = [
+            re.compile(r'(?:https?://)?(?:[a-z]+-)?(?:api|service|backend|internal|private)'
+                       r'\.(?:internal|corp|local|dev|staging|intranet)[^\s"\'\)]*', re.I),
+            re.compile(r'(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}'
+                       r'|192\.168\.\d{1,3}\.\d{1,3})(?::\d+)?(?:/[^\s"\'\)]*)?'),
+            re.compile(r'(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?(?:/[^\s"\'\)]*)?', re.I),
+        ]
+        for pattern in internal_patterns:
+            for match in pattern.finditer(js_code):
+                results["internal_apis"].append({
+                    "url": match.group(0)[:200],
+                    "match": match.group(0)[:80],
+                    "source_url": source_url,
+                })
+
+    def _extract_suspicious(self, js_code: str, results: Dict[str, Any], source_url: str) -> None:
+        susp_patterns = [
+            (re.compile(r'["\'][A-Za-z0-9+/]{40,}=*["\']'), "long_b64_like"),
+            (re.compile(r'(?i)(?:hack|exploit|bypass|backdoor|shell|xss|sqli|cmdi)\s*[:=]\s*["\'][^"\']+["\']'), "exploit_keyword"),
+            (re.compile(r'(?i)(?:TODO|FIXME|HACK|XXX|BUG|SECURITY|INSECURE|VULNERABLE)\s*[:=]\s*["\'][^"\']+["\']'), "security_todo"),
+            (re.compile(r'(?i)(?:bypass|disable|ignore|skip|turn_off|deactivate)\s*[:=]\s*(?:true|1|yes)'), "security_bypass"),
+        ]
+        for pattern, label in susp_patterns:
+            for match in pattern.finditer(js_code):
+                results["suspicious_patterns"].append({
+                    "type": label,
+                    "match": match.group(0)[:120],
+                    "source_url": source_url,
                 })
 
     def _extract_secrets(self, js_code: str, results: Dict[str, Any], source_url: str) -> None:

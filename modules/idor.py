@@ -202,6 +202,24 @@ class IdorScanner(ScannerModuleBase):
                             "form": form,
                         })
 
+        # Fuzzed parameters from recon — active params discovered by
+        # parameter fuzzing, injected as URL-source candidates
+        for fuzz_url, fuzz_params in self.recon.get("fuzzed_params", {}).items():
+            if not self._in_scope(fuzz_url):
+                continue
+            for param_name in fuzz_params:
+                key = (param_name, "fuzzed")
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append({
+                        "source": "fuzzed",
+                        "url": fuzz_url,
+                        "param": param_name,
+                        "value": "1",
+                        "type": self._classify_param(param_name, "1") or "numeric",
+                        "method": "GET",
+                    })
+
         return candidates
 
     def _classify_param(self, param: str, value: str) -> Optional[str]:

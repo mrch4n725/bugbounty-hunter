@@ -25,6 +25,9 @@ from engines.semantic_analyzer import SemanticResponseAnalyzer
 from engines.audit_log import AuditLogger
 from engines.footprint import FootprintManager
 from engines.cross_scan_dedup import CrossScanDatabase
+from engines.discovery_store import DiscoveryStore
+from engines.object_harvester import ObjectHarvester
+from engines.relationship_graph import RelationshipGraph
 from modules.external_intel import ExternalIntelligenceGatherer
 from modules.utils import BrowserValidator, OOBDetectionFramework
 
@@ -74,6 +77,9 @@ class ApplicationContainer:
         self._impact_escalation: ImpactEscalationAnalyzer | None = None
         self._evidence_completeness: EvidenceCompletenessValidator | None = None
         self._outcome_feedback_engine: OutcomeFeedbackEngine | None = None
+        self._discovery_store: DiscoveryStore | None = None
+        self._object_harvester: ObjectHarvester | None = None
+        self._relationship_graph: RelationshipGraph | None = None
 
     # ── Service accessors (lazy, cached) ─────────────────────────────────
 
@@ -272,6 +278,25 @@ class ApplicationContainer:
                 self._cross_scan_db = CrossScanDatabase(db_path)
         return self._cross_scan_db
 
+    @property
+    def discovery_store(self) -> DiscoveryStore:
+        if self._discovery_store is None:
+            db_path = self.config.get("discovery_db_path", "")
+            self._discovery_store = DiscoveryStore(db_path=db_path)
+        return self._discovery_store
+
+    @property
+    def object_harvester(self) -> ObjectHarvester:
+        if self._object_harvester is None:
+            self._object_harvester = ObjectHarvester(store=self.discovery_store)
+        return self._object_harvester
+
+    @property
+    def relationship_graph(self) -> RelationshipGraph:
+        if self._relationship_graph is None:
+            self._relationship_graph = RelationshipGraph(store=self.discovery_store)
+        return self._relationship_graph
+
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     def cleanup(self) -> None:
@@ -283,5 +308,10 @@ class ApplicationContainer:
         if self._oob_framework is not None:
             try:
                 self._oob_framework.clear()
+            except Exception:
+                pass
+        if self._discovery_store is not None:
+            try:
+                self._discovery_store.close()
             except Exception:
                 pass
