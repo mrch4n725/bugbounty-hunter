@@ -2172,7 +2172,13 @@ def compute_endpoint_score(url: str, forms: list[dict], recon_data: dict) -> int
         "has_cmd_param": 10,
         "is_graphql": 5,
     }
-    return sum(weights[s] for s in signals if s in weights)
+    # Tech signals get a uniform bonus (framework-specific URLs are higher value)
+    score = sum(weights[s] for s in signals if s in weights)
+    tech_signals = [s for s in signals if s.startswith("tech_")]
+    if tech_signals:
+        tech_bonus = min(len(tech_signals) * 20, 40)
+        score += tech_bonus
+    return score
 
 
 def _get_signal_set(
@@ -2256,6 +2262,24 @@ def _get_signal_set(
     )
     if any(any(cn in p for cn in cmd_param_names) for p in params_lower):
         signals.add("has_cmd_param")
+
+    # ── Technology-aware path signals (auto, never subtractive) ─────────
+    tech_data: dict = {}
+    if isinstance(recon_data, dict):
+        tech_data = recon_data.get("technology", {}) or {}
+    for category in ("cms", "framework", "language"):
+        detected = tech_data.get(category, [])
+        if isinstance(detected, list):
+            for tech_name in detected:
+                tech_key = f"tech_{tech_name.lower().replace('.', '_').replace(' ', '_')}"
+                signals.add(tech_key)
+    # Direct path-based tech hints (even without recon tech data)
+    if "/wp-" in path or "/xmlrpc.php" in path:
+        signals.add("tech_wordpress")
+    if "/actuator/" in path or "/swagger-ui" in path:
+        signals.add("tech_spring")
+    if "/graphql" in path or "/gql" in path:
+        signals.add("tech_graphql")
 
     return signals
 

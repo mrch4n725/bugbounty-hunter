@@ -213,7 +213,7 @@ class ApplicationContainer:
     @property
     def audit_logger(self) -> AuditLogger:
         if self._audit_logger is None:
-            self._audit_logger = AuditLogger(self.config.get("output", "reports"))
+            self._audit_logger = AuditLogger(self.config.get("output_dir", self.config.get("output", "reports")))
         return self._audit_logger
 
     @property

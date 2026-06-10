@@ -392,6 +392,24 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
                             obj.evidence.append(ev)
         enriched.append(obj)
 
+    # ── Semantic response classification (auto PII/credential detection) ──
+    if "semantic_analyzer" not in disabled_engines and container and hasattr(container, 'semantic_analyzer'):
+        try:
+            sa = container.semantic_analyzer
+            for obj in enriched:
+                excerpt = obj.get("response_excerpt", "") or getattr(obj, "response_excerpt", "")
+                if excerpt and len(excerpt) > 50:
+                    result = sa.classify_response(excerpt, url=obj.url)
+                    if result and result.matched_patterns:
+                        object.__setattr__(obj, "_semantic_classification", result)
+                        leak_types = {p["category"] for p in result.matched_patterns}
+                        object.__setattr__(obj, "_data_leak_categories", list(leak_types))
+                        log(f"  [DataLeak] {obj.url}: {', '.join(sorted(leak_types))}",
+                            Colors.YELLOW, verbose_only=True, verbose=config.get("verbose", False))
+        except Exception as e:
+            log(f"[!] Semantic classification failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
+
     log("[*] Validating evidence completeness...", Colors.CYAN)
     from engines.evidence_validator import EvidenceCompletenessValidator
     evidence_validated = []
@@ -477,6 +495,17 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
                 Colors.GREEN)
         except Exception as e:
             log(f"[!] Validation consensus failed: {e}", Colors.YELLOW)
+
+    # ── Payload Intelligence stats (auto-printed) ─────────────────────────
+    if container and hasattr(container, 'payload_intelligence'):
+        try:
+            stats = container.payload_intelligence.get_stats()
+            if stats and stats.get("total_records", 0) > 0:
+                log(f"[*] Payload intelligence: {stats['total_records']} records, "
+                    f"{stats.get('unique_payloads', 0)} unique payloads across "
+                    f"{len(stats.get('by_type', {}))} vuln types", Colors.CYAN)
+        except Exception:
+            pass
 
     updated = prioritize_findings(updated)
 

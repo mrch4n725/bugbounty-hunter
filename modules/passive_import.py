@@ -497,3 +497,110 @@ class CharlesImporter:
         result.urls = sorted(set(result.urls))
         result.js_endpoints = sorted(set(result.js_endpoints))
         return result
+
+
+class PostmanImporter:
+    @staticmethod
+    def import_collection(filepath: str) -> ImportResult:
+        result = ImportResult()
+        with open(filepath) as f:
+            collection = json.load(f)
+
+        items = collection.get("item", [])
+        queue: list = list(items)
+        while queue:
+            item = queue.pop(0)
+            if "item" in item:
+                queue.extend(item["item"])
+                continue
+            req = item.get("request", {})
+            if not req:
+                continue
+            url = PostmanImporter._resolve_url(req.get("url", {}))
+            if not url:
+                continue
+            result.urls.append(url)
+            result.parameters |= _extract_params_from_url(url)
+            method = req.get("method", "GET").upper()
+            request_headers = {
+                h["key"]: h["value"] for h in req.get("header", []) if h.get("key")
+            }
+            auth = _extract_auth(request_headers)
+            if auth:
+                result.auth_headers.update(auth)
+            body_data = ""
+            body = req.get("body", {})
+            if body.get("mode") == "raw":
+                body_data = body.get("raw", "")
+            elif body.get("mode") == "urlencoded":
+                parts = [
+                    f"{p['key']}={p.get('value', '')}"
+                    for p in body.get("urlencoded", []) if p.get("key")
+                ]
+                body_data = "&".join(parts)
+            elif body.get("mode") == "formdata":
+                parts = [
+                    f"{p['key']}={p.get('value', '')}"
+                    for p in body.get("formdata", []) if p.get("key")
+                ]
+                body_data = "&".join(parts)
+
+            for resp in item.get("response", []):
+                status_code = resp.get("code", 0)
+                if status_code:
+                    result.status_counts[status_code] = result.status_counts.get(status_code, 0) + 1
+                resp_headers = {
+                    h["key"]: h["value"] for h in resp.get("header", []) if h.get("key")
+                }
+                content_type = resp_headers.get("Content-Type", "")
+                result.tech_stack.extend(_extract_tech(resp_headers))
+                resp_body = resp.get("body", "") or resp.get("text", "") or ""
+                if resp_body:
+                    result.response_patterns.extend(
+                        _extract_response_patterns(url, resp_body, resp_headers)
+                    )
+                    if "text/html" in content_type and body_data and "=" in body_data:
+                        try:
+                            parsed_body = parse_qs(body_data)
+                            for param_name in parsed_body:
+                                result.parameters.add(param_name)
+                            result.forms.append({
+                                "url": url, "action": url, "method": method,
+                                "fields": [{"name": p, "type": "text", "value": ""} for p in parsed_body],
+                            })
+                        except Exception:
+                            pass
+                endpoint_type = _classify_endpoint(url, content_type)
+                if endpoint_type:
+                    result.api_endpoints.append({
+                        "url": url, "method": method,
+                        "content_type": content_type if endpoint_type == "api" else "graphql",
+                        "status_code": status_code,
+                        "body": body_data[:500] if body_data else "",
+                    })
+
+        result.tech_stack = list(set(result.tech_stack))
+        result.urls = sorted(set(result.urls))
+        result.js_endpoints = sorted(set(result.js_endpoints))
+        return result
+
+    @staticmethod
+    def _resolve_url(url_data: dict | str) -> str:
+        if isinstance(url_data, str):
+            return url_data
+        raw = url_data.get("raw", "")
+        if raw:
+            return raw
+        protocol = url_data.get("protocol", "https")
+        host = ".".join(url_data.get("host", [])) if isinstance(url_data.get("host"), list) else (url_data.get("host") or "")
+        port = url_data.get("port", "")
+        path_parts = url_data.get("path", [])
+        path = "/" + "/".join(path_parts) if isinstance(path_parts, list) else (path_parts or "")
+        query = url_data.get("query", [])
+        qs = ""
+        if query:
+            parts = [f"{q['key']}={q.get('value', '')}" for q in query if q.get("key")]
+            if parts:
+                qs = "?" + "&".join(parts)
+        port_str = f":{port}" if port else ""
+        return f"{protocol}://{host}{port_str}{path}{qs}"

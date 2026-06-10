@@ -181,8 +181,10 @@ def parse_args():
         help="Path to Burp/Charles export for mobile API mode")
     parser.add_argument("--diff-scan",
         help="Path to previous scan JSON output for diff/regression comparison")
-    parser.add_argument("--audit-log", action="store_true",
-        help="Enable per-request audit log (CSV) in output directory")
+    parser.add_argument("--audit-log", action="store_true", default=True,
+        help="Enable per-request audit log (SQLite) in output directory (default: on)")
+    parser.add_argument("--no-audit-log", action="store_false", dest="audit_log",
+        help="Disable per-request audit log (SQLite)")
     parser.add_argument("--payload-db",
         help="Path to payload intelligence database (JSON)")
     return parser.parse_args()
@@ -401,6 +403,8 @@ def build_config(args):
         "check_default_creds": getattr(args, "check_default_creds", False),
         "login_verify_url": getattr(args, "login_verify_url", None),
         "no_default_creds": getattr(args, "no_default_creds", False),
+        "audit_log": getattr(args, "audit_log", True),
+        "diff_scan": getattr(args, "diff_scan", ""),
         "status": {
             "phase": "initialized",
             "findings_count": 0,
@@ -710,6 +714,15 @@ def run(config: dict) -> int:
     os.makedirs(config["output_dir"], exist_ok=True)
     _log_startup(config)
 
+    # ── Audit logger (default on, opt-out via --no-audit-log) ────────
+    if config.get("audit_log", True) and container:
+        try:
+            al = container.audit_logger
+            config["_audit_logger"] = al
+            log("[*] Audit log enabled (SQLite)", Colors.CYAN)
+        except Exception as e:
+            log(f"[!] Failed to init audit logger: {e}", Colors.YELLOW)
+
     # ── Explicit auto-login (--do-login) — runs BEFORE recon ──────────
     # so that authenticated endpoints are discovered during crawling.
     do_login_url = config.get("do_login")
@@ -749,7 +762,7 @@ def run(config: dict) -> int:
         log(f"[*] Loading passive import: {passive_import_path}", Colors.CYAN)
         try:
             ext = os.path.splitext(passive_import_path)[1].lower()
-            from modules.passive_import import BurpXmlImporter, HarImporter, CharlesImporter
+            from modules.passive_import import BurpXmlImporter, HarImporter, CharlesImporter, PostmanImporter
             import_result = None
             if ext in (".xml",):
                 import_result = BurpXmlImporter.import_xml(passive_import_path)
@@ -757,6 +770,8 @@ def run(config: dict) -> int:
                 import_result = HarImporter.import_har(passive_import_path)
             elif ext in (".chls", ".chlsj"):
                 import_result = CharlesImporter.import_session(passive_import_path)
+            elif ext in (".json",):
+                import_result = PostmanImporter.import_collection(passive_import_path)
             if import_result:
                 imported = import_result.to_recon_dict()
                 log(f"  [+] Imported {len(imported.get('urls', []))} URLs, "
@@ -1070,6 +1085,29 @@ def run(config: dict) -> int:
                 log("[*] No regressions detected", Colors.GREEN)
         except Exception as e:
             log(f"[!] Replay cross-scan comparison failed: {e}", Colors.YELLOW)
+
+    # ── Cross-scan diff (--diff-scan) ────────────────────────────────────
+    diff_scan_path = config.get("diff_scan", "")
+    if diff_scan_path and os.path.isfile(diff_scan_path):
+        try:
+            log(f"[*] Comparing against previous scan: {diff_scan_path}", Colors.CYAN)
+            from engines.diff import ScanDiffEngine
+            new_findings = [f.to_dict() if hasattr(f, "to_dict") else dict(f) for f in all_findings]
+            old_findings = []
+            with open(diff_scan_path) as f:
+                old_data = json.load(f)
+            if isinstance(old_data, list):
+                old_findings = old_data
+            elif isinstance(old_data, dict):
+                old_findings = old_data.get("findings", [])
+            diff_result = ScanDiffEngine.diff(new_findings, old_findings)
+            log(ScanDiffEngine.format_summary(diff_result), Colors.WHITE)
+            config["_diff_result"] = diff_result
+            if diff_result.regressed_findings:
+                log(f"[!] {len(diff_result.regressed_findings)} regressed finding(s)",
+                    Colors.RED)
+        except Exception as e:
+            log(f"[!] Cross-scan diff failed: {e}", Colors.YELLOW)
 
     # ── Investigation Engine (Initiative 2) ──────────────────────────────
     if "investigation" not in disabled_engines and container:
