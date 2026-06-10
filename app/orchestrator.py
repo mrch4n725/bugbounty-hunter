@@ -493,6 +493,42 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
             log(f"[!] Object harvesting failed: {e}", Colors.YELLOW,
                 verbose_only=True, verbose=config.get("verbose", False))
 
+    # ── GQL Authorization Intelligence (feed stored GQL types into discovery) ──
+    if container and hasattr(container, 'discovery_store'):
+        try:
+            store = container.discovery_store
+            gql_types = store.get_by_category("gql_type")
+            if gql_types:
+                from engines.gql_auth import GqlAuthorizationEngine
+                gql_engine = GqlAuthorizationEngine(store)
+                # Feed GQL-derived ownership hints back into DiscoveryStore
+                for hint in gql_engine.build_ownership_hints():
+                    store.record(
+                        category="ownership_hint",
+                        value=hint["value"],
+                        source_url=hint["source_url"],
+                        extra=hint["extra"],
+                    )
+                for rel in gql_engine.build_relationships():
+                    store.record(
+                        category="ownership_relationship",
+                        value=rel["value"],
+                        source_url=rel["source_url"],
+                        extra=rel["extra"],
+                    )
+                gql_role_types = gql_engine.get_privilege_level_types()
+                for rt in gql_role_types:
+                    store.record("role", rt, source_url="gql_schema")
+                n_ownership = len(gql_engine.get_ownership_fields())
+                n_roles = len(gql_role_types)
+                if n_ownership or n_roles:
+                    log(f"[+] GQL auth intelligence: {n_ownership} ownership fields, "
+                        f"{n_roles} privilege types consumed",
+                        Colors.GREEN, verbose_only=True, verbose=config.get("verbose", False))
+        except Exception as e:
+            log(f"[!] GQL auth intelligence failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
+
     log("[*] Validating evidence completeness...", Colors.CYAN)
     evidence_completeness = getattr(container, 'evidence_completeness', None) if container else None
     if evidence_completeness is None:

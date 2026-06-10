@@ -20,7 +20,7 @@ from modules.scanner import VulnScanner
 from modules.api_scanner import ApiScanner
 from modules.reporter import Reporter
 from modules.js_intelligence import JSIntelligence
-from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, classify_endpoint, compute_endpoint_score, prioritize_findings, reset_seen_findings, _build_curl, set_mask_sensitive_default, ScanProgress, safe_cookies_dict
+from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, build_role_sessions, classify_endpoint, compute_endpoint_score, prioritize_findings, reset_seen_findings, _build_curl, set_mask_sensitive_default, ScanProgress, safe_cookies_dict
 from models.finding import Finding
 from app.bootstrap import bootstrap, auto_upgrade_config, print_startup_summary
 from engines.history import correlate_findings
@@ -1061,6 +1061,13 @@ def run(config: dict) -> int:
     stop_autosave, autosave_thread = _start_autosave(
         config, recon_data, all_findings, all_findings_lock, js_data=js_data, container=container
     )
+
+    # Build role sessions for authz testing (consumed by scanners + MultiAccountDiscovery)
+    base_session = make_session(config) if hasattr(config, "get") else None
+    role_sessions = build_role_sessions(config, base_session=base_session)
+    if len(role_sessions) >= 2:
+        config["_role_sessions"] = role_sessions
+
     try:
         run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, all_findings_lock, container=container, capabilities=capabilities)
     except KeyboardInterrupt:
@@ -1068,6 +1075,28 @@ def run(config: dict) -> int:
 
     # Merge JS secret findings AFTER run_scans (so they appear after scanner findings)
     all_findings.extend(js_findings)
+
+    # ── Multi-Account Discovery ──────────────────────────────────────────
+    if "multi_account" not in disabled_engines and container and container.multi_account_discovery:
+        try:
+            log("[*] Running multi-account discovery...", Colors.CYAN)
+            from engines.multi_account_discovery import MultiAccountDiscoveryEngine
+            mae = container.multi_account_discovery
+            cross_account_findings = mae.run_cross_account_scan(recon_data, container.discovery_store)
+            if cross_account_findings:
+                converted = []
+                for f_dict in cross_account_findings:
+                    if isinstance(f_dict, dict):
+                        converted.append(Finding.from_dict(f_dict))
+                    else:
+                        converted.append(f_dict)
+                all_findings.extend(converted)
+                log(f"[+] Multi-account discovery: {len(converted)} new authZ findings",
+                    Colors.GREEN)
+            else:
+                log("[*] Multi-account discovery: no new findings", Colors.CYAN)
+        except Exception as e:
+            log(f"[!] Multi-account discovery failed: {e}", Colors.YELLOW)
 
     # ── Convert to Finding instances for engine processing ───────────────
     all_findings = _findings_to_finding(config, all_findings, recon_data, js_data)

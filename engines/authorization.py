@@ -30,6 +30,7 @@ from models.evidence import (
 )
 from engines.validation_engine import ValidationEngine
 from engines.evidence_engine import EvidenceEngine
+from engines.differential_auth import DifferentialAuthorizationEngine
 
 
 # ── URL patterns for authorization-relevant endpoints ────────────────────
@@ -173,17 +174,35 @@ class AuthorizationEngine:
         if not resp_orig or not resp_targ:
             return None
 
-        content_diff = resp_targ.text != resp_orig.text
-        same_status = resp_orig.status_code == resp_targ.status_code
+        # Field-level comparison via DifferentialAuthorizationEngine
+        diff_engine = DifferentialAuthorizationEngine()
+        diff_result = diff_engine.compare_http(resp_orig, resp_targ)
+
+        content_diff = diff_result.body_diff_detected
+        same_status = not diff_result.status_diff
+        sensitive_leaks = diff_result.sensitive_field_leaks
+
         ownership_violation = (
-            content_diff and same_status and resp_targ.status_code == 200
+            content_diff
+            and same_status
+            and resp_targ.status_code == 200
+        ) or any(d.sensitivity == "ownership" for d in sensitive_leaks)
+
+        has_data_leak = any(
+            d.sensitivity in ("financial", "credential", "pii", "internal")
+            for d in sensitive_leaks
         )
 
-        if ownership_violation:
+        if ownership_violation or has_data_leak:
             ev_status = EvidenceStatus.VERIFIED
+            leak_desc = ""
+            if has_data_leak:
+                leak_types = {d.sensitivity for d in sensitive_leaks}
+                leak_fields = [d.field_path for d in sensitive_leaks]
+                leak_desc = f" — field-level leak: {', '.join(leak_types)} in {', '.join(leak_fields[:5])}"
             description = (
                 f"Authorization violation: {original_role} \u2192 {target_role} "
-                f"@ {url} \u2014 differing content confirms ownership bypass"
+                f"@ {url}{leak_desc}"
             )
         elif content_diff:
             ev_status = EvidenceStatus.COLLECTED
@@ -219,6 +238,7 @@ class AuthorizationEngine:
     ) -> tuple[str, str]:
         """Classify the violation type and severity.
 
+        Uses DifferentialAuthorizationEngine for field-level awareness.
         Returns (vuln_type, severity).
         """
         orig_level = _role_level(original_role)
@@ -234,7 +254,10 @@ class AuthorizationEngine:
                 return ("Authorization - Vertical", "high")
             return ("Authorization - Horizontal", "high")
 
-        return ("Authorization - Horizontal", "medium")
+        if evidence.target_status not in (403, 401) and evidence.original_status != evidence.target_status:
+            return ("Authorization - Status Bypass", "high")
+
+        return ("Authorization - Checked", "medium")
 
     def _build_finding(
         self,

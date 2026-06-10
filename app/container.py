@@ -28,6 +28,7 @@ from engines.cross_scan_dedup import CrossScanDatabase
 from engines.discovery_store import DiscoveryStore
 from engines.object_harvester import ObjectHarvester
 from engines.relationship_graph import RelationshipGraph
+from engines.multi_account_discovery import MultiAccountDiscoveryEngine
 from modules.external_intel import ExternalIntelligenceGatherer
 from modules.utils import BrowserValidator, OOBDetectionFramework
 
@@ -80,6 +81,7 @@ class ApplicationContainer:
         self._discovery_store: DiscoveryStore | None = None
         self._object_harvester: ObjectHarvester | None = None
         self._relationship_graph: RelationshipGraph | None = None
+        self._multi_account_discovery: MultiAccountDiscoveryEngine | None = None
 
     # ── Service accessors (lazy, cached) ─────────────────────────────────
 
@@ -225,6 +227,20 @@ class ApplicationContainer:
             output_dir = self.config.get("output_dir", "")
             self._outcome_feedback_engine = OutcomeFeedbackEngine(output_dir=output_dir)
         return self._outcome_feedback_engine
+
+    @property
+    def multi_account_discovery(self) -> MultiAccountDiscoveryEngine | None:
+        if self._multi_account_discovery is None:
+            role_sessions = self.config.get("_role_sessions", {})
+            if len(role_sessions) < 2:
+                return None
+            self._multi_account_discovery = MultiAccountDiscoveryEngine(
+                config=self.config,
+                role_sessions=role_sessions,
+                validation_engine=self.validation_engine,
+                evidence_engine=self.evidence_engine,
+            )
+        return self._multi_account_discovery
 
     # ── New engine accessors ─────────────────────────────────────────────
 

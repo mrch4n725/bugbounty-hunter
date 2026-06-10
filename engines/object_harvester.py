@@ -7,6 +7,7 @@ authorization testing). Uses JSON-traversal when possible for nested
 structures, falling back to regex for non-JSON responses.
 """
 
+import base64
 import json
 import re
 from typing import Any
@@ -58,6 +59,50 @@ class ObjectHarvester:
 
     def __init__(self, store: DiscoveryStore | None = None):
         self._store = store or DiscoveryStore()
+
+    def _harvest_jwt_claims(self, token: str, url: str, harvested: list[dict]) -> None:
+        """Decode a JWT payload and store extracted claims as intelligence."""
+        try:
+            parts = token.split(".")
+            if len(parts) < 2:
+                return
+            payload_b64 = parts[1]
+            padding = 4 - len(payload_b64) % 4
+            if padding != 4:
+                payload_b64 += "=" * padding
+            decoded = base64.urlsafe_b64decode(payload_b64)
+            claims = json.loads(decoded)
+        except Exception:
+            return
+
+        # Extract subject / user ID
+        sub = claims.get("sub") or claims.get("user_id") or claims.get("userId") or claims.get("id")
+        if sub and isinstance(sub, str) and len(sub) > 1:
+            sub_cat = "uuid" if "-" in sub and len(sub) == 36 else "numeric_id" if sub.isdigit() else "email" if "@" in sub else "ownership_hint"
+            self._store.record(sub_cat, sub, source_url=url, extra={"claim": "sub", "jwt_source": url[:100]})
+            harvested.append({"category": sub_cat, "value": sub, "source_url": url, "extra": {"claim": "sub"}})
+
+        # Extract roles
+        for claim_name in ("roles", "role", "groups", "permissions", "scopes"):
+            val = claims.get(claim_name)
+            if val:
+                if isinstance(val, list):
+                    for v in val:
+                        v_str = str(v)
+                        self._store.record("role", v_str, source_url=url, extra={"claim": claim_name, "jwt_source": url[:100]})
+                        harvested.append({"category": "role", "value": v_str, "source_url": url})
+                elif isinstance(val, str):
+                    self._store.record("role", val, source_url=url, extra={"claim": claim_name, "jwt_source": url[:100]})
+                    harvested.append({"category": "role", "value": val, "source_url": url})
+
+        # Extract organization / tenant
+        for claim_name in ("org_id", "orgId", "organization_id", "tenant_id", "tenantId", "account_id", "accountId"):
+            org_val = claims.get(claim_name)
+            if org_val is not None:
+                v_str = str(org_val)
+                self._store.record("ownership_hint", f"jwt:{claim_name}={v_str}", source_url=url,
+                                   extra={"claim": claim_name, "value": v_str, "jwt_source": url[:100]})
+                harvested.append({"category": "ownership_hint", "value": v_str, "source_url": url})
 
     @property
     def store(self) -> DiscoveryStore:
@@ -245,6 +290,8 @@ class ObjectHarvester:
             val = match.group(0)
             self._store.record("jwt", val, source_url=url)
             harvested.append({"category": "jwt", "value": val, "source_url": url})
+            # Decode JWT payload to extract claims as structured intelligence
+            self._harvest_jwt_claims(val, url, harvested)
 
         for match in ROLE_PATTERN.finditer(response_text):
             val = match.group(1)

@@ -355,6 +355,10 @@ class Finding:
             result["chain_data"] = self.chains
         if hasattr(self, "duplicate_risk"):
             result["duplicate_risk"] = self.duplicate_risk
+        if hasattr(self, "_escalation_result"):
+            result["escalation_result"] = self._escalation_result
+        if hasattr(self, "_best_escalation_path"):
+            result["best_escalation_path"] = self._best_escalation_path
         result["evidence"] = [
             {**e.to_dict(), "evidence_type": e.__class__.__name__} if hasattr(e, "to_dict") else {"raw": str(e), "evidence_type": "raw"}
             for e in self.evidence
