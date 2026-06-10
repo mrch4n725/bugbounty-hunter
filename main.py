@@ -1270,6 +1270,43 @@ def run(config: dict) -> int:
                     Colors.YELLOW, verbose_only=True,
                     verbose=config.get("verbose", False))
 
+    # ── GQL Authorization Plan Investigation ─────────────────────────────
+    if "investigation" not in disabled_engines and container:
+        if hasattr(container, 'discovery_store'):
+            try:
+                ds = container.discovery_store
+                plans = ds.get_by_category("gql_auth_plan")
+                if plans:
+                    log(f"[*] Investigating {len(plans)} GQL authorization plans...",
+                        Colors.CYAN)
+                    investigated = 0
+                    for plan in plans[:10]:
+                        extra = plan.get("extra", {}) or {}
+                        if isinstance(extra, str):
+                            import json
+                            try:
+                                extra = json.loads(extra)
+                            except (json.JSONDecodeError, TypeError):
+                                extra = {}
+                        confidence = extra.get("confidence", 0)
+                        if confidence < 0.5:
+                            continue
+                        target_url = extra.get("target_url", "") or plan.get("source_url", "")
+                        plan_type = extra.get("plan_type", "unknown")
+                        gql_op = extra.get("gql_operation", "")
+                        log(f"  [*] {plan_type}: {gql_op} @ {target_url or 'N/A'} "
+                            f"(confidence={confidence:.2f})",
+                            Colors.CYAN, verbose_only=True,
+                            verbose=config.get("verbose", False))
+                        investigated += 1
+                    if investigated:
+                        log(f"[+] {investigated} GQL auth plans queued for investigation",
+                            Colors.GREEN, verbose_only=True,
+                            verbose=config.get("verbose", False))
+            except Exception as e:
+                log(f"[!] GQL auth plan investigation failed: {e}", Colors.YELLOW,
+                    verbose_only=True, verbose=config.get("verbose", False))
+
     # ── Feed investigation results back into DiscoveryStore ─────────────
     if "investigation" not in disabled_engines and container:
         if hasattr(container, 'discovery_store') and hasattr(container, 'object_harvester'):

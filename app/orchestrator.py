@@ -714,37 +714,37 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
             log(f"[!] Candidate exploitation failed: {e}", Colors.YELLOW,
                 verbose_only=True, verbose=config.get("verbose", False))
 
-    # ── GQL Authorization Intelligence (feed stored GQL types into discovery) ──
+    # ── GQL Authorization Intelligence (relationship inference + ownership discovery + auth mapping) ──
     if container and hasattr(container, 'discovery_store'):
         try:
             store = container.discovery_store
             gql_types = store.get_by_category("gql_type")
             if gql_types:
-                from engines.gql_auth import GqlAuthorizationEngine
-                gql_engine = GqlAuthorizationEngine(store)
-                # Feed GQL-derived ownership hints back into DiscoveryStore
-                for hint in gql_engine.build_ownership_hints():
-                    store.record(
-                        category="ownership_hint",
-                        value=hint["value"],
-                        source_url=hint["source_url"],
-                        extra=hint["extra"],
-                    )
-                for rel in gql_engine.build_relationships():
-                    store.record(
-                        category="ownership_relationship",
-                        value=rel["value"],
-                        source_url=rel["source_url"],
-                        extra=rel["extra"],
-                    )
-                gql_role_types = gql_engine.get_privilege_level_types()
-                for rt in gql_role_types:
-                    store.record("role", rt, source_url="gql_schema")
-                n_ownership = len(gql_engine.get_ownership_fields())
-                n_roles = len(gql_role_types)
-                if n_ownership or n_roles:
-                    log(f"[+] GQL auth intelligence: {n_ownership} ownership fields, "
-                        f"{n_roles} privilege types consumed",
+                # Phase 1: Infer domain relationships from GQL schema types/fields
+                from engines.gql_relationships import GraphQLRelationshipEngine
+                rel_engine = GraphQLRelationshipEngine(store)
+                rel_stats = rel_engine.run_all()
+                rel_engine.store_relationships(store)
+                n_classified = rel_stats.get("classified_relationships", 0)
+
+                # Phase 2: Cross-reference with recon data for ownership discovery
+                from engines.gql_ownership import GraphQLOwnershipDiscovery
+                own_engine = GraphQLOwnershipDiscovery(store, rel_engine)
+                own_urls = recon_data.get("urls", []) if isinstance(recon_data, dict) else []
+                own_stats = own_engine.run_all(recon_data=recon_data, urls=own_urls, store=store)
+                own_engine.store_hints(store)
+                n_hints = own_stats.get("ownership_hints", 0)
+
+                # Phase 3: Generate authorization investigation plans
+                from engines.gql_auth_mapper import GraphQLAuthorizationMapper
+                mapper = GraphQLAuthorizationMapper(store, rel_engine, own_engine)
+                map_stats = mapper.run_all(store)
+                mapper.store_plans(store)
+                n_plans = map_stats.get("total_plans", 0)
+
+                if n_classified or n_hints or n_plans:
+                    log(f"[+] GQL auth intelligence: {n_classified} relationships, "
+                        f"{n_hints} ownership hints, {n_plans} auth plans",
                         Colors.GREEN, verbose_only=True, verbose=config.get("verbose", False))
         except Exception as e:
             log(f"[!] GQL auth intelligence failed: {e}", Colors.YELLOW,

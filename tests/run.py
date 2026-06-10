@@ -1367,6 +1367,266 @@ check("investigate_candidate empty strategies returns list",
       isinstance(results_empty, list))
 
 # ═══════════════════════════════════════════════════════════
+# 30. GraphQLRelationshipEngine
+# ═══════════════════════════════════════════════════════════
+section("30. GraphQLRelationshipEngine")
+
+from engines.discovery_store import DiscoveryStore
+from engines.gql_relationships import GraphQLRelationshipEngine
+from models.gql_auth import RelationshipType
+
+gql_rel_store = DiscoveryStore()
+
+# Seed store with mock GQL types, fields, and relationships
+gql_rel_store.record("gql_type", "User", source_url="https://ex.com/gql",
+                      extra={"kind": "OBJECT", "field_count": 5})
+gql_rel_store.record("gql_type", "Project", source_url="https://ex.com/gql",
+                      extra={"kind": "OBJECT", "field_count": 3})
+gql_rel_store.record("gql_type", "Organization", source_url="https://ex.com/gql",
+                      extra={"kind": "OBJECT", "field_count": 4})
+gql_rel_store.record("gql_type", "Team", source_url="https://ex.com/gql",
+                      extra={"kind": "OBJECT", "field_count": 3})
+gql_rel_store.record("gql_type", "Tenant", source_url="https://ex.com/gql",
+                      extra={"kind": "OBJECT", "field_count": 2})
+
+# Fields — relationships
+gql_rel_store.record("gql_field", "Project.owner", source_url="https://ex.com/gql",
+                      extra={"parent_type": "Project", "field_type": "User",
+                             "is_relationship": True, "args": 0})
+gql_rel_store.record("gql_field", "Team.org", source_url="https://ex.com/gql",
+                      extra={"parent_type": "Team", "field_type": "Organization",
+                             "is_relationship": True, "args": 0})
+gql_rel_store.record("gql_field", "Organization.tenant_id", source_url="https://ex.com/gql",
+                      extra={"parent_type": "Organization", "field_type": "Tenant",
+                             "is_relationship": True, "args": 0})
+gql_rel_store.record("gql_field", "Organization.members", source_url="https://ex.com/gql",
+                      extra={"parent_type": "Organization", "field_type": "User",
+                             "is_relationship": True, "args": 0})
+gql_rel_store.record("gql_field", "User.orgs", source_url="https://ex.com/gql",
+                      extra={"parent_type": "User", "field_type": "Organization",
+                             "is_relationship": True, "args": 0})
+gql_rel_store.record("gql_field", "User.org", source_url="https://ex.com/gql",
+                      extra={"parent_type": "User", "field_type": "Organization",
+                             "is_relationship": True, "args": 0})
+
+gql_rel = GraphQLRelationshipEngine(gql_rel_store)
+
+# get_type_names
+type_names = gql_rel.get_type_names()
+check("get_type_names returns set", isinstance(type_names, set))
+check("get_type_names includes User", "User" in type_names)
+
+# infer_classified_relationships
+classified = gql_rel.infer_classified_relationships()
+check("infer_classified_relationships returns list", isinstance(classified, list))
+check("classified has BELONGS_TO for Project.owner",
+      any(r.relationship_type == RelationshipType.BELONGS_TO
+          and r.from_type == "Project"
+          and r.to_type == "User"
+          for r in classified))
+check("classified has BELONGS_TO for Team.org",
+      any(r.relationship_type == RelationshipType.BELONGS_TO
+          and r.from_type == "Team"
+          and r.to_type == "Organization"
+          for r in classified))
+check("classified has TENANT_OF for Organization.tenant_id",
+      any(r.relationship_type == RelationshipType.TENANT_OF
+          and r.from_type == "Organization"
+          and r.to_type == "Tenant"
+          for r in classified))
+check("classified has HAS_MANY for Organization.members",
+      any(r.relationship_type == RelationshipType.HAS_MANY
+          and r.from_type == "Organization"
+          and r.to_type == "User"
+          for r in classified))
+check("classified has HAS_MANY for User.orgs",
+      any(r.relationship_type == RelationshipType.HAS_MANY
+          and r.from_type == "User"
+          and r.to_type == "Organization"
+          for r in classified))
+
+# infer_ownership_chains
+chains = gql_rel.infer_ownership_chains()
+chain_types = {r.relationship_type for r in chains}
+check("ownership chains found",
+      any(r.relationship_type == RelationshipType.OWNS_THROUGH for r in chains))
+
+# infer_memberships
+memberships = gql_rel.infer_memberships()
+check("membership inferred from HAS_MANY",
+      any(r.relationship_type == RelationshipType.MEMBER_OF
+          and r.from_type == "User"
+          and r.to_type == "Organization"
+          for r in memberships))
+
+# infer_privilege_types
+gql_rel_store.record("gql_type", "Admin", source_url="https://ex.com/gql",
+                      extra={"kind": "OBJECT", "field_count": 1})
+gql_rel_store.record("gql_type", "UserRole", source_url="https://ex.com/gql",
+                      extra={"kind": "OBJECT", "field_count": 1})
+priv_types = gql_rel.infer_privilege_types()
+check("privilege types found", len(priv_types) >= 2)
+check("Admin is privilege type", "Admin" in priv_types)
+
+# run_all
+stats = gql_rel.run_all()
+check("run_all returns stats dict", isinstance(stats, dict))
+check("run_all has classified_relationships", stats.get("classified_relationships", 0) > 0)
+
+# store_relationships
+stored_count = gql_rel.store_relationships()
+check("store_relationships returns count", stored_count > 0)
+
+# Verify stored records
+inferred = gql_rel_store.get_by_category("gql_inferred_relationship")
+check("gql_inferred_relationship stored", len(inferred) > 0)
+
+# ═══════════════════════════════════════════════════════════
+# 31. GraphQLOwnershipDiscovery
+# ═══════════════════════════════════════════════════════════
+section("31. GraphQLOwnershipDiscovery")
+
+from engines.gql_ownership import GraphQLOwnershipDiscovery
+
+gql_own_store = DiscoveryStore()
+# Copy seed data
+for rec in gql_rel_store.get_by_category("gql_type"):
+    gql_own_store.record("gql_type", rec["value"], source_url=rec["source_url"],
+                          extra=rec["extra"])
+for rec in gql_rel_store.get_by_category("gql_field"):
+    gql_own_store.record("gql_field", rec["value"], source_url=rec["source_url"],
+                          extra=rec["extra"])
+for rec in gql_rel_store.get_by_category("gql_relationship"):
+    gql_own_store.record("gql_relationship", rec["value"], source_url=rec["source_url"],
+                          extra=rec["extra"])
+
+gql_own = GraphQLOwnershipDiscovery(gql_own_store)
+
+# discover_from_url_patterns
+urls = [
+    "https://ex.com/users/123",
+    "https://ex.com/projects/456",
+    "https://ex.com/orgs/789/teams/012",
+]
+url_hints = gql_own.discover_from_url_patterns(urls)
+check("discover_from_url_patterns returns list", isinstance(url_hints, list))
+check("url patterns yield hints", len(url_hints) > 0)
+url_hint_values = {h["value"] for h in url_hints}
+check("url hint for User with ID 123",
+      any("User" in v and "123" in v for v in url_hint_values))
+check("url hint for Project with ID 456",
+      any("Project" in v and "456" in v for v in url_hint_values))
+
+# discover_from_relationships
+own_rel_engine = GraphQLRelationshipEngine(gql_own_store)
+own_rel_engine.infer_classified_relationships()
+own_rel_engine.infer_ownership_chains()
+own_rel_engine.infer_memberships()
+rel_hints = gql_own.discover_from_relationships(
+    own_rel_engine.infer_classified_relationships())
+check("discover_from_relationships returns list", isinstance(rel_hints, list))
+check("relationship hints generated", len(rel_hints) > 0)
+rel_categories = {h.get("category") for h in rel_hints}
+check("relationship hints include ownership_hint", "ownership_hint" in rel_categories)
+check("relationship hints include ownership_relationship",
+      "ownership_relationship" in rel_categories)
+
+# run_all — store seeded from above
+own_stats = gql_own.run_all(store=gql_own_store, urls=urls)
+check("run_all returns stats dict", isinstance(own_stats, dict))
+check("run_all has ownership_hints count", own_stats.get("ownership_hints", 0) > 0)
+
+# store_hints
+stored_own = gql_own.store_hints()
+check("store_hints returns count", stored_own > 0)
+
+# ═══════════════════════════════════════════════════════════
+# 32. GraphQLAuthorizationMapper
+# ═══════════════════════════════════════════════════════════
+section("32. GraphQLAuthorizationMapper")
+
+from engines.gql_auth_mapper import GraphQLAuthorizationMapper
+from models.gql_auth import PlanType
+
+gql_map_store = DiscoveryStore()
+# Seed with same types/fields/relationships
+for rec in gql_rel_store.get_by_category("gql_type"):
+    gql_map_store.record("gql_type", rec["value"], source_url=rec["source_url"],
+                          extra=rec["extra"])
+for rec in gql_rel_store.get_by_category("gql_field"):
+    gql_map_store.record("gql_field", rec["value"], source_url=rec["source_url"],
+                          extra=rec["extra"])
+# Add mutation fields for auth mapping
+gql_map_store.record("gql_field", "Mutation.createProject", source_url="https://ex.com/gql",
+                      extra={"parent_type": "Mutation", "field_type": "Project",
+                             "is_relationship": False, "args": 2})
+gql_map_store.record("gql_field", "Mutation.updateRole", source_url="https://ex.com/gql",
+                      extra={"parent_type": "Mutation", "field_type": "UserRole",
+                             "is_relationship": False, "args": 2})
+gql_map_store.record("gql_field", "Query.getProjects", source_url="https://ex.com/gql",
+                      extra={"parent_type": "Query", "field_type": "Project",
+                             "is_relationship": False, "args": 1})
+gql_map_store.record("gql_field", "Query.getUsers", source_url="https://ex.com/gql",
+                      extra={"parent_type": "Query", "field_type": "User",
+                             "is_relationship": False, "args": 0})
+gql_map_store.record("gql_field", "Query.getOrganizations", source_url="https://ex.com/gql",
+                      extra={"parent_type": "Query", "field_type": "Organization",
+                             "is_relationship": False, "args": 0})
+
+# Create relationship engine with pre-seeded data
+map_rel_engine = GraphQLRelationshipEngine(gql_map_store)
+map_rel_engine.infer_classified_relationships()
+map_rel_engine.infer_ownership_chains()
+map_rel_engine.infer_memberships()
+
+# Create ownership discovery
+map_own = GraphQLOwnershipDiscovery(gql_map_store, map_rel_engine)
+map_own.discover_from_url_patterns(["https://ex.com/projects/123"])
+
+# Create mapper
+mapper = GraphQLAuthorizationMapper(gql_map_store, map_rel_engine, map_own)
+
+# map_cross_tenant_operations
+tenant_plans = mapper.map_cross_tenant_operations()
+check("cross_tenant plans found",
+      any(p.plan_type == PlanType.CROSS_TENANT for p in tenant_plans))
+
+# map_ownership_violations
+owner_plans = mapper.map_ownership_violations()
+check("ownership_violation plans found",
+      any(p.plan_type == PlanType.OWNERSHIP_VIOLATION for p in owner_plans))
+
+# map_role_escalation_paths
+role_plans = mapper.map_role_escalation_paths()
+check("role_escalation plans found",
+      any(p.plan_type == PlanType.ROLE_ESCALATION for p in role_plans))
+
+# map_mutation_authorization
+mutation_plans = mapper.map_mutation_authorization()
+check("mutation_authorization plans found", len(mutation_plans) > 0)
+check("createProject mutation has a plan",
+      any(p.gql_operation == "createProject" for p in mutation_plans))
+
+# run_all
+map_stats = mapper.run_all()
+check("run_all returns stats dict", isinstance(map_stats, dict))
+check("run_all has total_plans", map_stats.get("total_plans", 0) > 0)
+
+# store_plans
+stored_plans = mapper.store_plans()
+check("store_plans returns count", stored_plans > 0)
+
+# Verify stored plans
+from_store = gql_map_store.get_by_category("gql_auth_plan")
+check("gql_auth_plan stored in DiscoveryStore", len(from_store) > 0)
+first_plan_extra = from_store[0].get("extra", {})
+if isinstance(first_plan_extra, str):
+    import json
+    first_plan_extra = json.loads(first_plan_extra)
+check("stored plan has plan_type", "plan_type" in first_plan_extra)
+check("stored plan has gql_operation", "gql_operation" in first_plan_extra)
+
+# ═══════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════
 print("\n" + "=" * 58)

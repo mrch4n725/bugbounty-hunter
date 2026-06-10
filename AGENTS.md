@@ -370,7 +370,7 @@ log("message", Colors.RED, verbose_only=True, verbose=self.verbose)
 - **No test framework dependency** (no pytest, no unittest) — tests are standalone Python scripts
 - Tests exercise all imports, enums, finding dedup, curl building, confidence mapping, reporter rendering, and module structure
 - Run with: `python3 tests/run.py`
-- Current test count: **321 tests** (all passing)
+- Current test count: **359 tests** (all passing)
 - `--dry-run` against real targets for integration: `python3 main.py --target https://example.com --dry-run --passive`
 - Multi-role auth: `python3 main.py --target https://example.com --role user_a --auth-header user_b:'Authorization:Bearer tok_b'`
 
@@ -498,6 +498,11 @@ Every HTML report includes a `<script type="application/ld+json">` block with al
 | Candidate exploitation in orchestrator | After business logic discovery, up to 10 top-ranked candidates are routed to `RaceConditionTester`, `PriceManipulationTester` for same-scan exploitation. Findings are tagged with `_from_candidate` attribute. Uses a `forms_by_action` lookup map to resolve abuse URLs to form data for tester probes. Wrapped in `try/except` in case session or imports fail. |
 | Candidate exploitation dedup merge | Candidate-exploitation findings share dedup keys with normal BL scanner findings. `DeduplicationEngine.add()` now merges `_from_candidate` from incoming into existing findings, and upgrades verification_stage if the incoming is higher. The tag survives serialization via `Finding.to_dict()`/`from_dict()`. `investigate_candidate()` also tags its fake Finding with `_from_candidate`. |
 | Container and Engine wiring gaps | `ValidationConsensusEngine` (consensus result set on findings but not rendered in reports), `DuplicateRiskEngine` (result set on finding but not in report output). OutcomeFeedbackEngine loop is now closed. |
+| GraphQLAuthorizationMapper plan storage | `GraphQLAuthorizationMapper.store_plans()` stores plans with category `gql_auth_plan`. `main.py` reads `gql_auth_plan` from DiscoveryStore post-scan and logs high-confidence plans. Plans span 4 plan types: cross_tenant, ownership_violation, role_escalation, mutation_authorization. |
+| GraphQL engine pipeline order | GQL auth pipeline (3 phases) runs in orchestrator after TARGET_LEVEL modules but before evidence validation. This means auth plans are available for cross-scan consumption but not same-scan. `main.py` reads plans post-scan for investigation queueing. |
+| GraphQLRelationshipEngine classification | Uses 5 relationship types: BELONGS_TO, HAS_MANY, TENANT_OF, OWNS_THROUGH, MEMBER_OF + GQL_ASSOCIATION fallback. Classification is purely field-name-based (owner→BELONGS_TO, tenant_id→TENANT_OF, plural→HAS_MANY). Confidence scores range 0.4–0.8 based on keyword specificity. |
+| GqlAuthorizationEngine preserved | The old `GqlAuthorizationEngine` is still importable at `engines.gql_auth` but no longer wired in orchestrator. The new pipeline (`GraphQLRelationshipEngine` → `GraphQLOwnershipDiscovery` → `GraphQLAuthorizationMapper`) is a superset. |
+| Ownership chain inference | `GraphQLRelationshipEngine.infer_ownership_chains()` follows BELONGS_TO edges to length-2 chains. A→B and B→C produces A OWNS_THROUGH C via "field→field2". Chain confidence = product of both confidences × 0.8. |
 | signal_count field | `_enrich_finding()` requires explicit `signal_count=` kwarg when called from scanners that report multiple signals. Defaults to 1 if not passed. Always pass the count when merging multiple detection signals into one finding. |
 | Recon-driven param sort | `params.sort(key=...)` in scanner scan() methods sorts params in-place by recon priority. All params are still scanned — priority params go first. The sort is a no-op when recon data is absent. |
 | Per-vuln-type metrics table | Printed after pipeline funnel. `validation_rate` is `validated / detected`. Scanners with rate < 0.5 and detected >= 2 get a `← needs attention` flag. Available via `MetricsCollector.per_vuln_type_table()`. |
