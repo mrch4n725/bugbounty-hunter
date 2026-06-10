@@ -79,6 +79,14 @@ engines/validation_engine.py  → modules/utils.py, models/
 engines/evidence_engine.py    → models/evidence.py
 engines/verification_engine.py → modules/utils.py, models/finding.py
 engines/oob_poller.py         → (std lib + callable)
+engines/discovery_store.py    → sqlite3
+engines/object_harvester.py   → engines/discovery_store.py
+engines/relationship_graph.py → engines/discovery_store.py
+engines/differential_auth.py  → modules/utils.py
+engines/authorization.py      → models/, modules/utils.py, engines/differential_auth.py
+engines/gql_auth.py           → engines/discovery_store.py
+engines/ownership_discovery.py → engines/discovery_store.py
+engines/multi_account_discovery.py → engines/authorization.py, engines/discovery_store.py
 ```
 
 ### Layer 3: Scanner Layer

@@ -609,11 +609,19 @@ bugbounty-hunter/
 │   ├── consensus_engine.py          # ValidationConsensusEngine — pluggable validator consensus scoring
 │   ├── confidence.py                # ConfidenceEngine — unified explainable scoring aggregating all signals
 │   ├── impact_escalation.py         # ImpactEscalationAnalyzer — per-vuln-type escalation maps
-│   ├── investigation.py            # InvestigationEngine — real HTTP/OOB/browser investigation strategies
+│   ├── discovery_store.py          # DiscoveryStore — SQLite-backed cross-scan intelligence (WAL, SHA-256 dedup)
+│   ├── object_harvester.py         # ObjectHarvester — UUID/ID/email/JWT/role extraction from responses
+│   ├── relationship_graph.py       # RelationshipGraph — ownership boundary inference from DiscoveryStore
+│   ├── multi_account_discovery.py  # MultiAccountDiscoveryEngine — cross-account replay across role pairs
+│   ├── differential_auth.py        # DifferentialAuthorizationEngine — field-level JSON diff with sensitivity classification
+│   ├── authorization.py            # AuthorizationEngine — role-based access comparison with evidence
+│   ├── gql_auth.py                 # GqlAuthorizationEngine — GQL schema ownership hints and relationships
+│   ├── ownership_discovery.py      # OwnershipDiscoveryEngine — proactive ownership inference from response/JWT/OpenAPI signals
+│   ├── investigation.py            # InvestigationEngine — real HTTP/OOB/browser investigation with cross-account IDOR strategies
 │   ├── attack_chain.py             # AttackChainEngine — finding correlation and chain building
-│   ├── outcome_feedback.py          # OutcomeFeedbackEngine — thread-safe JSON Lines outcome tracking
-│   ├── dedup.py                     # Finding deduplication with serialization (to_dict/from_dict) for resume
-│   └── metrics.py                   # MetricsCollector — pipeline funnel metrics, per-vuln-type breakdown
+│   ├── outcome_feedback.py         # OutcomeFeedbackEngine — thread-safe JSON Lines outcome tracking
+│   ├── dedup.py                    # Finding deduplication with serialization (to_dict/from_dict) for resume
+│   └── metrics.py                  # MetricsCollector — pipeline funnel metrics, per-vuln-type breakdown
 ├── scanners/
 │   ├── __init__.py
 │   ├── base.py                      # ScannerBase — shared lifecycle (detect/validate/collect/reproduce/confidence)

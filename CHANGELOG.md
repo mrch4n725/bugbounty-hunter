@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.0 (2026-06-10)
+
+### Authorization Intelligence Platform
+
+- **OwnershipDiscoveryEngine** — new `engines/ownership_discovery.py`: proactive ownership inference from response JSON patterns (ID+owner_id in same object), URL path hierarchy, JWT sub cross-references, OpenAPI model properties, and cross-cutting schema patterns across DiscoveryStore. Wired into orchestrator post-scan pipeline.
+- **Cross-account IDOR investigation** — `InvestigationEngine._exec_cross_account_idor()` compares responses across multiple role sessions with `AuthorizationComparisonEvidence`; detects both body-diff leaks and status-bypass patterns.
+- **Differential auth investigation** — `InvestigationEngine._exec_differential_auth()` does recursive field-level JSON comparison with sensitivity classification (pii/financial/credential/ownership/internal) across roles.
+- **Investigation → DiscoveryStore feedback** — confirmed findings (confidence >= 60, stage validated/verified) feed `confirmed_endpoint` and `validated_resource` records back into DiscoveryStore, closing the discover→learn→discover-more loop.
+- **Pre-scan object harvesting** — `ObjectHarvester` runs on recon data (forms HTML, JS file responses) *before* TARGET_LEVEL modules, feeding early IDs into authorization scanners.
+- **DifferentialAuthorizationEngine** — `engines/differential_auth.py`: recursive JSON field comparison with sensitivity classification. Integrated into `AuthorizationEngine.test_endpoint()`.
+- **GqlAuthorizationEngine** — `engines/gql_auth.py`: reads stored GQL types/fields/relationships, feeds ownership hints and type-to-type relationships into DiscoveryStore for RelationshipGraph consumption.
+- **MultiAccountDiscoveryEngine wired** — previously dead code (zero callers); added to `main.py` pipeline after `run_scans()` when 2+ role sessions exist.
+- **JWT payload decoding at harvest time** — `ObjectHarvester._harvest_jwt_claims()` decodes JWT payloads: extracts `sub` as resource ID, `roles`/`groups` as role records, `org_id`/`tenant_id` as ownership hints.
+- **Impact escalation surfaced** — `Finding.to_dict()` now serializes `_escalation_result` and `_best_escalation_path` for all report formats.
+- **GQL auth testing with real field selectors** — `_build_gql_selection_set()` builds field selectors from discovered schema types; `_detect_gql_body_diff()` fixed for same-status body differences; `_test_query_auth()` uses discovered type fields.
+- **Evidence normalization** — `Finding.__post_init__` normalizes `evidence` to always be a `list`. Removed 6 `isinstance(evidence, str)` guards across legacy code.
+
 ## 1.0.0 (2026-06-10)
 
 ### Major Features

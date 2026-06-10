@@ -34,6 +34,14 @@ flowchart TD
         ve["VerificationEngine.verify_all()"]
         ee["EvidenceEngine"]
         oob["OOBBackgroundPoller"]
+        ds["DiscoveryStore\n(SQLite persistence)"]
+        oh["ObjectHarvester\n(response extraction)"]
+        rg["RelationshipGraph\n(ownership inference)"]
+        ae["AuthorizationEngine\n(role-based comparison)"]
+        da["DifferentialAuthEngine\n(field-level JSON diff)"]
+        ga["GqlAuthEngine\n(GQL schema hints)"]
+        ode["OwnershipDiscoveryEngine\n(proactive inference)"]
+        ie["InvestigationEngine\n(cross-account IDOR,\ndifferential auth)"]
     end
 
     subgraph reporting["Reporting"]
@@ -70,6 +78,15 @@ flowchart TD
     get --> ve
     ve --> oob
 
+    get -.-> oh
+    oh -.-> ds
+    ds -.-> rg
+    rg -.-> ae
+    ae -.-> da
+    ds -.-> ga
+    ds -.-> ode
+    get -.-> ie
+
     report --> reporter_adapter
     reporter_adapter --> html
     reporter_adapter --> json
@@ -102,6 +119,13 @@ flowchart TD
         bv["BrowserValidator"]
         oob["OOBFramework"]
         oob_poller["OOBBackgroundPoller"]
+        ds["DiscoveryStore"]
+        oh["ObjectHarvester"]
+        rg["RelationshipGraph"]
+        ae["AuthorizationEngine"]
+        da["DifferentialAuthEngine"]
+        ga["GqlAuthEngine"]
+        ode["OwnershipDiscoveryEngine"]
     end
 
     subgraph orchestration["ScanOrchestrator (app/orchestrator.py)"]
@@ -114,9 +138,14 @@ flowchart TD
         per_url["per_url_scanner.init().scan().finalize()"]
         collect["Collect findings"]
         pipeline["Post-scan pipeline:"]
+        oh_feed["ObjectHarvester\n(extract from findings)"]
+        ode_feed["OwnershipDiscovery\n(infer relationships)"]
+        ga_feed["GqlAuthIntelligence\n(ownership hints)"]
         vp["VerificationEngine.verify_all()"]
         chain["chain_analysis()"]
         halt["check_self_halt()"]
+        inv["InvestigationEngine\n(cross-account IDOR,\ndifferential auth)"]
+        inv_feed["Investigation → DiscoveryStore\n(confirmed_endpoint,\nvalidated_resource)"]
         priority["prioritize_findings()"]
     end
 
@@ -171,14 +200,23 @@ flowchart TD
 
     findings --> collect
     collect --> pipeline
-    pipeline --> vp
+    pipeline --> oh_feed
+    oh_feed --> ode_feed
+    ode_feed --> ga_feed
+    ga_feed --> vp
     vp --> chain
     chain --> halt
-    halt --> priority
+    halt --> inv
+    inv --> inv_feed
+    inv_feed --> priority
 
     container -.->|"lazy injection"| tl
     container -.->|"lazy injection"| per_url
     container -.->|"lazy injection"| vp
+    container -.->|"lazy injection"| oh_feed
+    container -.->|"lazy injection"| ode_feed
+    container -.->|"lazy injection"| ga_feed
+    container -.->|"lazy injection"| inv
 
     report --> reporter_base
     reporter_base --> html
