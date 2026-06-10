@@ -6,14 +6,18 @@ from engines.attack_chain import AttackChainEngine
 from engines.investigation import InvestigationEngine, InvestigationPlanner
 from engines.impact import ImpactEngine
 from engines.promotion import FindingPromotionEngine
+from engines.confidence import ConfidenceEngine
+from engines.impact_escalation import ImpactEscalationAnalyzer
 from engines.replay import ReplayEngine
 from engines.scan_budget import ScanBudgetEngine
 from engines.duplicate_risk import DuplicateRiskEngine
 from engines.metrics import MetricsCollector
 from engines.ownership_validator import OwnershipValidator
 from engines.impact_validator import ImpactValidator
+from engines.evidence_validator import EvidenceCompletenessValidator
 from engines.submission_readiness import SubmissionReadinessEngine
 from engines.consensus_engine import ValidationConsensusEngine
+from engines.outcome_feedback import OutcomeFeedbackEngine
 from engines.auth_session import AuthSessionManager
 from engines.waf_evasion import WafEvasionEngine
 from engines.payload_intelligence import PayloadIntelligenceEngine
@@ -66,6 +70,10 @@ class ApplicationContainer:
         self._footprint_manager: FootprintManager | None = None
         self._external_intel: ExternalIntelligenceGatherer | None = None
         self._cross_scan_db: CrossScanDatabase | None = None
+        self._confidence_engine: ConfidenceEngine | None = None
+        self._impact_escalation: ImpactEscalationAnalyzer | None = None
+        self._evidence_completeness: EvidenceCompletenessValidator | None = None
+        self._outcome_feedback_engine: OutcomeFeedbackEngine | None = None
 
     # ── Service accessors (lazy, cached) ─────────────────────────────────
 
@@ -121,6 +129,9 @@ class ApplicationContainer:
             self._investigation_engine = InvestigationEngine(
                 planner=self.investigation_planner,
                 capabilities=cap_dict,
+                browser=self.browser_validator,
+                oob=self.oob_framework,
+                config=self.config,
             )
         return self._investigation_engine
 
@@ -183,6 +194,31 @@ class ApplicationContainer:
         if self._validation_consensus_engine is None:
             self._validation_consensus_engine = ValidationConsensusEngine()
         return self._validation_consensus_engine
+
+    @property
+    def evidence_completeness(self) -> EvidenceCompletenessValidator:
+        if self._evidence_completeness is None:
+            self._evidence_completeness = EvidenceCompletenessValidator()
+        return self._evidence_completeness
+
+    @property
+    def impact_escalation_analyzer(self) -> ImpactEscalationAnalyzer:
+        if self._impact_escalation is None:
+            self._impact_escalation = ImpactEscalationAnalyzer()
+        return self._impact_escalation
+
+    @property
+    def confidence_engine(self) -> ConfidenceEngine:
+        if self._confidence_engine is None:
+            self._confidence_engine = ConfidenceEngine()
+        return self._confidence_engine
+
+    @property
+    def outcome_feedback_engine(self) -> OutcomeFeedbackEngine:
+        if self._outcome_feedback_engine is None:
+            output_dir = self.config.get("output_dir", "")
+            self._outcome_feedback_engine = OutcomeFeedbackEngine(output_dir=output_dir)
+        return self._outcome_feedback_engine
 
     # ── New engine accessors ─────────────────────────────────────────────
 

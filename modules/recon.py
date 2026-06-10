@@ -123,6 +123,7 @@ class Recon:
         self.authenticated = False
         self.technology = {}
         self._html_comments = []
+        self._fuzzed_params: dict[str, list[str]] = {}  # url -> [param names]
         
         parsed = urlparse(self.target if '://' in self.target else f'https://{self.target}')
         self.base_url = f"{parsed.scheme}://{parsed.netloc}"
@@ -167,6 +168,14 @@ class Recon:
         # Subdomain enumeration and certificate transparency lookup
         self._enumerate_subdomains()
         self._crt_sh_lookup()
+        # Feed live subdomains into scanner URL pool
+        for sub in list(self.subdomains):
+            sub_url = f"https://{sub}"
+            if sub_url not in self.urls and same_domain(self.base_url, sub_url):
+                self.urls.add(sub_url)
+            sub_url_http = f"http://{sub}"
+            if sub_url_http not in self.urls and same_domain(self.base_url, sub_url_http):
+                self.urls.add(sub_url_http)
         self._discover_robots()
         self._discover_sitemap()
         
@@ -193,6 +202,7 @@ class Recon:
             'authenticated': self.authenticated,
             'technology': self.technology,
             'html_comments': self._html_comments,
+            'fuzzed_params': dict(self._fuzzed_params),
         }
 
     def _fingerprint_shell(self):
@@ -803,6 +813,20 @@ class Recon:
                 log(f"  [Env Var] {ev['reference']}: {ev['variable']}", Colors.YELLOW,
                     verbose_only=True, verbose=self.verbose)
 
+            # ── Feed discovered endpoints into scanner URL pool ────────────
+            for ep in analysis.get("endpoints", []):
+                ep_url = ep.get("url", "")
+                if ep_url and same_domain(self.base_url, ep_url):
+                    with self.urls_lock:
+                        if ep_url not in self.urls:
+                            self.urls.add(ep_url)
+            for ep in analysis.get("hidden_endpoints", []):
+                ep_url = ep.get("url", "")
+                if ep_url and same_domain(self.base_url, ep_url):
+                    with self.urls_lock:
+                        if ep_url not in self.urls:
+                            self.urls.add(ep_url)
+
             # Log discovered endpoints in verbose mode
             for ep in analysis.get("endpoints", []):
                 log(f"  [JS Endpoint] {ep['type']}: {ep['url']}", Colors.CYAN,
@@ -821,10 +845,25 @@ class Recon:
         """Probe common admin, API, and sensitive paths across the target.
 
         Discovers hidden endpoints that aren't linked from crawled pages.
-        Adds discovered 200/403/401 paths to the URL set for further scanning.
+        Adds discovered 200/403/401/500 paths to the URL set for further scanning.
+        On 401/403, probes bypass headers to find accessible paths.
         Probes are rate-limited to avoid overwhelming the target.
         """
         discovered = 0
+        bypass_discovered = 0
+        BYPASS_HEADERS = [
+            {"X-Forwarded-For": "127.0.0.1"},
+            {"X-Forwarded-Host": "127.0.0.1"},
+            {"X-Original-URL": "/"},
+            {"X-Rewrite-URL": "/"},
+            {"X-Real-IP": "127.0.0.1"},
+            {"X-Forwarded-Proto": "https"},
+            {"X-ProxyUser-IP": "127.0.0.1"},
+            {"X-Client-IP": "127.0.0.1"},
+            {"Client-IP": "127.0.0.1"},
+            {"X-Auth-Token": "admin"},
+            {"Authorization": "Basic YWRtaW46YWRtaW4="},
+        ]
         log("[*] Probing common paths for hidden endpoints...",
             Colors.CYAN, verbose_only=True, verbose=self.verbose)
         for path in self.COMMON_PATHS:
@@ -840,11 +879,28 @@ class Recon:
                             discovered += 1
                     if self.verbose:
                         log(f"  [{r.status_code}] {test_url}", Colors.YELLOW)
+
+                # On 401/403, probe bypass headers
+                if r.status_code in (401, 403):
+                    for headers in BYPASS_HEADERS:
+                        try:
+                            br = self.session.get(test_url, headers={**dict(self.session.headers), **headers}, timeout=self.timeout)
+                            if br.status_code == 200:
+                                with self.urls_lock:
+                                    if test_url not in self.urls:
+                                        self.urls.add(test_url)
+                                        bypass_discovered += 1
+                                if self.verbose:
+                                    log(f"  [BYPASS] {test_url} via {list(headers.keys())[0]} → {br.status_code}", Colors.GREEN)
+                                break
+                        except Exception:
+                            continue
             except Exception:
                 continue
         if discovered:
-            log(f"[+] Common path probing discovered {discovered} new endpoint(s)",
-                Colors.GREEN)
+            log(f"[+] Common path probing discovered {discovered} new endpoint(s)", Colors.GREEN)
+        if bypass_discovered:
+            log(f"[+] Bypass probing: {bypass_discovered} endpoint(s) accessible via header bypass", Colors.GREEN)
 
     def _mine_html_comments(self, html: str, source_url: str) -> None:
         """Extract hidden endpoints, parameters, and credentials from HTML comments."""
@@ -911,20 +967,28 @@ class Recon:
             if path_key not in seen_paths:
                 seen_paths[path_key] = u
 
-        path_list = list(seen_paths.values())[:50]
+        path_list = list(seen_paths.values())
+        max_fuzz_urls = self.config.get("max_fuzz_urls", 200)
+        if len(path_list) > max_fuzz_urls:
+            path_list = path_list[:max_fuzz_urls]
+
         discovered = 0
 
         log(f"[*] Parameter fuzzing on {len(path_list)} unique paths ({len(COMMON_PARAMS)} params each)...",
             Colors.CYAN, verbose_only=True, verbose=self.verbose)
 
         for base_url in path_list:
-            if urlparse(base_url).query:
-                continue
+            existing_qs = urlparse(base_url).query
+            has_existing_qs = bool(existing_qs)
 
             try:
                 baseline = safe_get(self.session, base_url, self.timeout, raise_for_status=False)
                 if not baseline:
-                    continue
+                    # For URLs with existing params, use the URL itself as baseline
+                    if has_existing_qs:
+                        baseline = safe_get(self.session, base_url.split("?")[0], self.timeout, raise_for_status=False)
+                    if not baseline:
+                        continue
                 baseline_len = len(baseline.text) if baseline.text else 0
                 baseline_status = baseline.status_code
                 baseline_hash = hashlib.md5(baseline.text.encode()).hexdigest() if baseline.text else ""
@@ -933,7 +997,10 @@ class Recon:
 
             for param in COMMON_PARAMS:
                 try:
-                    test_url = f"{base_url}?{param}=1"
+                    if has_existing_qs:
+                        test_url = f"{base_url}&{param}=1"
+                    else:
+                        test_url = f"{base_url}?{param}=1"
                     resp = safe_get(self.session, test_url, self.timeout, raise_for_status=False)
                     if not resp:
                         continue
@@ -967,6 +1034,7 @@ class Recon:
                         with self.urls_lock:
                             self.urls.add(test_url)
                             self.params.add(param)
+                            self._fuzzed_params.setdefault(base_url, []).append(param)
                         discovered += 1
                         if self.verbose:
                             log(f"  [Param] {param} active on {base_url} ({signals} signals)",

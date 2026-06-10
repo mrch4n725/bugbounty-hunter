@@ -35,8 +35,23 @@ OPENAPI_PATHS = [
 
 GQL_ENDPOINTS = [
     "/graphql", "/api/graphql", "/gql",
-    "/api/v1/graphql", "/graphql/console",
-    "/graphiql", "/api/graphiql", "/api/v2/graphql",
+    "/api/v1/graphql", "/api/v2/graphql", "/api/v3/graphql",
+    "/graphql/console", "/console/graphql",
+    "/graphiql", "/api/graphiql", "/graphiql.html",
+    "/graphql/graphiql", "/graphql/altair", "/altair",
+    "/voyager", "/graphql/voyager",
+    "/playground", "/graphql/playground",
+    "/subscriptions", "/ws/graphql", "/graphqlws",
+]
+
+GQL_QUERY_PARAM_PATHS = [
+    "/api", "/api/v1", "/api/v2", "/api/v3",
+    "/api/query", "/query",
+]
+
+GQL_WS_PATHS = [
+    "/ws/graphql", "/graphql/ws", "/subscriptions",
+    "/ws", "/socket", "/websocket",
 ]
 
 BOLA_TAMPER_MAP = {
@@ -225,10 +240,17 @@ class ApiScanner(ScannerModuleBase):
     # ── GraphQL helpers ────────────────────────────────────────────────────
 
     def _find_gql_endpoints(self) -> list[str]:
-        """Probe common paths to discover live GraphQL endpoints."""
+        """Probe common paths to discover live GraphQL endpoints.
+
+        Probes:
+          - Static GQL paths (graphql, graphiql, altair, voyager, playground, ws)
+          - Query-parameter-based GQL (``/api?query=...``)
+          - WebSocket GQL subscriptions
+        """
         found: list[str] = []
         seen: set[str] = set()
 
+        # 1. Static GQL paths
         for path in GQL_ENDPOINTS:
             url = self.base_url + path
             if not self._in_scope(url):
@@ -248,6 +270,37 @@ class ApiScanner(ScannerModuleBase):
                 r = self.session.post(url, json={"query": "{ __typename }"}, timeout=self.timeout)
                 if r.status_code == 200 and "__typename" in r.text:
                     found.append(url)
+            except Exception:
+                pass
+
+        # 2. Query-parameter-based GQL endpoints
+        for path in GQL_QUERY_PARAM_PATHS:
+            url = self.base_url + path + "?query={__typename}"
+            if not self._in_scope(url):
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            try:
+                r = safe_get(self.session, url, self.timeout, raise_for_status=False)
+                if r and r.status_code == 200 and "__typename" in (r.text or ""):
+                    found.append(self.base_url + path)
+            except Exception:
+                pass
+
+        # 3. WebSocket GQL subscriptions (probe via HTTP GET to WS endpoint as heuristic)
+        for path in GQL_WS_PATHS:
+            url = self.base_url + path
+            if not self._in_scope(url):
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            try:
+                resp = safe_get(self.session, url, self.timeout, raise_for_status=False)
+                if resp and resp.status_code in (200, 426):
+                    if "graphql" in (resp.text or "").lower() or "upgrade" in str(resp.headers).lower():
+                        found.append(url)
             except Exception:
                 pass
 

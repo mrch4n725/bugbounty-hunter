@@ -106,7 +106,8 @@ def parse_args():
     parser.add_argument("--disable-engine", nargs="+", default=[],
         choices=["attack_chains", "investigation", "impact", "evidence_quality",
                  "scan_budget", "asset_graph", "promotion", "replay",
-                 "duplicate_risk", "consensus", "metrics"],
+                 "duplicate_risk", "consensus", "metrics", "confidence",
+                 "impact_escalation"],
         help="Disable specific analysis engines")
     parser.add_argument("--rdc-noise", action="store_true",
         help="Reduce attack-chain noise by filtering same-root-cause / low-value chains.")

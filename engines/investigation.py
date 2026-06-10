@@ -1,7 +1,15 @@
+import hashlib
+import time as time_module
 from typing import Any
 
+import requests
+
 from models.finding import Finding, calculate_confidence, ConfidenceLevel
-from models.evidence import EvidenceType
+from models.evidence import EvidenceType, EvidenceStatus
+from models.evidence import (
+    BrowserExecutionEvidence, OOBCallbackEvidence, TimingEvidence,
+    HttpRequestEvidence, HttpResponseEvidence, ResponseDiffEvidence,
+)
 from models.investigation import InvestigationTask, InvestigationPlan, InvestigationResult
 from engines.evidence_quality import EvidenceQualityEngine
 
@@ -263,9 +271,30 @@ class InvestigationEngine:
         self,
         planner: InvestigationPlanner | None = None,
         capabilities: dict[str, bool] | None = None,
+        browser: Any = None,
+        oob: Any = None,
+        session: requests.Session | None = None,
+        config: dict[str, Any] | None = None,
     ):
         self.planner = planner or InvestigationPlanner(capabilities)
+        self.browser = browser
+        self.oob = oob
+        self.session = session or requests.Session()
+        self.config = config or {}
         self.results: dict[str, list[InvestigationResult]] = {}
+        self._evidence_store: list[tuple] = []
+
+    def collect_evidence(self) -> list[tuple]:
+        """Return all evidence pairs (evidence, finding_fingerprint) created during investigation."""
+        result = list(self._evidence_store)
+        self._evidence_store.clear()
+        return result
+
+    def _record_evidence(self, evidence: Any, fingerprint: str) -> str:
+        """Store evidence and return its fingerprint."""
+        raw = hashlib.sha256(str(evidence.to_dict()).encode()).hexdigest()[:16]
+        self._evidence_store.append((evidence, fingerprint))
+        return raw
 
     def investigate(
         self,
@@ -306,54 +335,49 @@ class InvestigationEngine:
 
     def _execute_task(self, task: InvestigationTask, finding: Finding) -> InvestigationResult:
         strategy = task.strategy
+        fp = finding.fingerprint or ""
 
+        # ── Open Redirect ───────────────────────────────────────────
         if strategy == "open_redirect_follow":
-            return self._simulate_result(task, success=True, delta=15,
-                next_strategy=None, evidence_fp="simulated:open_redirect")
+            return self._exec_open_redirect(task, finding)
 
+        # ── Replay ─────────────────────────────────────────────────
         if strategy in ("replay_with_auth", "replay_without_auth"):
-            return self._simulate_result(task, success=True, delta=10,
-                next_strategy=None, evidence_fp="simulated:replay")
+            return self._exec_replay(task, finding)
 
+        # ── OOB strategies ─────────────────────────────────────────
         if strategy in ("oob_ssrf", "oob_cmdi", "oob_xxe", "oob_sqli", "ssti_oob"):
-            return self._simulate_result(task, success=True, delta=CONFIDENCE_BOOST.get(strategy, 40),
-                next_strategy=None, evidence_fp=f"simulated:oob:{strategy}")
+            return self._exec_oob(task, finding, strategy)
 
+        # ── SSRF internal / cloud metadata ─────────────────────────
         if strategy in ("ssrf_internal", "ssrf_cloud_metadata"):
             next_s = "ssrf_cloud_metadata" if strategy == "ssrf_internal" else None
-            return self._simulate_result(task, success=True, delta=CONFIDENCE_BOOST.get(strategy, 30),
-                next_strategy=next_s, evidence_fp=f"simulated:ssrf:{strategy}")
+            return self._exec_ssrf_probe(task, finding, strategy, next_s)
 
+        # ── Browser XSS strategies ─────────────────────────────────
         if strategy in ("browser_xss", "stored_xss_check", "dom_xss_check"):
-            return self._simulate_result(task, success=True, delta=CONFIDENCE_BOOST.get(strategy, 35),
-                next_strategy=None, evidence_fp=f"simulated:browser:{strategy}")
+            return self._exec_browser(task, finding, strategy)
 
+        # ── IDOR / Authz strategies ───────────────────────────────
         if strategy in ("horizontal_idor", "vertical_idor", "ownership_validation"):
-            next_s = None
-            if strategy == "horizontal_idor":
-                next_s = "vertical_idor"
-            elif strategy == "vertical_idor":
-                next_s = "ownership_validation"
-            return self._simulate_result(task, success=True, delta=CONFIDENCE_BOOST.get(strategy, 20),
-                next_strategy=next_s, evidence_fp=f"simulated:authz:{strategy}")
+            return self._exec_idor(task, finding, strategy)
 
+        # ── SQLi confirmation ──────────────────────────────────────
         if strategy in ("timing_sqli", "boolean_sqli", "error_sqli"):
-            next_s = None
-            if strategy == "error_sqli":
-                next_s = "timing_sqli"
-            elif strategy == "timing_sqli":
-                next_s = "boolean_sqli"
-            return self._simulate_result(task, success=True, delta=CONFIDENCE_BOOST.get(strategy, 15),
-                next_strategy=next_s, evidence_fp=f"simulated:sqli:{strategy}")
+            return self._exec_sqli(task, finding, strategy)
 
-        if strategy in ("lfi_file_read", "ssti_eval"):
-            return self._simulate_result(task, success=True, delta=CONFIDENCE_BOOST.get(strategy, 35),
-                next_strategy=None, evidence_fp=f"simulated:{strategy}")
+        # ── LFI file read ──────────────────────────────────────────
+        if strategy == "lfi_file_read":
+            return self._exec_lfi(task, finding)
 
-        return self._simulate_result(task, success=False, delta=0,
+        # ── SSTI eval ──────────────────────────────────────────────
+        if strategy == "ssti_eval":
+            return self._exec_ssti(task, finding)
+
+        return self._build_result(task, success=False, delta=0,
             next_strategy=None, evidence_fp="")
 
-    def _simulate_result(
+    def _build_result(
         self, task: InvestigationTask, success: bool, delta: int,
         next_strategy: str | None, evidence_fp: str,
     ) -> InvestigationResult:
@@ -366,6 +390,291 @@ class InvestigationEngine:
             success=success,
             next_strategy=next_strategy,
         )
+
+    def _make_request(
+        self, url: str, finding: Finding, timeout: int = 15,
+    ) -> tuple[requests.Response | None, HttpRequestEvidence | None, HttpResponseEvidence | None]:
+        """Make an HTTP request and return (response, req_evidence, resp_evidence)."""
+        try:
+            resp = self.session.get(url, timeout=timeout, allow_redirects=False)
+            req_ev = HttpRequestEvidence(
+                method="GET", url=url,
+                headers=dict(resp.request.headers) if resp.request else {},
+                description=f"Investigation probe: {url}",
+                status=EvidenceStatus.COLLECTED,
+            )
+            resp_ev = HttpResponseEvidence(
+                status_code=resp.status_code,
+                headers=dict(resp.headers),
+                body=resp.text[:4000],
+                description=f"Response to investigation probe: {url}",
+                status=EvidenceStatus.VERIFIED if resp.ok else EvidenceStatus.COLLECTED,
+            )
+            return resp, req_ev, resp_ev
+        except Exception:
+            return None, None, None
+
+    def _exec_open_redirect(self, task: InvestigationTask, finding: Finding) -> InvestigationResult:
+        resp, req_ev, resp_ev = self._make_request(finding.url, finding, timeout=10)
+        if resp is None:
+            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+        fp = finding.fingerprint or ""
+        if req_ev:
+            self._record_evidence(req_ev, fp)
+        if resp_ev:
+            self._record_evidence(resp_ev, fp)
+
+        location = resp.headers.get("Location", "") or resp.headers.get("location", "")
+        if location:
+            # Check if redirect goes off-domain
+            from urllib.parse import urlparse
+            orig_domain = urlparse(finding.url).netloc
+            target_domain = urlparse(location).netloc
+            if target_domain and target_domain != orig_domain:
+                return self._build_result(task, success=True, delta=CONFIDENCE_BOOST.get("open_redirect_follow", 15),
+                    next_strategy=None, evidence_fp=self._record_evidence(
+                        ResponseDiffEvidence(
+                            original_response=finding.response_excerpt or "",
+                            new_response=f"Redirect to: {location}",
+                            comparison="Location header analysis",
+                            status=EvidenceStatus.VERIFIED,
+                        ), fp))
+        return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+
+    def _exec_replay(self, task: InvestigationTask, finding: Finding) -> InvestigationResult:
+        resp, req_ev, resp_ev = self._make_request(finding.url, finding)
+        if resp is None:
+            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+        fp = finding.fingerprint or ""
+        if req_ev:
+            self._record_evidence(req_ev, fp)
+        if resp_ev:
+            self._record_evidence(resp_ev, fp)
+
+        # Replay succeeded if we got a response
+        delta = CONFIDENCE_BOOST.get(task.strategy, 10) if resp.ok else 0
+        return self._build_result(task, success=resp.ok, delta=delta,
+            next_strategy=None, evidence_fp=fp)
+
+    def _exec_oob(self, task: InvestigationTask, finding: Finding, strategy: str) -> InvestigationResult:
+        if not self.oob:
+            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+        fp = finding.fingerprint or ""
+        payload_url = self.oob.callback_url
+        if not payload_url:
+            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+
+        # Use the target URL param if available
+        probe_url = f"{finding.url}&oob={hashlib.md5(payload_url.encode()).hexdigest()[:8]}" if "?" in (finding.url or "") else finding.url
+        resp, req_ev, resp_ev = self._make_request(probe_url, finding)
+        self.oob.register_interaction(vuln_type=strategy, payload=probe_url, url=finding.url, fingerprint=fp)
+        if req_ev:
+            self._record_evidence(req_ev, fp)
+        if resp_ev:
+            self._record_evidence(resp_ev, fp)
+
+        # Poll briefly for the callback
+        callbacks = self.oob.poll(timeout=15.0)
+        if callbacks:
+            cb_ev = OOBCallbackEvidence(
+                callback_type="dns",
+                callback_host=self.oob.callback_host,
+                callback_token=self.oob.callback_token,
+                raw_data=str(callbacks),
+                status=EvidenceStatus.VERIFIED,
+            )
+            ev_fp = self._record_evidence(cb_ev, fp)
+            return self._build_result(task, success=True,
+                delta=CONFIDENCE_BOOST.get(strategy, 40),
+                next_strategy=None, evidence_fp=ev_fp)
+        return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+
+    def _exec_ssrf_probe(self, task: InvestigationTask, finding: Finding, strategy: str, next_s: str | None) -> InvestigationResult:
+        targets = []
+        if strategy == "ssrf_cloud_metadata":
+            targets = [
+                "http://169.254.169.254/latest/meta-data/",
+                "http://metadata.google.internal/computeMetadata/v1/",
+                "http://100.100.100.200/latest/meta-data/",
+            ]
+        else:
+            targets = [
+                "http://127.0.0.1:22/",
+                "http://127.0.0.1:80/",
+                "http://127.0.0.1:443/",
+                "http://localhost/",
+            ]
+
+        fp = finding.fingerprint or ""
+        for target in targets:
+            resp, req_ev, resp_ev = self._make_request(target, finding, timeout=5)
+            if resp is not None and resp.status_code < 500:
+                if req_ev:
+                    self._record_evidence(req_ev, fp)
+                if resp_ev:
+                    self._record_evidence(resp_ev, fp)
+                return self._build_result(task, success=True,
+                    delta=CONFIDENCE_BOOST.get(strategy, 30),
+                    next_strategy=next_s, evidence_fp=resp_ev.to_dict().get("evidence_type", "ssrf_probe") if resp_ev else fp)
+        return self._build_result(task, success=False, delta=0, next_strategy=next_s, evidence_fp="")
+
+    def _exec_browser(self, task: InvestigationTask, finding: Finding, strategy: str) -> InvestigationResult:
+        if not self.browser:
+            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+        fp = finding.fingerprint or ""
+
+        try:
+            result = None
+            if strategy == "dom_xss_check":
+                result_list = self.browser.scan_dom_xss(finding.url, probes=["<img src=x onerror=alert(1)>"])
+                if result_list:
+                    result = result_list[0]
+            else:
+                param_val = finding.parameter or "test"
+                result = self.browser.check_xss_execution(finding.url, payload=param_val)
+
+            if result and (result.get("alert_fired") or result.get("dom_mutation")):
+                bv_ev = BrowserExecutionEvidence(
+                    alert_fired=result.get("alert_fired", False),
+                    dom_mutation=result.get("dom_mutation", False),
+                    screenshot_path=result.get("screenshot_path", ""),
+                    status=EvidenceStatus.VERIFIED,
+                )
+                ev_fp = self._record_evidence(bv_ev, fp)
+                return self._build_result(task, success=True,
+                    delta=CONFIDENCE_BOOST.get(strategy, 35),
+                    next_strategy=None, evidence_fp=ev_fp)
+        except Exception:
+            pass
+        return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+
+    def _exec_idor(self, task: InvestigationTask, finding: Finding, strategy: str) -> InvestigationResult:
+        next_s = None
+        if strategy == "horizontal_idor":
+            next_s = "vertical_idor"
+        elif strategy == "vertical_idor":
+            next_s = "ownership_validation"
+
+        resp, req_ev, resp_ev = self._make_request(finding.url, finding)
+        if resp is None:
+            return self._build_result(task, success=False, delta=0, next_strategy=next_s, evidence_fp="")
+        fp = finding.fingerprint or ""
+        if req_ev:
+            self._record_evidence(req_ev, fp)
+        if resp_ev:
+            self._record_evidence(resp_ev, fp)
+
+        # IDOR detection via status / response diff
+        if resp.status_code == 200:
+            return self._build_result(task, success=True,
+                delta=CONFIDENCE_BOOST.get(strategy, 20),
+                next_strategy=next_s, evidence_fp=resp_ev.to_dict().get("evidence_type", "idor_probe") if resp_ev else fp)
+        return self._build_result(task, success=False, delta=0, next_strategy=next_s, evidence_fp="")
+
+    def _exec_sqli(self, task: InvestigationTask, finding: Finding, strategy: str) -> InvestigationResult:
+        next_s = None
+        if strategy == "error_sqli":
+            next_s = "timing_sqli"
+        elif strategy == "timing_sqli":
+            next_s = "boolean_sqli"
+
+        fp = finding.fingerprint or ""
+        payloads = {
+            "error_sqli": ["'", "\"", "1'", "1\"", "' OR '1'='1"],
+            "timing_sqli": ["' OR SLEEP(5)--", "1'; WAITFOR DELAY '0:0:5'--", "' OR pg_sleep(5)--"],
+            "boolean_sqli": ["' OR '1'='1", "' AND '1'='2", "' OR 1=1--", "' AND 1=2--"],
+        }
+        for payload in payloads.get(strategy, []):
+            probe_url = finding.url
+            if "?" in (probe_url or ""):
+                probe_url = f"{probe_url}&invest={payload}"
+            elif probe_url:
+                probe_url = f"{probe_url}?invest={payload}"
+
+            t0 = time_module.time()
+            resp, req_ev, resp_ev = self._make_request(probe_url, finding, timeout=10)
+            elapsed = (time_module.time() - t0) * 1000
+
+            if resp is None:
+                continue
+            if req_ev:
+                self._record_evidence(req_ev, fp)
+            if resp_ev:
+                self._record_evidence(resp_ev, fp)
+
+            if strategy == "timing_sqli" and elapsed > 4000:
+                te = TimingEvidence(triggered_time_ms=elapsed, baseline_time_ms=500)
+                ev_fp = self._record_evidence(te, fp)
+                return self._build_result(task, success=True,
+                    delta=CONFIDENCE_BOOST.get("timing_sqli", 15),
+                    next_strategy=next_s, evidence_fp=ev_fp)
+            if strategy == "error_sqli":
+                errors = ["sql", "mysql", "sqlite", "postgresql", "ora-", "syntax error",
+                          "unclosed quotation", "odbc", "driver error"]
+                body_lower = (resp.text or "").lower()
+                if any(e in body_lower for e in errors):
+                    if resp_ev:
+                        self._record_evidence(resp_ev, fp)
+                    return self._build_result(task, success=True,
+                        delta=CONFIDENCE_BOOST.get("error_sqli", 10),
+                        next_strategy=next_s, evidence_fp=fp)
+            if strategy == "boolean_sqli":
+                # Check for response size difference between true/false payloads
+                continue
+        return self._build_result(task, success=False, delta=0, next_strategy=next_s, evidence_fp="")
+
+    def _exec_lfi(self, task: InvestigationTask, finding: Finding) -> InvestigationResult:
+        payloads = [
+            "/etc/passwd", "/etc/hosts",
+            "../../../../etc/passwd", "../../../../etc/hosts",
+            "....//....//....//etc/passwd",
+        ]
+        fp = finding.fingerprint or ""
+        for payload in payloads:
+            probe_url = finding.url
+            if "?" in (probe_url or ""):
+                probe_url = f"{probe_url}&file={payload}"
+            else:
+                probe_url = f"{probe_url}?file={payload}"
+            resp, req_ev, resp_ev = self._make_request(probe_url, finding, timeout=10)
+            if resp is None:
+                continue
+            if req_ev:
+                self._record_evidence(req_ev, fp)
+            if resp_ev:
+                self._record_evidence(resp_ev, fp)
+            body = resp.text or ""
+            if "root:" in body or "daemon:" in body or "localhost" in body:
+                return self._build_result(task, success=True,
+                    delta=CONFIDENCE_BOOST.get("lfi_file_read", 35),
+                    next_strategy=None, evidence_fp=fp)
+        return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+
+    def _exec_ssti(self, task: InvestigationTask, finding: Finding) -> InvestigationResult:
+        payloads = [
+            "{{7*7}}", "${7*7}", "#{7*7}", "{{7*'7'}}",
+            "{{config}}", "{{self}}", "<%= 7*7 %>",
+        ]
+        fp = finding.fingerprint or ""
+        for payload in payloads:
+            probe_url = finding.url
+            if "?" in (probe_url or ""):
+                probe_url = f"{probe_url}&ssti={payload}"
+            else:
+                probe_url = f"{probe_url}?ssti={payload}"
+            resp, req_ev, resp_ev = self._make_request(probe_url, finding, timeout=10)
+            if resp is None:
+                continue
+            if req_ev:
+                self._record_evidence(req_ev, fp)
+            if resp_ev:
+                self._record_evidence(resp_ev, fp)
+            body = resp.text or ""
+            if "49" in body and "{{7*7}}" in payload:
+                return self._build_result(task, success=True,
+                    delta=CONFIDENCE_BOOST.get("ssti_eval", 35),
+                    next_strategy=None, evidence_fp=fp)
+        return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
 
     def _apply_result(self, finding: Finding, result: InvestigationResult) -> None:
         new_score = min(100, (finding.confidence_score or 25) + result.confidence_delta)

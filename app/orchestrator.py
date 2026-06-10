@@ -370,6 +370,19 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
 
     log("[*] Running chain analysis...", Colors.CYAN)
     updated = VulnScanner.chain_analysis(updated)
+    if container and hasattr(container, 'attack_chain_engine') and "attack_chains" not in disabled_engines:
+        try:
+            ace = container.attack_chain_engine
+            asset_graph = config.get("asset_graph")
+            chains = ace.analyze(updated, rdc_noise=config.get("rdc_noise", False), asset_graph=asset_graph)
+            if chains:
+                from engines.attack_chain import AttackChainEngine
+                updated = AttackChainEngine.annotate_findings(updated, chains)
+                log(f"[+] Attack chain engine: {len(chains)} chain(s) identified", Colors.GREEN)
+                for c in chains:
+                    log(f"    Chain: {c.description} (confidence: {c.overall_confidence:.0f})", Colors.CYAN)
+        except Exception as e:
+            log(f"[!] Attack chain engine error: {e}", Colors.YELLOW)
 
     log("[*] Checking self-halting conditions...", Colors.CYAN)
     updated = VulnScanner.check_self_halt(updated)
@@ -411,19 +424,22 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
                 verbose_only=True, verbose=config.get("verbose", False))
 
     log("[*] Validating evidence completeness...", Colors.CYAN)
-    from engines.evidence_validator import EvidenceCompletenessValidator
+    evidence_completeness = getattr(container, 'evidence_completeness', None) if container else None
+    if evidence_completeness is None:
+        from engines.evidence_validator import EvidenceCompletenessValidator as ECV
+        evidence_completeness = ECV
     evidence_validated = []
     for obj in enriched:
-        evidence_validated.append(EvidenceCompletenessValidator.validate(obj))
+        evidence_validated.append(evidence_completeness.validate(obj))
     updated = evidence_validated
 
     # ── Ownership Validation ──────────────────────────────────────────────
-    if "ownership" not in disabled_engines:
+    if "ownership" not in disabled_engines and container:
         try:
             log("[*] Validating ownership...", Colors.CYAN)
-            from engines.ownership_validator import OwnershipValidator
+            ownership_validator = container.ownership_validator
             for obj in updated:
-                ownership_ev = OwnershipValidator.validate(obj)
+                ownership_ev = ownership_validator.validate(obj)
                 if ownership_ev:
                     if isinstance(obj.evidence, str):
                         obj.evidence = [obj.evidence] if obj.evidence else []
@@ -437,12 +453,12 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
             log(f"[!] Ownership validation failed: {e}", Colors.YELLOW)
 
     # ── Impact Validation ────────────────────────────────────────────────
-    if "impact" not in disabled_engines:
+    if "impact" not in disabled_engines and container:
         try:
             log("[*] Validating impact...", Colors.CYAN)
-            from engines.impact_validator import ImpactValidator
+            impact_validator = container.impact_validator
             for obj in updated:
-                impact_ev = ImpactValidator.validate(obj)
+                impact_ev = impact_validator.validate(obj)
                 if impact_ev:
                     if isinstance(obj.evidence, str):
                         obj.evidence = [obj.evidence] if obj.evidence else []
@@ -469,32 +485,62 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
         bundle_count += 1
     log(f"[+] Evidence bundles built for {bundle_count} findings", Colors.GREEN)
 
-    # ── Submission Readiness ─────────────────────────────────────────────
-    if "submission_readiness" not in disabled_engines:
-        try:
-            log("[*] Assessing submission readiness...", Colors.CYAN)
-            from engines.submission_readiness import SubmissionReadinessEngine
-            SubmissionReadinessEngine.assess_all(updated)
-            log(f"[+] Submission readiness assessed for {len(updated)} findings", Colors.GREEN)
-        except Exception as e:
-            log(f"[!] Submission readiness assessment failed: {e}", Colors.YELLOW)
-
-    # ── Validation Consensus (opt-in) ────────────────────────────────────
-    if "consensus" not in disabled_engines:
+    # ── Validation Consensus (now affects confidence/priority/readiness) ──
+    consensus_results: dict[str, Any] = {}
+    if "consensus" not in disabled_engines and container:
         try:
             log("[*] Computing validation consensus...", Colors.CYAN)
-            from engines.consensus_engine import ValidationConsensusEngine
-            engine = ValidationConsensusEngine.create_default()
+            consensus_engine = container.validation_consensus_engine.create_default()
             consensus_for = 0
             for obj in updated:
-                result = engine.evaluate(obj)
+                result = consensus_engine.evaluate(obj)
                 object.__setattr__(obj, "consensus_result", result.to_dict())
+                consensus_results[obj.fingerprint] = result
                 if result.consensus_level in ("strong", "moderate"):
                     consensus_for += 1
             log(f"[+] Consensus: {consensus_for}/{len(updated)} findings meet threshold",
                 Colors.GREEN)
         except Exception as e:
             log(f"[!] Validation consensus failed: {e}", Colors.YELLOW)
+
+    # ── Unified Confidence Scoring (Initiative 2 + 7) ────────────────────
+    if "confidence" not in disabled_engines and container:
+        try:
+            log("[*] Computing unified confidence scores...", Colors.CYAN)
+            confidence_engine = container.confidence_engine
+            for obj in updated:
+                consensus = consensus_results.get(obj.fingerprint)
+                result = confidence_engine.evaluate(obj, consensus_result=consensus)
+                confidence_engine.apply(obj, result)
+            log(f"[+] Confidence scored for {len(updated)} findings", Colors.GREEN)
+        except Exception as e:
+            log(f"[!] Confidence scoring failed: {e}", Colors.YELLOW)
+
+    # ── Impact Escalation Analysis (Initiative 4) ────────────────────────
+    if "impact_escalation" not in disabled_engines and container:
+        try:
+            log("[*] Analyzing impact escalation paths...", Colors.CYAN)
+            escalation = container.impact_escalation_analyzer
+            asset_graph = config.get("asset_graph")
+            for obj in updated:
+                er = escalation.analyze(obj, asset_graph=asset_graph)
+                object.__setattr__(obj, "_escalation_result", er.to_dict())
+                if er.escalation_paths:
+                    best_path = max(er.escalation_paths, key=lambda p: p.confidence_gain)
+                    object.__setattr__(obj, "_best_escalation_path", best_path.to_dict())
+            log(f"[+] Impact escalation analyzed for {len(updated)} findings", Colors.GREEN)
+        except Exception as e:
+            log(f"[!] Impact escalation analysis failed: {e}", Colors.YELLOW)
+
+    # ── Submission Readiness (consensus-aware) ─────────────────────────
+    if "submission_readiness" not in disabled_engines and container:
+        try:
+            log("[*] Assessing submission readiness (consensus-aware)...", Colors.CYAN)
+            readiness = container.submission_readiness_engine
+            readiness.assess_all(updated)
+            log(f"[+] Submission readiness assessed for {len(updated)} findings", Colors.GREEN)
+        except Exception as e:
+            log(f"[!] Submission readiness assessment failed: {e}", Colors.YELLOW)
 
     # ── Payload Intelligence stats (auto-printed) ─────────────────────────
     if container and hasattr(container, 'payload_intelligence'):
@@ -507,6 +553,25 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
         except Exception:
             pass
 
+    # ── Outcome Feedback (historical outcomes check) ───────────────────────
+    if container and hasattr(container, 'outcome_feedback_engine'):
+        try:
+            ofe = container.outcome_feedback_engine
+            stats = ofe.get_stats()
+            if stats.get("total_records", 0) > 0:
+                log(f"[*] Outcome feedback: {stats['total_records']} historical outcome(s), "
+                    f"${stats.get('total_bounty', 0):.2f} total bounty", Colors.CYAN)
+                for obj in updated:
+                    fp = obj.fingerprint or ""
+                    if fp and ofe.has_positive_outcome(fp):
+                        object.__setattr__(obj, "_historical_outcome", "positive")
+                        log(f"    {obj.vuln_type} @ {obj.url}: previously accepted/bounty paid",
+                            Colors.GREEN, verbose_only=True, verbose=config.get("verbose", False))
+        except Exception as e:
+            log(f"[!] Outcome feedback check failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
+
+    # ── Priority scoring (consensus-aware) ───────────────────────────────
     updated = prioritize_findings(updated)
 
     # Merge TARGET_LEVEL findings (ApiScanner/IdorScanner don't use self._add())

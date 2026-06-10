@@ -26,6 +26,8 @@ from models.budget import TargetValueScore, ScanBudget
 from models.replay import ValidationSnapshot, ReplayBundle
 from models.duplicate import DuplicateRisk, LIKELY_DUPLICATE, MODERATE_RISK, POTENTIALLY_NOVEL
 from models.metrics import PipelineMetrics
+from models.confidence import ConfidenceFactors, ConfidenceContribution, ConfidenceResult
+from models.escalation import EscalationPath, EscalationResult
 
 __all__ = [
     "Finding", "VerificationStage", "EvidenceStrength", "FindingState",
@@ -52,4 +54,9 @@ __all__ = [
     "ValidationSnapshot", "ReplayBundle",
     "DuplicateRisk", "LIKELY_DUPLICATE", "MODERATE_RISK", "POTENTIALLY_NOVEL",
     "PipelineMetrics",
+    "ConfidenceFactors",
+    "ConfidenceContribution",
+    "ConfidenceResult",
+    "EscalationPath",
+    "EscalationResult",
 ]
