@@ -4,11 +4,14 @@ from typing import Any
 
 import requests
 
+from modules.utils import build_role_sessions, log, Colors, safe_get
+
 from models.finding import Finding, calculate_confidence, ConfidenceLevel
 from models.evidence import EvidenceType, EvidenceStatus
 from models.evidence import (
     BrowserExecutionEvidence, OOBCallbackEvidence, TimingEvidence,
     HttpRequestEvidence, HttpResponseEvidence, ResponseDiffEvidence,
+    AuthorizationComparisonEvidence,
 )
 from models.investigation import InvestigationTask, InvestigationPlan, InvestigationResult
 from engines.evidence_quality import EvidenceQualityEngine
@@ -141,6 +144,18 @@ STRATEGY_REGISTRY: dict[str, dict[str, Any]] = {
         "priority": 50,
         "description": "Replay finding without authentication",
     },
+    "cross_account_idor": {
+        "capability": "none",
+        "cost": 3,
+        "priority": 85,
+        "description": "Compare responses across multiple role sessions for IDOR detection",
+    },
+    "differential_auth": {
+        "capability": "none",
+        "cost": 4,
+        "priority": 80,
+        "description": "Field-level JSON comparison with sensitivity classification across roles",
+    },
 }
 
 VULN_STRATEGY_MAP: dict[str, list[str]] = {
@@ -157,9 +172,9 @@ VULN_STRATEGY_MAP: dict[str, list[str]] = {
     "cmd_injection": ["oob_cmdi"],
     "command injection": ["oob_cmdi"],
     "lfi": ["lfi_file_read"],
-    "idor": ["horizontal_idor", "vertical_idor", "ownership_validation"],
-    "potential idor": ["horizontal_idor", "vertical_idor", "ownership_validation"],
-    "authorization": ["horizontal_idor", "vertical_idor", "ownership_validation"],
+    "idor": ["cross_account_idor", "horizontal_idor", "vertical_idor", "ownership_validation", "differential_auth"],
+    "potential idor": ["cross_account_idor", "horizontal_idor", "vertical_idor", "ownership_validation"],
+    "authorization": ["cross_account_idor", "horizontal_idor", "vertical_idor", "ownership_validation", "differential_auth"],
     "open_redirect": ["open_redirect_follow"],
     "open redirect": ["open_redirect_follow"],
     "bola": ["horizontal_idor", "vertical_idor"],
@@ -188,6 +203,8 @@ CONFIDENCE_BOOST: dict[str, int] = {
     "open_redirect_follow": 15,
     "replay_with_auth": 10,
     "replay_without_auth": 5,
+    "cross_account_idor": 30,
+    "differential_auth": 35,
 }
 
 
@@ -359,6 +376,10 @@ class InvestigationEngine:
             return self._exec_browser(task, finding, strategy)
 
         # ── IDOR / Authz strategies ───────────────────────────────
+        if strategy == "cross_account_idor":
+            return self._exec_cross_account_idor(task, finding)
+        if strategy == "differential_auth":
+            return self._exec_differential_auth(task, finding)
         if strategy in ("horizontal_idor", "vertical_idor", "ownership_validation"):
             return self._exec_idor(task, finding, strategy)
 
@@ -674,6 +695,206 @@ class InvestigationEngine:
                 return self._build_result(task, success=True,
                     delta=CONFIDENCE_BOOST.get("ssti_eval", 35),
                     next_strategy=None, evidence_fp=fp)
+        return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+
+    def _exec_cross_account_idor(self, task: InvestigationTask, finding: Finding) -> InvestigationResult:
+        """Compare responses across multiple role sessions for IDOR detection."""
+        role_sessions = build_role_sessions(self.config, self.session)
+        if len(role_sessions) < 2:
+            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+
+        fp = finding.fingerprint or ""
+        roles = list(role_sessions.keys())
+        default_role = roles[0]
+        other_roles = roles[1:]
+        default_sess = role_sessions[default_role]
+
+        resp_a, req_ev, resp_ev = self._make_request(finding.url, finding, timeout=10)
+        if resp_a is None or resp_a.status_code != 200:
+            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+        if req_ev:
+            self._record_evidence(req_ev, fp)
+        if resp_ev:
+            self._record_evidence(resp_ev, fp)
+
+        body_a = resp_a.text or ""
+        status_a = resp_a.status_code
+        success_count = 0
+
+        for alt_role in other_roles:
+            alt_sess = role_sessions[alt_role]
+            try:
+                resp_b = alt_sess.get(finding.url, timeout=10, allow_redirects=False)
+            except Exception:
+                continue
+            body_b = resp_b.text or ""
+            status_b = resp_b.status_code
+
+            if status_a == 200 and status_b == 200:
+                # Both succeeded — check body diff for data leakage
+                if body_a != body_b:
+                    success_count += 1
+                    authz_ev = AuthorizationComparisonEvidence(
+                        url=finding.url,
+                        original_role=default_role,
+                        target_role=alt_role,
+                        original_status=status_a,
+                        target_status=status_b,
+                        original_body_excerpt=body_a[:500],
+                        target_body_excerpt=body_b[:500],
+                        body_diff_detected=True,
+                        description=f"Cross-account IDOR: {default_role} vs {alt_role} differ at {finding.url}",
+                        status=EvidenceStatus.ANALYZED,
+                    )
+                    self._record_evidence(authz_ev, fp)
+            elif status_a != 200 and status_b == 200:
+                # Status bypass: alt role gets content default role can't
+                success_count += 1
+                authz_ev = AuthorizationComparisonEvidence(
+                    url=finding.url,
+                    original_role=default_role,
+                    target_role=alt_role,
+                    original_status=status_a,
+                    target_status=status_b,
+                    original_body_excerpt="",
+                    target_body_excerpt=body_b[:500],
+                    body_diff_detected=True,
+                    description=f"Status bypass: {default_role} got {status_a}, {alt_role} got {status_b} at {finding.url}",
+                    status=EvidenceStatus.ANALYZED,
+                )
+                self._record_evidence(authz_ev, fp)
+
+        if success_count:
+            return self._build_result(task, success=True,
+                delta=CONFIDENCE_BOOST.get("cross_account_idor", 30),
+                next_strategy="differential_auth" if success_count >= 1 else "ownership_validation",
+                evidence_fp=fp)
+        return self._build_result(task, success=False, delta=0, next_strategy="horizontal_idor", evidence_fp="")
+
+    def _exec_differential_auth(self, task: InvestigationTask, finding: Finding) -> InvestigationResult:
+        """Field-level JSON comparison with sensitivity classification across roles."""
+        import json
+
+        role_sessions = build_role_sessions(self.config, self.session)
+        if len(role_sessions) < 2:
+            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+
+        fp = finding.fingerprint or ""
+        roles = list(role_sessions.keys())
+        default_role = roles[0]
+        other_roles = roles[1:]
+        default_sess = role_sessions[default_role]
+
+        resp_a, req_ev, resp_ev = self._make_request(finding.url, finding, timeout=10)
+        if resp_a is None or resp_a.status_code != 200:
+            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+        if req_ev:
+            self._record_evidence(req_ev, fp)
+        if resp_ev:
+            self._record_evidence(resp_ev, fp)
+
+        try:
+            body_a_json = json.loads(resp_a.text or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+
+        if not isinstance(body_a_json, dict):
+            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+
+        SENSITIVE_FIELD_KEYWORDS = {
+            "pii": ["email", "phone", "ssn", "name", "address", "dob", "birth"],
+            "financial": ["price", "cost", "salary", "balance", "card", "payment"],
+            "credential": ["password", "token", "secret", "key", "auth"],
+            "ownership": ["owner", "user_id", "account_id", "customer_id", "belongs_to"],
+            "internal": ["internal", "admin", "system", "debug", "trace", "config"],
+        }
+
+        def _classify_fields(obj: dict, prefix: str = "") -> dict[str, list[str]]:
+            classified: dict[str, list[str]] = {}
+            for key, val in obj.items():
+                full_key = f"{prefix}.{key}" if prefix else key
+                key_lower = key.lower()
+                for category, keywords in SENSITIVE_FIELD_KEYWORDS.items():
+                    if any(kw in key_lower for kw in keywords):
+                        classified.setdefault(category, []).append(full_key)
+                if isinstance(val, dict):
+                    sub = _classify_fields(val, full_key)
+                    for cat, fields in sub.items():
+                        classified.setdefault(cat, []).extend(fields)
+            return classified
+
+        default_classified = _classify_fields(body_a_json)
+        default_fields = set()
+
+        def _flatten(obj: dict, prefix: str = ""):
+            for key, val in obj.items():
+                full_key = f"{prefix}.{key}" if prefix else key
+                default_fields.add(full_key)
+                if isinstance(val, dict):
+                    _flatten(val, full_key)
+                elif isinstance(val, list) and val and isinstance(val[0], dict):
+                    _flatten(val[0], full_key)
+
+        _flatten(body_a_json)
+
+        success_count = 0
+        for alt_role in other_roles:
+            alt_sess = role_sessions[alt_role]
+            try:
+                resp_b = alt_sess.get(finding.url, timeout=10, allow_redirects=False)
+            except Exception:
+                continue
+            if resp_b.status_code != 200:
+                continue
+            try:
+                body_b_json = json.loads(resp_b.text or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(body_b_json, dict):
+                continue
+
+            alt_fields = set()
+
+            def _flatten_b(obj: dict, prefix: str = ""):
+                for key, val in obj.items():
+                    full_key = f"{prefix}.{key}" if prefix else key
+                    alt_fields.add(full_key)
+                    if isinstance(val, dict):
+                        _flatten_b(val, full_key)
+                    elif isinstance(val, list) and val and isinstance(val[0], dict):
+                        _flatten_b(val[0], full_key)
+
+            _flatten_b(body_b_json)
+
+            extra_fields = alt_fields - default_fields
+            missing_fields = default_fields - alt_fields
+
+            if extra_fields:
+                # Alt role sees extra sensitive data
+                for cat in ("pii", "financial", "credential", "ownership", "internal"):
+                    sensitive_extra = [f for f in extra_fields
+                                       if any(kw in f.lower() for kw in SENSITIVE_FIELD_KEYWORDS[cat])]
+                    if sensitive_extra:
+                        success_count += 1
+                        authz_ev = AuthorizationComparisonEvidence(
+                            url=finding.url,
+                            original_role=default_role,
+                            target_role=alt_role,
+                            original_status=resp_a.status_code,
+                            target_status=resp_b.status_code,
+                            original_body_excerpt=resp_a.text[:500],
+                            target_body_excerpt=resp_b.text[:500],
+                            body_diff_detected=True,
+                            description=f"Differential auth: {alt_role} sees extra {cat} fields: {', '.join(sensitive_extra[:5])}",
+                            status=EvidenceStatus.ANALYZED,
+                        )
+                        self._record_evidence(authz_ev, fp)
+
+        if success_count:
+            return self._build_result(task, success=True,
+                delta=CONFIDENCE_BOOST.get("differential_auth", 35),
+                next_strategy="ownership_validation",
+                evidence_fp=fp)
         return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
 
     def _apply_result(self, finding: Finding, result: InvestigationResult) -> None:

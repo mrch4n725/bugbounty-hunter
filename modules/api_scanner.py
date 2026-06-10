@@ -863,9 +863,11 @@ class ApiScanner(ScannerModuleBase):
             variables = self._build_gql_variables(args, discovered_ids, id_idx)
             id_idx += len(args)
 
+            selection_set = self._build_gql_selection_set(mut_name)
+
             gql_query = (
                 f"mutation {{ {mut_name}({', '.join(f'{k}: ${k}' for k in variables)})"
-                f" {{ __typename }} }}"
+                f" {selection_set} }}"
             )
             body = {"query": gql_query, "variables": variables}
 
@@ -889,15 +891,61 @@ class ApiScanner(ScannerModuleBase):
 
     def _test_query_auth(self, url: str, default_role: str,
                          other_roles: list[str]) -> list[dict]:
-        """Test basic GraphQL queries for auth bypass across roles.
+        """Test GraphQL queries for auth bypass across roles.
 
-        Sends ``{ __typename }``, a simple object query, and a
-        field-discovery query under each role, comparing responses.
+        Uses discovered type fields from the schema for meaningful
+        comparison, plus basic introspection probes.
         """
         findings: list[dict] = []
         default_sess = self.role_sessions[default_role]
 
-        test_queries = [
+        # Build field-level queries from discovered types
+        store = self._get_discovery_store()
+        discovered_queries: list[tuple[str, str]] = []
+        if store is not None:
+            gql_types = store.get_by_category("gql_type")
+            gql_fields = store.get_by_category("gql_field")
+            query_root_name = "Query"
+            for rec in gql_types:
+                extra_raw = rec.get("extra") or "{}"
+                try:
+                    import json
+                    extra = json.loads(extra_raw) if isinstance(extra_raw, str) else extra_raw
+                except (json.JSONDecodeError, TypeError):
+                    extra = {}
+                if extra.get("role") == "query_root":
+                    query_root_name = rec.get("value", "Query")
+                    break
+
+            # Find top-level query fields
+            root_field_names: list[str] = []
+            for rec in gql_fields:
+                val: str = rec.get("value", "")
+                extra_raw = rec.get("extra") or "{}"
+                try:
+                    extra = json.loads(extra_raw) if isinstance(extra_raw, str) else extra_raw
+                except (json.JSONDecodeError, TypeError):
+                    extra = {}
+                if extra.get("parent_type") == query_root_name:
+                    field_name = val.split(".")[-1]
+                    field_type = extra.get("field_type", "")
+                    if field_type and field_type not in ("String", "Int", "Float", "Boolean", "ID"):
+                        root_field_names.append(f"{field_name} {{ id name }}")
+                    elif field_name not in ("__typename",):
+                        root_field_names.append(field_name)
+
+            if root_field_names:
+                deduped: list[str] = []
+                seen: set[str] = set()
+                for f in root_field_names[:5]:
+                    base = f.split(" ")[0]
+                    if base not in seen:
+                        seen.add(base)
+                        deduped.append(f)
+                selection = "{ " + " ".join(deduped) + " }"
+                discovered_queries.append(("type query", f"{{ {query_root_name} {selection} }}"))
+
+        test_queries = discovered_queries + [
             ("__typename", "{ __typename }"),
             ("schema check", "{ __schema { queryType { name } } }"),
             ("introspection", "{ __schema { types { name } } }"),
@@ -949,6 +997,66 @@ class ApiScanner(ScannerModuleBase):
             variables["input"] = "test"
         return variables
 
+    def _build_gql_selection_set(self, mutation_name: str) -> str:
+        """Build a field selection set for a mutation's return type.
+
+        Reads DiscoveryStore for gql_field records and constructs a
+        meaningful selection set with real type fields instead of just
+        ``{ __typename }``.
+
+        Returns a string like ``{ id name email role { id name } }``.
+        """
+        store = self._get_discovery_store()
+        if store is None:
+            return "{ __typename }"
+
+        gql_fields = store.get_by_category("gql_field")
+        # Find mutation return fields: the mutation name typically maps
+        # to a returned object type (e.g. createUser returns User)
+        # Try to find fields belonging to the capitalized mutation name
+        return_type_candidates = [
+            mutation_name.replace("create", "").replace("update", "").replace("delete", ""),
+            mutation_name.replace("add", "").replace("remove", ""),
+            mutation_name.replace("set", ""),
+        ]
+
+        candidate_fields: list[str] = []
+        for rec in gql_fields:
+            val: str = rec.get("value", "")
+            extra_raw = rec.get("extra") or "{}"
+            try:
+                import json
+                extra = json.loads(extra_raw) if isinstance(extra_raw, str) else extra_raw
+            except (json.JSONDecodeError, TypeError):
+                extra = {}
+            parent_type: str = extra.get("parent_type", "")
+            # Check if this field belongs to any candidate return type
+            for candidate in return_type_candidates:
+                if candidate and parent_type.lower() == candidate.lower():
+                    field_name = val.split(".")[-1]
+                    is_rel = extra.get("is_relationship", False)
+                    if is_rel:
+                        field_type = extra.get("field_type", "")
+                        candidate_fields.append(f"{field_name} {{ id name }}")
+                    elif field_name not in ("__typename", "id"):
+                        candidate_fields.append(field_name)
+                    break
+
+        if candidate_fields:
+            # Deduplicate and limit to 10 fields max
+            seen: set[str] = set()
+            unique: list[str] = []
+            for f in candidate_fields:
+                base = f.split(" ")[0]
+                if base not in seen:
+                    seen.add(base)
+                    unique.append(f)
+                    if len(unique) >= 10:
+                        break
+            return "{ " + " ".join(unique) + " }"
+
+        return "{ __typename }"
+
     @staticmethod
     def _try_gql_request(session: Any, url: str, body: dict,
                          timeout: int | None = None) -> Any | None:
@@ -997,12 +1105,9 @@ class ApiScanner(ScannerModuleBase):
 
         Checks:
           - One has ``data``, other has ``errors``
-          - Different data content (ignoring __typename)
+          - Different data content (field-level comparison, ignoring __typename)
           - Different error messages
         """
-        if resp_a.status_code == resp_b.status_code:
-            return False
-
         try:
             data_a = resp_a.json() if hasattr(resp_a, 'json') else {}
             data_b = resp_b.json() if hasattr(resp_b, 'json') else {}
@@ -1025,6 +1130,13 @@ class ApiScanner(ScannerModuleBase):
             return True
         if not has_errors_a and has_errors_b:
             return True
+
+        # Field-level comparison when both have data
+        if has_data_a and has_data_b:
+            data_content_a = data_a.get("data", {})
+            data_content_b = data_b.get("data", {})
+            if data_content_a != data_content_b:
+                return True
 
         return False
 

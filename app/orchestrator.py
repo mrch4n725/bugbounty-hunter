@@ -151,6 +151,61 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
         config["_audit_logger"] = container.audit_logger
     all_findings_local: list[dict] = []
 
+    # ── Pre-scan object harvesting (feed recon data into DiscoveryStore before TARGET_LEVEL modules) ──
+    if container and hasattr(container, 'object_harvester') and hasattr(container, 'discovery_store'):
+        try:
+            harvester = container.object_harvester
+            pre_harvest_count = 0
+            # Harvest from form HTML
+            for form in recon_data.get("forms", []):
+                form_html = form.get("html", "") or form.get("action", "")
+                if form_html and len(form_html) > 50:
+                    pre_harvest_count += len(harvester.harvest(
+                        url=form.get("action", ""), response_text=str(form_html)))
+            # Harvest from JS response excerpts in js_data
+            js_data = recon_data.get("js_data", {})
+            for js_key in ("js_urls", "js_content", "endpoints"):
+                js_items = js_data.get(js_key, []) if isinstance(js_data, dict) else []
+                if isinstance(js_items, list):
+                    for item in js_items:
+                        if isinstance(item, str) and len(item) > 100:
+                            pre_harvest_count += len(harvester.harvest(
+                                url=item, response_text=item[:2000]))
+                        elif isinstance(item, dict):
+                            content = item.get("content", "") or item.get("response", "")
+                            if content and len(content) > 100:
+                                pre_harvest_count += len(harvester.harvest(
+                                    url=item.get("url", ""), response_text=str(content)[:2000]))
+            # Harvest from discovery store's existing URLs (previous scans)
+            for cat in ("numeric_id", "uuid", "email", "role"):
+                for rec in container.discovery_store.get_by_category(cat):
+                    src_url = rec.get("source_url", "")
+                    if src_url:
+                        pass  # Already stored — nothing to re-harvest
+            if pre_harvest_count:
+                log(f"[+] Pre-scan harvest: {pre_harvest_count} objects from recon data",
+                    Colors.GREEN, verbose_only=True, verbose=config.get("verbose", False))
+            # Rebuild discovery hints after early harvest
+            if hasattr(container, 'discovery_store'):
+                ds = container.discovery_store
+                ownership_urls: list[str] = []
+                for cat in ("ownership_hint", "ownership_relationship"):
+                    for rec in ds.get_by_category(cat):
+                        src = rec.get("source_url", "")
+                        if src and src not in ownership_urls:
+                            ownership_urls.append(src)
+                if hasattr(container, 'relationship_graph'):
+                    graph = container.relationship_graph
+                    boundaries = graph.get_ownership_boundaries()
+                    for pattern in boundaries:
+                        if pattern not in ownership_urls:
+                            ownership_urls.append(pattern)
+                recon_data.setdefault("_discovery_hints", {})["ownership_urls"] = ownership_urls
+                recon_data.setdefault("_discovery_hints", {})["auth_patterns"] = ownership_urls
+        except Exception as e:
+            log(f"[!] Pre-scan harvest failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
+
     # ── OOB Background Poller (Phase 3) ───────────────────────────────
     oob_poller = None
     if scanner.oob and scanner.oob.oob_host:
@@ -491,6 +546,36 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
                         Colors.CYAN, verbose_only=True, verbose=config.get("verbose", False))
         except Exception as e:
             log(f"[!] Object harvesting failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
+
+    # ── Ownership Discovery (proactive ownership inference from all signals) ──
+    if container and hasattr(container, 'discovery_store'):
+        try:
+            from engines.ownership_discovery import OwnershipDiscoveryEngine
+            ode = OwnershipDiscoveryEngine(container.discovery_store)
+            # Build known_ids from store for URL pattern matching
+            known_ids: dict[str, list[str]] = {}
+            for cat in ("numeric_id", "uuid", "email"):
+                for rec in container.discovery_store.get_by_category(cat):
+                    known_ids.setdefault(cat, []).append(rec["value"])
+
+            # Build response_bodies from findings
+            response_bodies: dict[str, str] = {}
+            for obj in enriched:
+                excerpt = obj.get("response_excerpt", "") or getattr(obj, "response_excerpt", "") or ""
+                if excerpt and len(excerpt) > 50:
+                    response_bodies[obj.url] = excerpt[:5000]
+
+            discovered = ode.discover_all(
+                urls=list(known_ids.get("numeric_id", [])) if known_ids else None,
+                response_bodies=response_bodies or None,
+                known_ids=known_ids or None,
+            )
+            if discovered:
+                log(f"[+] Ownership discovery: {len(discovered)} relationships inferred",
+                    Colors.GREEN, verbose_only=True, verbose=config.get("verbose", False))
+        except Exception as e:
+            log(f"[!] Ownership discovery failed: {e}", Colors.YELLOW,
                 verbose_only=True, verbose=config.get("verbose", False))
 
     # ── GQL Authorization Intelligence (feed stored GQL types into discovery) ──

@@ -1237,6 +1237,53 @@ def run(config: dict) -> int:
         except Exception as e:
             log(f"[!] Investigation engine failed: {e}", Colors.YELLOW)
 
+    # ── Feed investigation results back into DiscoveryStore ─────────────
+    if "investigation" not in disabled_engines and container:
+        if hasattr(container, 'discovery_store') and hasattr(container, 'object_harvester'):
+            try:
+                ds = container.discovery_store
+                oh = container.object_harvester
+                feed_count = 0
+                for f in all_findings:
+                    if (f.confidence_score or 0) >= 60 and f.verification_stage in ("validated", "verified", "exploitable"):
+                        # Store confirmed endpoint as discovery resource
+                        fp = oh._fingerprint(f.url)
+                        ds_link = ds.get_by_fingerprint(fp, "confirmed_endpoint")
+                        if not ds_link:
+                            ds.store(
+                                category="confirmed_endpoint",
+                                value=f.url,
+                                source_url=f.url,
+                                extra=json.dumps({
+                                    "vuln_type": f.vuln_type,
+                                    "severity": f.severity,
+                                    "verification_stage": f.verification_stage,
+                                    "confidence": f.confidence_score,
+                                })
+                            )
+                            feed_count += 1
+                        # Extract and store numeric IDs from URL path
+                        import re
+                        ids_in_url = re.findall(r'/(\d{4,12})(?:/|$|[\?&#])', f.url)
+                        for id_val in ids_in_url:
+                            id_fp = oh._fingerprint(f"resource:{id_val}")
+                            existing = ds.get_by_fingerprint(id_fp, "validated_resource")
+                            if not existing:
+                                ds.store(
+                                    category="validated_resource",
+                                    value=id_val,
+                                    source_url=f.url,
+                                    extra=json.dumps({"vuln_type": f.vuln_type})
+                                )
+                                feed_count += 1
+                if feed_count:
+                    log(f"[+] Investigation feedback: {feed_count} artifacts stored in DiscoveryStore",
+                        Colors.GREEN, verbose_only=True,
+                        verbose=config.get("verbose", False))
+            except Exception as e:
+                log(f"[!] Investigation feedback failed: {e}", Colors.YELLOW,
+                    verbose_only=True, verbose=config.get("verbose", False))
+
     # ── Attack Chain Detection (Initiative 1) ────────────────────────────
     if "attack_chains" not in disabled_engines and container:
         try:
