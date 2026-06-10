@@ -34,8 +34,6 @@ class ConfidenceEngine:
         factors.base_score = current_score
 
         evidence = finding.evidence or []
-        if isinstance(evidence, str):
-            evidence = [evidence] if evidence else []
 
         quality_scores = EvidenceQualityEngine.assess_finding_evidence(finding)
         quality_contrib = EvidenceQualityEngine.confidence_contribution(quality_scores)

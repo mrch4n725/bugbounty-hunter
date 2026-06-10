@@ -136,9 +136,12 @@ class ApiScanner(ScannerModuleBase):
         findings.extend(self.scan_graphql_introspection(gql_endpoints))
         findings.extend(self.scan_graphql_injection(gql_endpoints))
         findings.extend(self.scan_graphql_auth_bypass(gql_endpoints))
+        findings.extend(self._scan_gql_batched_auth_bypass(gql_endpoints))
         findings.extend(self.scan_graphql_query_depth(gql_endpoints))
         findings.extend(self.scan_bola(endpoints))
         findings.extend(self.scan_mass_assignment(endpoints))
+
+        self._store_openapi_to_discovery_store(endpoints)
 
         # Final scope filter on all results
         in_scope = [f for f in findings if self._in_scope(f.url)]
@@ -252,6 +255,110 @@ class ApiScanner(ScannerModuleBase):
 
     # ── GraphQL helpers ────────────────────────────────────────────────────
 
+    def _get_discovery_store(self):
+        """Return the DiscoveryStore instance if available, else None."""
+        if self.container and hasattr(self.container, 'discovery_store'):
+            return self.container.discovery_store
+        return None
+
+    def _get_numeric_ids_for_args(self, max_count: int = 10) -> list[str]:
+        """Fetch numeric IDs from DiscoveryStore for injecting into GQL args."""
+        store = self._get_discovery_store()
+        if store is None:
+            return []
+        records = store.get_by_category("numeric_id")
+        seen: set[str] = set()
+        ids: list[str] = []
+        for r in records:
+            val = r["value"]
+            if val not in seen:
+                seen.add(val)
+                ids.append(val)
+                if len(ids) >= max_count:
+                    break
+        return ids
+
+    def _store_gql_types(self, schema: dict, url: str) -> None:
+        """Parse an introspection schema into DiscoveryStore type/field/relationship records.
+
+        Stores:
+          - ``gql_type``: each named type with kind and field count
+          - ``gql_field``: each field with parent type and resolved type
+          - ``gql_relationship``: type-to-type references (fields whose
+            type is another object type, implying a relationship)
+        """
+        store = self._get_discovery_store()
+        if store is None:
+            return
+
+        query_type_name = schema.get("queryType", {}).get("name", "Query")
+        mutation_type_name = schema.get("mutationType", {}).get("name", "")
+
+        store.record("gql_type", query_type_name, source_url=url,
+                     extra={"kind": "OBJECT", "role": "query_root"})
+        if mutation_type_name:
+            store.record("gql_type", mutation_type_name, source_url=url,
+                         extra={"kind": "OBJECT", "role": "mutation_root"})
+
+        type_map: dict[str, dict] = {}
+        for t in schema.get("types", []):
+            name = t.get("name", "")
+            if not name or name.startswith("__") or name in ("String", "Int", "Float", "Boolean", "ID"):
+                continue
+            type_map[name] = t
+
+        seen_types: set[str] = set()
+        for type_name, t in type_map.items():
+            if type_name in seen_types:
+                continue
+            seen_types.add(type_name)
+            kind = t.get("kind", "OBJECT")
+            fields = t.get("fields") or []
+
+            if kind not in ("OBJECT", "INPUT_OBJECT", "INTERFACE", "UNION"):
+                continue
+
+            store.record("gql_type", type_name, source_url=url,
+                         extra={"kind": kind, "field_count": len(fields)})
+
+            for field in fields:
+                field_name = field.get("name", "")
+                field_type = self._resolve_gql_type_name(field.get("type", {}))
+                if not field_name:
+                    continue
+
+                is_relationship = field_type in type_map and field_type not in (
+                    "String", "Int", "Float", "Boolean", "ID")
+                store.record("gql_field", f"{type_name}.{field_name}", source_url=url,
+                             extra={"parent_type": type_name,
+                                    "field_type": field_type,
+                                    "is_relationship": is_relationship,
+                                    "args": len(field.get("args") or [])})
+
+                if is_relationship:
+                    store.record("gql_relationship",
+                                 f"{type_name}→{field_type}", source_url=url,
+                                 extra={"from_type": type_name,
+                                        "to_type": field_type,
+                                        "via_field": field_name})
+                    log(f"  [GQL] Relationship: {type_name}.{field_name} → {field_type}",
+                        Colors.CYAN, verbose_only=True, verbose=self.verbose)
+
+    @staticmethod
+    def _resolve_gql_type_name(type_ref: dict) -> str:
+        """Resolve a GraphQL type reference to its base type name.
+
+        Handles NON_NULL and LIST wrappers to find the underlying named type.
+        """
+        if not type_ref:
+            return "Unknown"
+        kind = type_ref.get("kind", "")
+        if kind == "NON_NULL":
+            return ApiScanner._resolve_gql_type_name(type_ref.get("ofType", {}) or {})
+        if kind == "LIST":
+            return ApiScanner._resolve_gql_type_name(type_ref.get("ofType", {}) or {})
+        return type_ref.get("name", "Unknown")
+
     def _find_gql_endpoints(self) -> list[str]:
         """Probe common paths to discover live GraphQL endpoints.
 
@@ -361,6 +468,8 @@ class ApiScanner(ScannerModuleBase):
 
                 if self.verbose:
                     self._print_schema_summary(schema)
+
+                self._store_gql_types(schema, url)
 
             except Exception as e:
                 log(f"  [GQL] Introspection error for {url}: {e}", Colors.WHITE,
@@ -494,6 +603,39 @@ class ApiScanner(ScannerModuleBase):
             self._scan_graphql_batching(findings, gql_endpoints)
 
         return self._deduplicate(findings)
+
+    def _store_openapi_to_discovery_store(self, endpoints: list[dict]) -> None:
+        """Record OpenAPI endpoint model metadata into DiscoveryStore.
+
+        Stores each endpoint path + method as an ``api_model`` record, and
+        each parameter with its type as an ``api_property`` record linked to
+        the parent endpoint. This intelligence feeds downstream scanners
+        (IDOR, AuthZ) with parameter names and types.
+        """
+        store = None
+        if self.container and hasattr(self.container, 'discovery_store'):
+            store = self.container.discovery_store
+        if store is None:
+            return
+
+        for ep in endpoints:
+            path = ep.get("path", "")
+            method = ep.get("method", "GET")
+            ep_key = f"{method} {path}"
+
+            store.record("api_model", ep_key, source_url=ep.get("source_url", ""),
+                         extra={"path": path, "method": method,
+                                "summary": ep.get("summary", "")})
+
+            for param in ep.get("parameters", []):
+                param_name = param.get("name", "")
+                if not param_name:
+                    continue
+                store.record("api_property", param_name, source_url=ep.get("source_url", ""),
+                             extra={"parent_endpoint": ep_key,
+                                    "param_in": param.get("in", "query"),
+                                    "param_type": param.get("type", "string"),
+                                    "required": param.get("required", False)})
 
     def _scan_graphql_batching(self, findings: list[dict], gql_endpoints: list[str]) -> None:
         """Send a batch of identical queries and check for processing."""
@@ -658,12 +800,19 @@ class ApiScanner(ScannerModuleBase):
 
         return self._deduplicate(findings)
 
-    # ── GraphQL Auth Bypass (Phase 5) ─────────────────────────────────────
+    # ── GraphQL Auth Bypass ────────────────────────────────────────────
 
     def scan_graphql_auth_bypass(self, gql_endpoints: list[str]) -> list[dict]:
         """Test GraphQL mutations with alternative role sessions to detect
-        authorization bypass. Sends the same operation with different roles
-        and compares responses."""
+        authorization bypass.
+
+        Improvements over the previous implementation:
+          - Tests ALL mutations (not just first 5)
+          - Fills args with real IDs from DiscoveryStore when available
+          - Adds response body content comparison (JSON diff) alongside
+            status code comparison
+          - Tests both mutations and queries
+        """
         findings: list[dict] = []
 
         if len(gql_endpoints) < 1 or len(self.role_sessions) < 2:
@@ -679,56 +828,301 @@ class ApiScanner(ScannerModuleBase):
         if not other_roles:
             return findings
 
-        alt_role = other_roles[0]
+        discovered_ids = self._get_numeric_ids_for_args(max_count=20)
+        id_iter = iter(discovered_ids)
 
-        for mut in mutations[:5]:
-            url = mut["url"]
+        for url in gql_endpoints:
+            url_mutations = [m for m in mutations if m["url"] == url]
+            findings.extend(self._test_mutation_auth(
+                url, url_mutations, default_role, other_roles, discovered_ids))
+            findings.extend(self._test_query_auth(
+                url, default_role, other_roles))
+
+        return self._deduplicate(findings)
+
+    def _test_mutation_auth(self, url: str, mutations: list[dict],
+                            default_role: str, other_roles: list[str],
+                            discovered_ids: list[str]) -> list[dict]:
+        """Test every mutation for auth bypass using role sessions.
+
+        For each mutation, tries all roles as the 'alt' role to catch
+        multi-role authorization violations. Uses real IDs from
+        DiscoveryStore when arg names match ID patterns.
+        """
+        findings: list[dict] = []
+        id_idx = 0
+
+        default_sess = self.role_sessions[default_role]
+
+        for mut in mutations:
             mut_name = mut["name"]
             args = mut.get("args", [])
             if not args:
                 continue
 
-            variables: dict[str, str] = {}
-            for arg in args[:2]:
-                variables[arg["name"]] = "test"
-            if not variables:
-                variables["input"] = "test"
+            variables = self._build_gql_variables(args, discovered_ids, id_idx)
+            id_idx += len(args)
 
-            gql_query = f"mutation {{ {mut_name}({', '.join(f'{k}: ${k}' for k in variables)}) {{ __typename }} }}"
+            gql_query = (
+                f"mutation {{ {mut_name}({', '.join(f'{k}: ${k}' for k in variables)})"
+                f" {{ __typename }} }}"
+            )
             body = {"query": gql_query, "variables": variables}
 
-            default_sess = self.role_sessions[default_role]
-            alt_sess = self.role_sessions[alt_role]
+            resp_a = self._try_gql_request(default_sess, url, body)
+            if resp_a is None:
+                continue
 
-            try:
-                resp_a = default_sess.post(url, json=body, timeout=self.timeout)
-                resp_b = alt_sess.post(url, json=body, timeout=self.timeout)
+            for alt_role in other_roles:
+                alt_sess = self.role_sessions[alt_role]
+                resp_b = self._try_gql_request(alt_sess, url, body)
+                if resp_b is None:
+                    continue
 
-                if resp_a.status_code != 200 and resp_b.status_code == 200:
-                    self._append_finding(findings, finding(
-                        "GraphQL Auth Bypass",
-                        url, "critical",
-                        f"Mutation '{mut_name}' rejected for '{default_role}' "
-                        f"(HTTP {resp_a.status_code}) but accepted for '{alt_role}' "
-                        f"(HTTP {resp_b.status_code}) — authorization bypass.",
-                        f"Role '{default_role}': HTTP {resp_a.status_code} | "
-                        f"Role '{alt_role}': HTTP {resp_b.status_code}",
-                        verification_stage="validated",
-                        request=_build_curl("POST", url, dict(default_sess.headers)),
-                        response_excerpt=resp_b.text[:500],
-                        steps_to_reproduce=[
-                            f"Authenticate as '{alt_role}'",
-                            f"Send mutation '{mut_name}' to {url}",
-                            "Observe HTTP 200 vs the expected rejection",
-                        ],
-                    ))
-                    log(f"  [GQL Auth] {mut_name} — {alt_role} bypassed auth",
-                        Colors.RED, verbose_only=True, verbose=self.verbose)
-            except Exception as e:
-                log(f"  [GQL Auth] Error: {e}", Colors.WHITE,
-                    verbose_only=True, verbose=self.verbose)
+                bypass = self._compare_gql_responses(
+                    mut_name, url, default_role, alt_role,
+                    resp_a, resp_b, body, "mutation")
+                if bypass:
+                    findings.append(bypass)
 
-        return self._deduplicate(findings)
+        return findings
+
+    def _test_query_auth(self, url: str, default_role: str,
+                         other_roles: list[str]) -> list[dict]:
+        """Test basic GraphQL queries for auth bypass across roles.
+
+        Sends ``{ __typename }``, a simple object query, and a
+        field-discovery query under each role, comparing responses.
+        """
+        findings: list[dict] = []
+        default_sess = self.role_sessions[default_role]
+
+        test_queries = [
+            ("__typename", "{ __typename }"),
+            ("schema check", "{ __schema { queryType { name } } }"),
+            ("introspection", "{ __schema { types { name } } }"),
+        ]
+
+        for qlabel, qtext in test_queries:
+            body = {"query": qtext}
+            resp_a = self._try_gql_request(default_sess, url, body)
+            if resp_a is None:
+                continue
+
+            for alt_role in other_roles:
+                alt_sess = self.role_sessions[alt_role]
+                resp_b = self._try_gql_request(alt_sess, url, body)
+                if resp_b is None:
+                    continue
+
+                bypass = self._compare_gql_responses(
+                    qlabel, url, default_role, alt_role,
+                    resp_a, resp_b, body, "query")
+                if bypass:
+                    findings.append(bypass)
+
+        return findings
+
+    def _build_gql_variables(self, args: list[dict], discovered_ids: list[str],
+                             start_idx: int = 0) -> dict[str, str]:
+        """Build GQL variables for a mutation, using real IDs when appropriate.
+
+        Maps arg names to discovered IDs when the arg name suggests an
+        identifier (``id``, ``userId``, ``accountId``, etc.), falling
+        back to ``"test"`` for other args.
+        """
+        id_arg_keys = frozenset({
+            "id", "userId", "user_id", "accountId", "account_id",
+            "orgId", "org_id", "uid", "teamId", "team_id",
+            "input", "data", "record",
+        })
+        variables: dict[str, str] = {}
+        for i, arg in enumerate(args[:5]):
+            arg_name = arg["name"]
+            arg_lower = arg_name.lower()
+            if arg_lower in id_arg_keys and discovered_ids:
+                idx = (start_idx + i) % len(discovered_ids)
+                variables[arg_name] = discovered_ids[idx]
+            else:
+                variables[arg_name] = "test"
+        if not variables:
+            variables["input"] = "test"
+        return variables
+
+    @staticmethod
+    def _try_gql_request(session: Any, url: str, body: dict,
+                         timeout: int | None = None) -> Any | None:
+        """Send a GQL POST request and return the response, or None on failure."""
+        try:
+            resp = session.post(url, json=body, timeout=timeout or 30)
+            return resp
+        except Exception:
+            return None
+
+    def _compare_gql_responses(self, name: str, url: str,
+                               default_role: str, alt_role: str,
+                               resp_a: Any, resp_b: Any,
+                               body: dict, gql_type: str) -> dict | None:
+        """Compare GQL responses between two roles and create a finding if bypass found.
+
+        Detects bypass via:
+          1. Status code disparity (default rejected, alt accepted)
+          2. Body content disparity (default gets error, alt gets data)
+        """
+        findings_list: list[dict] = []
+
+        status_bypass = (resp_a.status_code != 200 and resp_b.status_code == 200)
+        if status_bypass:
+            finding_obj = self._make_auth_finding(
+                name, url, default_role, alt_role, gql_type,
+                resp_a, resp_b, body, "HTTP status bypass")
+            if finding_obj:
+                findings_list.append(finding_obj)
+
+        body_diff = self._detect_gql_body_diff(resp_a, resp_b)
+        if body_diff and not status_bypass:
+            finding_obj = self._make_auth_finding(
+                name, url, default_role, alt_role, gql_type,
+                resp_a, resp_b, body, "response body bypass")
+            if finding_obj:
+                findings_list.append(finding_obj)
+
+        if findings_list:
+            return findings_list[0]
+        return None
+
+    @staticmethod
+    def _detect_gql_body_diff(resp_a: Any, resp_b: Any) -> bool:
+        """Return True if the responses differ in a meaningful way.
+
+        Checks:
+          - One has ``data``, other has ``errors``
+          - Different data content (ignoring __typename)
+          - Different error messages
+        """
+        if resp_a.status_code == resp_b.status_code:
+            return False
+
+        try:
+            data_a = resp_a.json() if hasattr(resp_a, 'json') else {}
+            data_b = resp_b.json() if hasattr(resp_b, 'json') else {}
+        except (json.JSONDecodeError, ValueError, AttributeError):
+            return False
+
+        if not isinstance(data_a, dict) or not isinstance(data_b, dict):
+            return False
+
+        has_data_a = "data" in data_a and data_a["data"] is not None
+        has_data_b = "data" in data_b and data_b["data"] is not None
+        if has_data_a and not has_data_b:
+            return True
+        if not has_data_a and has_data_b:
+            return True
+
+        has_errors_a = "errors" in data_a
+        has_errors_b = "errors" in data_b
+        if has_errors_a and not has_errors_b:
+            return True
+        if not has_errors_a and has_errors_b:
+            return True
+
+        return False
+
+    def _make_auth_finding(self, name: str, url: str,
+                           default_role: str, alt_role: str,
+                           gql_type: str, resp_a: Any, resp_b: Any,
+                           body: dict, bypass_signal: str) -> dict | None:
+        """Create a finding for a detected GQL auth bypass."""
+        from models.evidence import AuthorizationComparisonEvidence, HttpRequestEvidence, HttpResponseEvidence
+
+        finding_obj = finding(
+            "GraphQL Auth Bypass",
+            url, "critical",
+            f"{gql_type.capitalize()} '{name}' rejected for '{default_role}' "
+            f"(HTTP {resp_a.status_code}) but accepted for '{alt_role}' "
+            f"(HTTP {resp_b.status_code}) — {bypass_signal}.",
+            f"Signal: {bypass_signal} | Role '{default_role}': "
+            f"HTTP {resp_a.status_code} | "
+            f"Role '{alt_role}': HTTP {resp_b.status_code}",
+            verification_stage="validated",
+            request=_build_curl("POST", url, dict(getattr(self, 'session', type('', (), {}))().headers
+                                if not hasattr(self, 'session') else self.session.headers)),
+            response_excerpt=resp_b.text[:500],
+            steps_to_reproduce=[
+                f"Authenticate as '{alt_role}'",
+                f"Send {gql_type} '{name}' to {url}",
+                f"Observe HTTP {resp_b.status_code} vs expected rejection (HTTP {resp_a.status_code})",
+            ],
+        )
+
+        try:
+            authz_ev = AuthorizationComparisonEvidence(
+                original_role=default_role,
+                original_status=resp_a.status_code,
+                original_body=resp_a.text[:500] if hasattr(resp_a, 'text') else "",
+                target_role=alt_role,
+                target_status=resp_b.status_code,
+                target_body=resp_b.text[:500] if hasattr(resp_b, 'text') else "",
+                body_diff_detected=(bypass_signal == "response body bypass"),
+            )
+            existing = finding_obj.get("evidence", [])
+            if isinstance(existing, str):
+                existing = [existing] if existing else []
+            existing.append(authz_ev)
+            finding_obj["evidence"] = existing
+        except Exception:
+            pass
+
+        log(f"  [GQL Auth] {name} ({gql_type}) — {alt_role} bypassed auth via {bypass_signal}",
+            Colors.RED, verbose_only=True, verbose=self.verbose)
+        return finding_obj
+
+    # ── GraphQL Batched Auth Bypass ──────────────────────────────────────
+
+    def _scan_gql_batched_auth_bypass(self, gql_endpoints: list[str]) -> list[dict]:
+        """Send batched queries under different roles to detect auth bypass.
+
+        Batched GQL can sometimes bypass auth checks because each request
+        in the batch may be evaluated independently, and some roles may
+        have access to data in the batch that they shouldn't.
+        """
+        findings: list[dict] = []
+
+        if len(gql_endpoints) < 1 or len(self.role_sessions) < 2:
+            return findings
+
+        roles = list(self.role_sessions.keys())
+        default_role = self.current_role if self.current_role in self.role_sessions else roles[0]
+        other_roles = [r for r in roles if r != default_role and r != "alt"]
+        if not other_roles:
+            return findings
+
+        batch_query = {"query": "{ __typename }"}
+        batch = [batch_query] * 5 + [
+            {"query": "{ __schema { queryType { name } } }"},
+            {"query": "{ __schema { mutationType { name } } }"},
+        ]
+
+        default_sess = self.role_sessions[default_role]
+
+        for url in gql_endpoints:
+            resp_a = self._try_gql_request(default_sess, url, batch)
+            if resp_a is None:
+                continue
+
+            for alt_role in other_roles:
+                alt_sess = self.role_sessions[alt_role]
+                resp_b = self._try_gql_request(alt_sess, url, batch)
+                if resp_b is None:
+                    continue
+
+                bypass = self._compare_gql_responses(
+                    "batched", url, default_role, alt_role,
+                    resp_a, resp_b, {"batch": batch}, "batched query")
+                if bypass:
+                    findings.append(bypass)
+
+        return findings
 
     # ── GraphQL Query Depth Attack (Phase 5) ──────────────────────────────
 

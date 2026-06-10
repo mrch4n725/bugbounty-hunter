@@ -299,9 +299,11 @@ class IdorScanner(ScannerModuleBase):
                         description=f"Horizontal privilege escalation: secondary user accessed {url}",
                         status=EvidenceStatus.VERIFIED,
                     )
-                    if not isinstance(f_dict.get("evidence", []), list):
-                        f_dict["evidence"] = [str(f_dict.get("evidence", ""))]
-                    f_dict["evidence"].append(ev)
+                    ev_list = f_dict.get("evidence", [])
+                    if isinstance(ev_list, str):
+                        ev_list = [ev_list] if ev_list else []
+                    ev_list.append(ev)
+                    f_dict["evidence"] = ev_list
                     if hasattr(self, '_container') and self._container and self._container.evidence_engine:
                         self._container.evidence_engine.store(ev)
                         self._container.evidence_engine.link_to_finding(ev, f_dict.get("fingerprint", ""))
@@ -620,9 +622,11 @@ class IdorScanner(ScannerModuleBase):
                     ],
                 )
                 if f_dict:
-                    if not isinstance(f_dict.get("evidence", []), list):
-                        f_dict["evidence"] = [str(f_dict.get("evidence", ""))]
-                    f_dict["evidence"].append(auth_evidence)
+                    ev_list = f_dict.get("evidence", [])
+                    if isinstance(ev_list, str):
+                        ev_list = [ev_list] if ev_list else []
+                    ev_list.append(auth_evidence)
+                    f_dict["evidence"] = ev_list
                     # Update reproduction steps for submission readiness
                     f_dict["steps_to_reproduce"] = [
                         f"Authenticate as '{default_role}' (provide session token or cookie)",
@@ -638,6 +642,264 @@ class IdorScanner(ScannerModuleBase):
                     self._append_finding(findings, f_dict)
                 log(f"  [IDOR Owner] {test_url[:80]} — {default_role} vs {alt_role}",
                     Colors.RED, verbose_only=True, verbose=self.verbose)
+
+    # ── Stateful IDOR: create-then-access (Phase 5) ──────────────────────
+
+    def scan_stateful_idor(self, findings: list[dict]) -> None:
+        """Create a resource as one role, then test access as other roles.
+
+        Identifies POST endpoints from forms and OpenAPI data, creates
+        a resource with the default role, extracts the new resource ID
+        from the response, and then tests GET/access with alternative
+        roles. Catches IDORs that only manifest after resource creation
+        (e.g., create a document as User A, then read it as User B).
+        """
+        if len(self.role_sessions) < 2:
+            return
+
+        roles = list(self.role_sessions.keys())
+        default_role = self.current_role if self.current_role in self.role_sessions else roles[0]
+        other_roles = [r for r in roles if r != default_role and r != "alt"]
+        if not other_roles:
+            return
+
+        create_targets = self._find_stateful_create_targets()
+        if not create_targets:
+            return
+
+        log(f"  [IDOR] Found {len(create_targets)} stateful create target(s)",
+            Colors.CYAN, verbose_only=True, verbose=self.verbose)
+
+        default_sess = self.role_sessions[default_role]
+
+        for target in create_targets[:10]:
+            url = target["url"]
+            method = target.get("method", "POST")
+            body = target.get("body", {})
+
+            resp = self._try_stateful_create(default_sess, url, method, body)
+            if resp is None:
+                continue
+
+            created_id = self._extract_created_id(resp.text, url)
+            if not created_id:
+                continue
+
+            log(f"  [IDOR] Created resource @ {url} → id={created_id}",
+                Colors.CYAN, verbose_only=True, verbose=self.verbose)
+
+            for alt_role in other_roles:
+                alt_sess = self.role_sessions[alt_role]
+                self._try_stateful_access(findings, created_id, url,
+                                          default_role, alt_role,
+                                          default_sess, alt_sess)
+
+    def _find_stateful_create_targets(self) -> list[dict]:
+        """Find POST endpoints that likely create resources.
+
+        Sources:
+          1. Forms with POST method from recon_data
+          2. OpenAPI POST endpoints from DiscoveryStore (``api_model`` records)
+          3. Known creation path patterns (/api/*/create, /api/*/new)
+        """
+        targets: list[dict] = []
+        seen_urls: set[str] = set()
+
+        for form in self.recon.get("forms", []):
+            action = form.get("action", "")
+            method = form.get("method", "get").upper()
+            if method != "POST" or not action or not self._in_scope(action):
+                continue
+            if action in seen_urls:
+                continue
+            seen_urls.add(action)
+            fields = form.get("fields", [])
+            body = {f["name"]: (f.get("value", "test") or "test")
+                    for f in fields if f.get("name")}
+            targets.append({"url": action, "method": "POST", "body": body})
+
+        if self.container and hasattr(self.container, 'discovery_store'):
+            store = self.container.discovery_store
+            for rec in store.get_by_category("api_model"):
+                extra = rec.get("extra", {})
+                if extra.get("method") != "POST":
+                    continue
+                api_url = self.base_url + extra.get("path", "")
+                if not api_url or not self._in_scope(api_url):
+                    continue
+                if api_url in seen_urls:
+                    continue
+                seen_urls.add(api_url)
+                targets.append({"url": api_url, "method": "POST", "body": {}})
+
+        create_paths = ("/create", "/new", "/add", "/register", "/signup")
+        for url in self.recon.get("urls", []):
+            if not self._in_scope(url):
+                continue
+            path_lower = urlparse(url).path.lower()
+            if any(cp in path_lower for cp in create_paths):
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                targets.append({"url": url, "method": "POST", "body": {}})
+
+        return targets
+
+    def _try_stateful_create(self, session: Any, url: str, method: str,
+                             body: dict) -> Any | None:
+        """Attempt to create a resource via POST.
+
+        Returns the response on success (2xx), None otherwise.
+        """
+        try:
+            if body:
+                resp = session.post(url, json=body, timeout=self.timeout)
+            else:
+                resp = session.post(url, json={"name": "test", "title": "test"},
+                                    timeout=self.timeout)
+            if resp and resp.status_code in (200, 201, 202):
+                return resp
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _extract_created_id(response_text: str, url: str) -> str | None:
+        """Extract a newly created resource ID from a JSON response.
+
+        Looks for ``"id"``, ``"resourceId"``, ``"uid"`` at the top level
+        or nested in a ``"data"`` / ``"result"`` wrapper. Returns None if
+        no ID can be extracted.
+        """
+        if not response_text:
+            return None
+        try:
+            parsed = json.loads(response_text)
+        except (json.JSONDecodeError, ValueError):
+            match = re.search(r'"id"\s*:\s*"?(\\d+)"?', response_text)
+            return match.group(1) if match else None
+
+        if isinstance(parsed, dict):
+            for key in ("id", "resourceId", "resource_id", "uid", "ID"):
+                val = parsed.get(key)
+                if val is not None:
+                    return str(val)
+            data = parsed.get("data") or parsed.get("result")
+            if isinstance(data, dict):
+                for key in ("id", "resourceId", "resource_id", "uid", "ID"):
+                    val = data.get(key)
+                    if val is not None:
+                        return str(val)
+        return None
+
+    def _try_stateful_access(self, findings: list[dict], created_id: str,
+                              create_url: str, default_role: str, alt_role: str,
+                              default_sess: Any, alt_sess: Any) -> None:
+        """Try to access the created resource with an alternative role.
+
+        Tests:
+          1. GET on the created resource URL (if ID is in the path)
+          2. GET with ID as a query parameter
+          3. DELETE on the resource URL
+        """
+        access_urls = self._build_access_urls(create_url, created_id)
+        alt_findings: list[dict] = []
+
+        for access_url, access_method, desc in access_urls:
+            resp_default = self._try_gql_method(default_sess, access_url, access_method)
+            resp_alt = self._try_gql_method(alt_sess, access_url, access_method)
+
+            if resp_default is None or resp_alt is None:
+                continue
+
+            if resp_alt.status_code == 200 and resp_default.status_code != 200:
+                self._append_stateful_finding(findings, created_id, create_url,
+                                               access_url, access_method, desc,
+                                               default_role, alt_role,
+                                               resp_default, resp_alt)
+                alt_findings.append(True)
+            elif resp_alt.status_code == 200 and resp_default.status_code == 200:
+                similarity = self._jaccard_similarity(
+                    resp_default.text, resp_alt.text)
+                if similarity < 0.85 and len(resp_alt.text) > 300:
+                    self._append_stateful_finding(findings, created_id, create_url,
+                                                   access_url, access_method, desc,
+                                                   default_role, alt_role,
+                                                   resp_default, resp_alt)
+                    alt_findings.append(True)
+
+    @staticmethod
+    def _build_access_urls(url: str, created_id: str) -> list[tuple[str, str, str]]:
+        """Build candidate access URLs for testing with the created ID."""
+        candidates: list[tuple[str, str, str]] = []
+        base = url.rstrip("/")
+
+        if base.endswith(("/create", "/new", "/add")):
+            parent = base.rsplit("/", 1)[0]
+        else:
+            parent = base
+
+        candidates.append((f"{parent}/{created_id}", "GET",
+                           f"GET resource by ID ({created_id})"))
+        candidates.append((f"{parent}/{created_id}", "DELETE",
+                           f"DELETE resource by ID ({created_id})"))
+        candidates.append((f"{url}?id={created_id}", "GET",
+                           "GET with query param id"))
+        candidates.append((f"{url}?resourceId={created_id}", "GET",
+                           "GET with query param resourceId"))
+        if "?" in url:
+            candidates.append((f"{url}&id={created_id}", "GET",
+                               "GET with appended id param"))
+        return candidates
+
+    @staticmethod
+    def _try_gql_method(session: Any, url: str, method: str) -> Any | None:
+        """Send an HTTP request and return the response, or None on failure."""
+        try:
+            if method == "GET":
+                return session.get(url, timeout=30)
+            elif method == "DELETE":
+                return session.delete(url, timeout=30)
+            elif method == "POST":
+                return session.post(url, timeout=30)
+            return None
+        except Exception:
+            return None
+
+    def _append_stateful_finding(self, findings: list[dict], created_id: str,
+                                  create_url: str, access_url: str,
+                                  access_method: str, desc: str,
+                                  default_role: str, alt_role: str,
+                                  resp_a: Any, resp_b: Any) -> None:
+        """Create and append a stateful IDOR finding."""
+        f_dict = finding(
+            "IDOR - Stateful Resource Access",
+            access_url, "critical",
+            f"Resource created at '{create_url}' (id={created_id}) by "
+            f"'{default_role}' is accessible via '{access_method}' by "
+            f"'{alt_role}' — stateful IDOR: create-then-access.",
+            f"Role A ({default_role}): HTTP {resp_a.status_code} | "
+            f"Role B ({alt_role}): HTTP {resp_b.status_code} | "
+            f"Access: {desc}",
+            verification_stage="validated",
+            request=_build_curl(access_method, access_url,
+                                dict(self.session.headers),
+                                cookies=safe_cookies_dict(self.session.cookies)),
+            response_excerpt=resp_b.text[:500],
+            steps_to_reproduce=[
+                f"Authenticate as '{default_role}'",
+                f"Send POST to {create_url} to create a resource",
+                f"Note the created resource ID: {created_id}",
+                f"Authenticate as '{alt_role}'",
+                f"Send {access_method} to {access_url}",
+                "Observe that the resource created by another user is accessible",
+            ],
+        )
+        if f_dict:
+            self._append_finding(findings, f_dict)
+            log(f"  [IDOR Stateful] {access_method} {access_url[:80]} — "
+                f"{alt_role} accessed resource created by {default_role}",
+                Colors.RED, verbose_only=True, verbose=self.verbose)
 
     # ── Passive scan (zero additional requests) ────────────────────────────
 
@@ -690,6 +952,7 @@ class IdorScanner(ScannerModuleBase):
             self.scan_sequential_enum(findings, candidates)
             self.scan_encoded_id_manipulation(findings, candidates)
             self.verify_ownership(findings, candidates)
+            self.scan_stateful_idor(findings)
 
         # Bundle evidence items per finding into CompositeEvidence
         for fdict in findings:

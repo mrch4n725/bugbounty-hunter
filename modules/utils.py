@@ -2171,6 +2171,9 @@ def compute_endpoint_score(url: str, forms: list[dict], recon_data: dict) -> int
         "is_file_upload": 10,
         "has_cmd_param": 10,
         "is_graphql": 5,
+        "has_auth_potential": 40,
+        "has_biz_impact": 30,
+        "has_ownership_signal": 45,
     }
     # Tech signals get a uniform bonus (framework-specific URLs are higher value)
     score = sum(weights[s] for s in signals if s in weights)
@@ -2262,6 +2265,41 @@ def _get_signal_set(
     )
     if any(any(cn in p for cn in cmd_param_names) for p in params_lower):
         signals.add("has_cmd_param")
+
+    # ── Discovery priority signals ──────────────────────────────────────
+    path_segments_numeric = re.findall(r'/(\d{2,12})(?:/|$)', path)
+    if path_segments_numeric:
+        signals.add("has_auth_potential")
+
+    biz_impact_paths = (
+        "payment", "billing", "invoice", "checkout", "order",
+        "transaction", "transfer", "payout", "refund", "wallet",
+        "purchase", "subscription", "admin", "internal",
+        "organisation", "organization", "management", "settings",
+        "privacy", "security", "verification",
+    )
+    if any(bp in path for bp in biz_impact_paths):
+        signals.add("has_biz_impact")
+
+    if isinstance(recon_data, dict):
+        discovery_hints = recon_data.get("_discovery_hints", {})
+        if isinstance(discovery_hints, dict):
+            ownership_urls = discovery_hints.get("ownership_urls", [])
+            if isinstance(ownership_urls, list):
+                pattern_match = any(
+                    isinstance(p, str) and re.match(p.replace("{id}", r"\d+").replace("{uuid}", r"[0-9a-f-]+"), url)
+                    for p in ownership_urls
+                )
+                if pattern_match:
+                    signals.add("has_ownership_signal")
+            auth_patterns = discovery_hints.get("auth_patterns", [])
+            if isinstance(auth_patterns, list) and auth_patterns:
+                pattern_match = any(
+                    isinstance(p, str) and re.match(p.replace("{id}", r"\d+").replace("{uuid}", r"[0-9a-f-]+"), url)
+                    for p in auth_patterns
+                )
+                if pattern_match:
+                    signals.add("has_auth_potential")
 
     # ── Technology-aware path signals (auto, never subtractive) ─────────
     tech_data: dict = {}

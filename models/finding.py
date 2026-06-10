@@ -303,6 +303,8 @@ class Finding:
                 self.evidence_strength = evidence_strength_from_score(self.confidence_score).value
             if self.false_positive_risk == "high":
                 self.false_positive_risk = false_positive_risk_from_score(self.confidence_score).value
+        if isinstance(self.evidence, str):
+            self.evidence = [self.evidence] if self.evidence else []
         guard_confidence_invariants(self)
 
     def to_dict(self) -> dict[str, Any]:

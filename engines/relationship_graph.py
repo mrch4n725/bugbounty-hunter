@@ -26,8 +26,12 @@ class RelationshipGraph:
     def get_ownership_boundaries(self) -> dict[str, list[dict]]:
         """Return a map of URL patterns to discovered object IDs.
 
+        Includes ownership hints (e.g. ``owner_id``, ``organization_id``)
+        that imply relationships between resources — these are tagged with
+        ``relationship_type`` for the AuthorizationEngine.
+
         Returns:
-            {url_pattern: [{id_value, id_type, source_url}, ...]}
+            {url_pattern: [{id_value, id_type, source_url, relationship_type?}, ...]}
         """
         boundaries: dict[str, list[dict]] = {}
 
@@ -62,6 +66,37 @@ class RelationshipGraph:
                 "id_value": value,
                 "id_type": "email",
                 "source_url": source,
+            })
+
+        # Ownership hints — infer ownership boundaries from owner references
+        for rec in self._store.get_by_category("ownership_hint"):
+            source = rec.get("source_url", "")
+            pattern = self._url_to_pattern(source)
+            value = rec["value"]
+            extra = rec.get("extra", {})
+            boundaries.setdefault(pattern, []).append({
+                "id_value": value,
+                "id_type": extra.get("hint_type", "owner_reference"),
+                "source_url": source,
+                "relationship_type": "owned_by",
+                "owner_key": extra.get("owner_key", ""),
+            })
+
+        # Ownership relationships — resource + owner + role in one record
+        for rec in self._store.get_by_category("ownership_relationship"):
+            source = rec.get("source_url", "")
+            pattern = self._url_to_pattern(source)
+            extra = rec.get("extra", {})
+            resource_id = extra.get("resource_id", rec["value"])
+            owner_id = extra.get("owner_id", "")
+            relationship = extra.get("relationship", "unknown")
+            boundaries.setdefault(pattern, []).append({
+                "id_value": resource_id,
+                "id_type": "resource",
+                "source_url": source,
+                "relationship_type": relationship,
+                "owner_id": owner_id,
+                "role": extra.get("role", ""),
             })
 
         return boundaries

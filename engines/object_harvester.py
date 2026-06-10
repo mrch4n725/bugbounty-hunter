@@ -3,7 +3,8 @@
 Extracts UUIDs, numeric IDs, emails, JWT tokens, roles, and other objects
 from response text and stores them in the DiscoveryStore for reuse across
 scans (e.g., feeding discovered IDs into IDOR enumeration, roles into
-authorization testing).
+authorization testing). Uses JSON-traversal when possible for nested
+structures, falling back to regex for non-JSON responses.
 """
 
 import json
@@ -30,6 +31,27 @@ PRIVATE_IP_PATTERN = re.compile(r'(?<!\d)(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(
 
 API_KEY_PATTERN = re.compile(r'(?:"(?:api[_-]?key|apikey|secret|token|api_secret|access_token)"\s*:\s*")([A-Za-z0-9_\-]{16,})', re.IGNORECASE)
 
+ID_KEYS = frozenset({
+    "id", "userid", "user_id", "account", "accountid", "account_id",
+    "uid", "org", "orgid", "org_id", "role", "team", "project",
+    "group", "item", "customer", "order", "ticket", "invoice",
+    "product", "document", "file", "ref", "asset",
+})
+
+OWNER_KEYS = frozenset({
+    "owner_id", "ownerid", "user_id", "userid", "organization_id",
+    "organizationid", "org_id", "orgid", "tenant_id", "tenantid",
+    "workspace_id", "workspaceid", "account_id", "accountid",
+    "team_id", "teamid", "group_id", "groupid", "company_id",
+    "companyid", "customer_id", "customerid", "creator_id",
+    "creatorid", "author_id", "authorid", "manager_id", "managerid",
+})
+
+ROLE_KEYS = frozenset({
+    "role", "group", "permission", "access_level", "userrole",
+    "type", "user_type", "member_type", "subscription_tier",
+})
+
 
 class ObjectHarvester:
     """Extract interesting objects from HTTP response text and persist them."""
@@ -45,6 +67,10 @@ class ObjectHarvester:
                 response_headers: dict[str, str] | None = None) -> list[dict]:
         """Scan response text for interesting objects and record them.
 
+        First attempts JSON-traversal for structured extraction, then
+        applies regex patterns as a catch-all for non-JSON responses
+        or unstructured text embedded in responses.
+
         Returns a list of harvested object dicts for immediate use.
         """
         if not response_text:
@@ -52,52 +78,206 @@ class ObjectHarvester:
 
         harvested: list[dict] = []
 
-        # UUIDs
-        for match in UUID_PATTERN.finditer(response_text):
-            val = match.group(0)
-            self._store.record("uuid", val, source_url=url)
-            harvested.append({"category": "uuid", "value": val, "source_url": url})
+        try:
+            parsed = json.loads(response_text)
+            if isinstance(parsed, (dict, list)):
+                json_objects = self._harvest_json(url, parsed)
+                harvested.extend(json_objects)
+        except (json.JSONDecodeError, ValueError):
+            pass
 
-        # Numeric IDs in JSON
-        for match in NUMERIC_ID_PATTERN.finditer(response_text):
-            val = match.group(1)
-            self._store.record("numeric_id", val, source_url=url)
-            harvested.append({"category": "numeric_id", "value": val, "source_url": url})
+        harvested.extend(self._harvest_regex(url, response_text))
 
-        # Emails
-        for match in EMAIL_PATTERN.finditer(response_text):
-            val = match.group(0)
-            self._store.record("email", val, source_url=url)
-            harvested.append({"category": "email", "value": val, "source_url": url})
-
-        # JWT tokens
-        for match in JWT_PATTERN.finditer(response_text):
-            val = match.group(0)
-            self._store.record("jwt", val, source_url=url)
-            harvested.append({"category": "jwt", "value": val, "source_url": url})
-
-        # Roles
-        for match in ROLE_PATTERN.finditer(response_text):
-            val = match.group(1)
-            self._store.record("role", val, source_url=url)
-            harvested.append({"category": "role", "value": val, "source_url": url})
-
-        # Private IPs
-        for match in PRIVATE_IP_PATTERN.finditer(response_text):
-            val = match.group(0)
-            self._store.record("private_ip", val, source_url=url)
-            harvested.append({"category": "private_ip", "value": val, "source_url": url})
-
-        # API keys in JSON responses
-        for match in API_KEY_PATTERN.finditer(response_text):
-            val = match.group(1)
-            self._store.record("api_key", val, source_url=url)
-            harvested.append({"category": "api_key", "value": val, "source_url": url})
-
-        # GraphQL-related patterns in response
         if "__typename" in response_text or '"data"' in response_text[:500]:
             self._store.record("graphql_response", url, source_url=url,
                                extra={"signal": "typename_or_data"})
             harvested.append({"category": "graphql_response", "value": url, "source_url": url})
 
         return harvested
+
+    def _harvest_json(self, url: str, obj: Any, _path: str = "") -> list[dict]:
+        """Recursively traverse a parsed JSON structure, extracting objects.
+
+        Handles nested dicts, lists, and mixed structures. Extracts:
+          - Numeric values at ID-like keys
+          - UUID strings at any key
+          - Email strings at any key
+          - Values at role/permission-like keys
+          - Ownership hints (e.g. ``id`` + ``owner_id`` in same object)
+        """
+        harvested: list[dict] = []
+
+        if isinstance(obj, dict):
+            current_has_id = None
+            current_has_owner = None
+            current_role = None
+
+            for key, value in obj.items():
+                key_lower = key.lower()
+                sub_path = f"{_path}.{key}" if _path else key
+
+                if isinstance(value, (dict, list)):
+                    nested = self._harvest_json(url, value, sub_path)
+                    harvested.extend(nested)
+
+                elif isinstance(value, (int, float)) and value >= 10 and value <= 10**12:
+                    if key_lower in ID_KEYS:
+                        val_str = str(int(value))
+                        self._store.record("numeric_id", val_str, source_url=url,
+                                           extra={"json_path": sub_path})
+                        harvested.append({
+                            "category": "numeric_id", "value": val_str,
+                            "source_url": url, "json_path": sub_path,
+                            "extracted_by": "json_traversal",
+                        })
+                        current_has_id = val_str
+
+                    if key_lower in OWNER_KEYS:
+                        val_str = str(int(value))
+                        self._store.record("ownership_hint", val_str, source_url=url,
+                                           extra={"json_path": sub_path,
+                                                  "hint_type": "owner_reference",
+                                                  "owner_key": key})
+                        harvested.append({
+                            "category": "ownership_hint", "value": val_str,
+                            "source_url": url, "json_path": sub_path,
+                            "hint_type": "owner_reference",
+                        })
+                        current_has_owner = val_str
+
+                elif isinstance(value, str):
+                    if key_lower in OWNER_KEYS:
+                        match = _extract_id_from_str(value)
+                        if match:
+                            self._store.record("ownership_hint", match, source_url=url,
+                                               extra={"json_path": sub_path,
+                                                      "hint_type": "owner_reference",
+                                                      "owner_key": key})
+                            harvested.append({
+                                "category": "ownership_hint", "value": match,
+                                "source_url": url, "json_path": sub_path,
+                                "hint_type": "owner_reference",
+                            })
+                            current_has_owner = match
+
+                    if key_lower in ROLE_KEYS:
+                        self._store.record("role", value, source_url=url,
+                                           extra={"json_path": sub_path})
+                        harvested.append({
+                            "category": "role", "value": value,
+                            "source_url": url, "json_path": sub_path,
+                            "extracted_by": "json_traversal",
+                        })
+                        current_role = value
+
+                    if UUID_PATTERN.fullmatch(value):
+                        self._store.record("uuid", value, source_url=url,
+                                           extra={"json_path": sub_path})
+                        harvested.append({
+                            "category": "uuid", "value": value,
+                            "source_url": url, "json_path": sub_path,
+                            "extracted_by": "json_traversal",
+                        })
+
+                    if "@" in value and "." in value and EMAIL_PATTERN.fullmatch(value):
+                        self._store.record("email", value, source_url=url,
+                                           extra={"json_path": sub_path})
+                        harvested.append({
+                            "category": "email", "value": value,
+                            "source_url": url, "json_path": sub_path,
+                            "extracted_by": "json_traversal",
+                        })
+
+                    if JWT_PATTERN.fullmatch(value):
+                        self._store.record("jwt", value, source_url=url,
+                                           extra={"json_path": sub_path})
+                        harvested.append({
+                            "category": "jwt", "value": value,
+                            "source_url": url, "json_path": sub_path,
+                            "extracted_by": "json_traversal",
+                        })
+
+            if current_has_id and (current_has_owner or current_role):
+                extra: dict[str, Any] = {"resource_id": current_has_id}
+                if current_has_owner:
+                    extra["owner_id"] = current_has_owner
+                    extra["relationship"] = "owned_by"
+                if current_role:
+                    extra["role"] = current_role
+                    extra["relationship"] = extra.get("relationship", "has_role")
+                self._store.record("ownership_relationship", f"{current_has_id}@{url}",
+                                   source_url=url, extra=extra)
+                harvested.append({
+                    "category": "ownership_relationship",
+                    "value": current_has_id,
+                    "source_url": url,
+                    "extra": extra,
+                })
+
+        elif isinstance(obj, list):
+            for idx, item in enumerate(obj):
+                sub_path = f"{_path}[{idx}]"
+                nested = self._harvest_json(url, item, sub_path)
+                harvested.extend(nested)
+
+        return harvested
+
+    def _harvest_regex(self, url: str, response_text: str) -> list[dict]:
+        """Regex-based extraction for non-JSON responses or unstructured text."""
+        harvested: list[dict] = []
+
+        for match in UUID_PATTERN.finditer(response_text):
+            val = match.group(0)
+            self._store.record("uuid", val, source_url=url)
+            harvested.append({"category": "uuid", "value": val, "source_url": url})
+
+        for match in NUMERIC_ID_PATTERN.finditer(response_text):
+            val = match.group(1)
+            self._store.record("numeric_id", val, source_url=url)
+            harvested.append({"category": "numeric_id", "value": val, "source_url": url})
+
+        for match in EMAIL_PATTERN.finditer(response_text):
+            val = match.group(0)
+            self._store.record("email", val, source_url=url)
+            harvested.append({"category": "email", "value": val, "source_url": url})
+
+        for match in JWT_PATTERN.finditer(response_text):
+            val = match.group(0)
+            self._store.record("jwt", val, source_url=url)
+            harvested.append({"category": "jwt", "value": val, "source_url": url})
+
+        for match in ROLE_PATTERN.finditer(response_text):
+            val = match.group(1)
+            self._store.record("role", val, source_url=url)
+            harvested.append({"category": "role", "value": val, "source_url": url})
+
+        for match in PRIVATE_IP_PATTERN.finditer(response_text):
+            val = match.group(0)
+            self._store.record("private_ip", val, source_url=url)
+            harvested.append({"category": "private_ip", "value": val, "source_url": url})
+
+        for match in API_KEY_PATTERN.finditer(response_text):
+            val = match.group(1)
+            self._store.record("api_key", val, source_url=url)
+            harvested.append({"category": "api_key", "value": val, "source_url": url})
+
+        return harvested
+
+
+def _extract_id_from_str(value: str) -> str | None:
+    """Extract a numeric or UUID identifier from a string value.
+
+    Handles string-encoded numbers (``"123"``), UUIDs, and values embedded
+    in URL-like strings (``"/users/123"``). Returns None if no ID found.
+    """
+    if value.isdigit() and len(value) >= 2:
+        return value
+    if UUID_PATTERN.fullmatch(value):
+        return value
+    match = re.search(r'/(\d{2,12})(?:/|$)', value)
+    if match:
+        return match.group(1)
+    match = re.search(r'(\d{2,12})', value)
+    if match:
+        return match.group(1)
+    return None

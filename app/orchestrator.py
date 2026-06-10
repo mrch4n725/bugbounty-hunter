@@ -267,6 +267,27 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
         log(f"[*] HTML comments: extracted {comment_urls_added} URL(s) to scan pool",
             Colors.CYAN, verbose_only=True, verbose=config.get("verbose", False))
 
+    # ── Populate discovery hints from DiscoveryStore for priority scoring ──
+    if container and hasattr(container, 'discovery_store'):
+        try:
+            store = container.discovery_store
+            ownership_urls: list[str] = []
+            for cat in ("ownership_hint", "ownership_relationship"):
+                for rec in store.get_by_category(cat):
+                    src = rec.get("source_url", "")
+                    if src and src not in ownership_urls:
+                        ownership_urls.append(src)
+            if hasattr(container, 'relationship_graph'):
+                graph = container.relationship_graph
+                boundaries = graph.get_ownership_boundaries()
+                for pattern in boundaries:
+                    if pattern not in ownership_urls:
+                        ownership_urls.append(pattern)
+            recon_data.setdefault("_discovery_hints", {})["ownership_urls"] = ownership_urls
+            recon_data.setdefault("_discovery_hints", {})["auth_patterns"] = ownership_urls
+        except Exception:
+            pass
+
     # ── Step 3: Score and sort URLs ──────────────────────────────────────
     urls = recon_data.get("urls", [])
     forms = recon_data.get("forms", [])
@@ -422,12 +443,12 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
             if fp:
                 linked = evidence_engine.get_evidence(fp)
                 if linked:
-                    if isinstance(obj.evidence, str):
-                        obj.evidence = [obj.evidence] if obj.evidence else []
-                    existing_ids = {id(e) for e in (obj.evidence or [])}
+                    obj_evidence = obj.evidence if isinstance(obj.evidence, list) else []
+                    existing_ids = {id(e) for e in obj_evidence}
                     for ev in linked:
                         if id(ev) not in existing_ids:
-                            obj.evidence.append(ev)
+                            obj_evidence.append(ev)
+                    obj.evidence = obj_evidence
         enriched.append(obj)
 
     # ── Semantic response classification (auto PII/credential detection) ──
@@ -490,9 +511,9 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
             for obj in updated:
                 ownership_ev = ownership_validator.validate(obj)
                 if ownership_ev:
-                    if isinstance(obj.evidence, str):
-                        obj.evidence = [obj.evidence] if obj.evidence else []
-                    obj.evidence.append(ownership_ev)
+                    obj_evidence = obj.evidence if isinstance(obj.evidence, list) else []
+                    obj_evidence.append(ownership_ev)
+                    obj.evidence = obj_evidence
                     if evidence_engine is not None:
                         fp = obj.fingerprint or ""
                         if fp:
@@ -509,9 +530,9 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
             for obj in updated:
                 impact_ev = impact_validator.validate(obj)
                 if impact_ev:
-                    if isinstance(obj.evidence, str):
-                        obj.evidence = [obj.evidence] if obj.evidence else []
-                    obj.evidence.append(impact_ev)
+                    obj_evidence = obj.evidence if isinstance(obj.evidence, list) else []
+                    obj_evidence.append(impact_ev)
+                    obj.evidence = obj_evidence
                     if evidence_engine is not None:
                         fp = obj.fingerprint or ""
                         if fp:

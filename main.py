@@ -489,7 +489,85 @@ def _run_recon_if_needed(config: dict, run_recon: bool, container=None):
         print("[!] Scanning unauthenticated. Pass --cookies or --headers for full coverage of authenticated attack surface.")
     log(f"[+] Discovered {len(recon_data.get('urls', []))} URLs, "
         f"{len(recon_data.get('subdomains', []))} subdomains", Colors.GREEN)
+
+    # SPA recon via Playwright (--spa-recon flag)
+    if config.get("spa_recon") and config.get("target"):
+        _run_spa_recon(config, recon_data)
+
     return recon, recon_data
+
+
+def _run_spa_recon(config: dict, recon_data: dict) -> None:
+    """Run headless browser SPA recon to discover JS-rendered routes,
+    XHR/fetch API calls, config objects, and client-side parameters.
+
+    Merges results into recon_data in-place.
+    """
+    try:
+        from modules.recon_spa import HeadlessReconBrowser
+    except ImportError:
+        log("[!] SPA recon unavailable: modules.recon_spa not found", Colors.YELLOW)
+        return
+
+    spa_recon = HeadlessReconBrowser(config)
+    if not spa_recon.start():
+        log("[!] SPA recon unavailable: Playwright not installed or browser failed to launch",
+            Colors.YELLOW)
+        return
+
+    try:
+        target = config["target"]
+        log("[*] Starting SPA spider...", Colors.CYAN)
+
+        spider_results = spa_recon.spa_spider(start_url=target, max_clicks=30, max_depth=2)
+        if spider_results:
+            discovered_urls = spider_results.get("urls", [])
+            discovered_forms = spider_results.get("forms", [])
+            discovered_xhr = spider_results.get("xhr_endpoints", [])
+            config_objects = spider_results.get("config_objects", {})
+
+            added_urls = 0
+            for u in discovered_urls:
+                if u not in recon_data.get("urls", []):
+                    recon_data.setdefault("urls", []).append(u)
+                    added_urls += 1
+            for ep in discovered_xhr:
+                if ep not in recon_data.get("urls", []):
+                    recon_data.setdefault("urls", []).append(ep)
+                    added_urls += 1
+
+            added_forms = 0
+            for f in discovered_forms:
+                if f not in recon_data.get("forms", []):
+                    recon_data.setdefault("forms", []).append(f)
+                    added_forms += 1
+
+            if config_objects:
+                recon_data.setdefault("spa_config", {}).update(config_objects)
+
+            api_endpoints = spider_results.get("api_endpoints", [])
+            for ep in api_endpoints:
+                if ep not in recon_data.get("urls", []):
+                    recon_data.setdefault("urls", []).append(ep)
+                    added_urls += 1
+
+            log(f"[+] SPA recon: {added_urls} URL(s), {added_forms} form(s) discovered",
+                Colors.GREEN)
+
+        spa_framework = spa_recon.detect_frameworks(target)
+        if spa_framework:
+            log(f"[+] SPA framework(s): {', '.join(spa_framework)}", Colors.CYAN)
+            recon_data.setdefault("technology", {}).setdefault("framework", []).extend(spa_framework)
+
+        spa_params = spa_recon.discover_runtime_params(target)
+        if spa_params:
+            log(f"[+] SPA runtime params: {len(spa_params)} discovered", Colors.CYAN,
+                verbose_only=True, verbose=config.get("verbose", False))
+
+    except Exception as e:
+        log(f"[!] SPA recon error: {e}", Colors.YELLOW)
+    finally:
+        spa_recon.close()
 
 
 def _start_autosave(config, recon_data, all_findings, all_findings_lock, js_data=None, container=None):
