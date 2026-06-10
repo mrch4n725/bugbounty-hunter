@@ -51,6 +51,7 @@ It combines multithreaded reconnaissance, intelligence-led module selection, mul
 Key capabilities:
 
 - **27+ scan modules** — XSS (reflected, stored, DOM, DOM fragment, JSON reflection, SVG), SQLi (error, boolean, time, OOB, second-order, header, JSON body), SSTI (polyglot, filter bypass, error fingerprint), SSRF (cloud metadata, redirect DNS, protocol smuggling, DNS timing, OOB), XXE (in-band, error, XInclude, SVG upload, JSON-to-XML, OOB), CMDI (time, OOB, argument injection, Windows), Blind XSS, LFI (path traversal, log poisoning, zip slip, /proc/self), Open Redirect, CSRF, IDOR, GraphQL, API, JWT, CORS, and more
+- **Discovery-first intelligence pipeline** — subdomains auto-injected into scanner URL pool, JS-discovered endpoints fed directly into scan targets, active parameter fuzzing expanded to 200 URLs with query-string support, GraphQL discovery boosted to 21+ endpoints with query-param and WebSocket probing, 401/403 bypass probing with 12 header techniques
 - **Evidence chain** — every finding progresses through Detection → Validation → Exploitation → Verification with confidence scoring
 - **Ownership validation** — cross-user authorization violations confirmed via content-diff comparison, producing `OwnershipEvidence` with identity tracking
 - **Impact validation** — demonstrated vs. theoretical impact distinguished by examining exploitation-proof evidence (browser exec, OOB callbacks, command execution, secret validation)
@@ -75,7 +76,7 @@ The scanner operates in five phases:
 Recon ──▶ Intelligence ──▶ Active Checks ──▶ Verification ──▶ Post-Scan ──▶ Report
 ```
 
-1. **Reconnaissance** — Crawls the target, discovers URLs, forms, and query parameters; performs subdomain discovery; extracts JavaScript bundles and mines them for endpoints and secrets.
+1. **Reconnaissance** — Crawls the target, discovers URLs, forms, and query parameters; performs subdomain discovery (DNS wordlist + crt.sh); extracts JavaScript bundles and mines them for endpoints and secrets. Discovered subdomains and JS endpoints are automatically fed into the scanner URL pool for comprehensive coverage. Active parameter fuzzing probes all discovered endpoints (configurable up to 200 URLs) with multi-signal detection.
 
 2. **Intelligence** — Technology fingerprinting (framework, CMS, language, WAF); JS AST analysis (regex-based with optional esprima); endpoint classification to determine which modules to run per URL.
 
@@ -87,7 +88,7 @@ Recon ──▶ Intelligence ──▶ Active Checks ──▶ Verification ─�
    - **Live secret validation** — AWS keys tested against STS, GitHub tokens against the API, Slack tokens validated by format
    - **Multi-signal analysis** — SQLi requires 2+ independent signals (error, boolean, time, OOB) before Confirmed
 
-5. **Post-Scan** — Findings pass through a pipeline: duplicate risk assessment, CVSS/impact narrative enrichment, pipeline metrics collection (funnel/bottleneck analysis + per-vuln-type detection/validation ratio breakdown), and regression comparison against previous scan outputs.
+5. **Post-Scan** — Findings pass through a pipeline: investigation engine (real HTTP/OOB/browser execution for low-confidence findings), confidence scoring (unified explainable aggregation of evidence quality, ownership, impact, consensus, and investigation depth), impact escalation analysis (per-vuln-type escalation paths for IDOR/SSRF/XSS/SQLi/SSTI/LFI/open_redirect), attack chain correlation, duplicate risk assessment, CVSS/impact narrative enrichment, pipeline metrics collection (funnel/bottleneck analysis + per-vuln-type detection/validation ratio breakdown), outcome feedback tracking, and regression comparison against previous scan outputs.
 
 6. **Validation Maturity** — Reports apply a multi-engine validation pipeline:
    - **OwnershipValidator** — examines authorization comparison evidence to confirm identity-based access violations
@@ -95,6 +96,8 @@ Recon ──▶ Intelligence ──▶ Active Checks ──▶ Verification ─�
    - **EvidenceBundle** — groups evidence by category (technical, validation, ownership, impact) with quality scores
    - **SubmissionReadinessEngine** — overrides mechanical stage-to-state mapping when evidence quality or confidence is insufficient
    - **ValidationConsensusEngine** — aggregates validator opinions into a weighted confidence score with consensus level (strong/moderate/weak)
+   - **ConfidenceEngine** — unified explainable scoring aggregating all signals into a single confidence score with per-factor breakdown
+   - **ImpactEscalationAnalyzer** — per-vuln-type escalation path generation for submission-ready impact proof
 
 ---
 
@@ -341,6 +344,7 @@ module_params:
 | `--auth-header` | — | Auth header for a role in format `role_name:Header:Value` (repeatable). E.g. `--auth-header user_b:'Authorization:Bearer tok_b'` |
 | `--auto` | off | Auto mode: sensible defaults for a quick scan (`rps=3`, `threads=5`, `autosave=60s`, `format=chatgpt`). Single-command convenience — just `python main.py --target https://x.com --auto`. |
 | `--legacy-scanners` | off | Fall back to legacy inline scanner logic in `modules/scanner.py` (not recommended; ScannerBase is the default). |
+| `--disable-engine` | — | Disable specific post-scan engines: `attack_chains`, `investigation`, `impact`, `evidence_quality`, `scan_budget`, `asset_graph`, `promotion`, `replay`, `duplicate_risk`, `consensus`, `metrics`, `confidence`, `impact_escalation` |
 | `--verbose`, `-v` | off | Per-request and per-finding diagnostic output |
 
 ---
@@ -590,18 +594,26 @@ bugbounty-hunter/
 │   ├── finding.py                   # Canonical Finding dataclass (UUIDv7, SHA-256 fingerprints, enums)
 │   ├── evidence.py                  # EvidenceBase + 12 polymorphic subclasses
 │   ├── evidence_bundle.py           # EvidenceBundle with categorization, quality scoring, submission readiness
+│   ├── confidence.py                # ConfidenceFactors, ConfidenceContribution, ConfidenceResult
+│   ├── escalation.py                # EscalationPath, EscalationResult
 │   └── config.py                    # ScanConfig typed dataclass
 ├── engines/
 │   ├── __init__.py
 │   ├── validation_engine.py         # Centralized OOB, browser, timing, secret, auth, GraphQL validation
 │   ├── evidence_engine.py           # Evidence storage, linking, SQLite persistence (WAL + batch inserts), snapshot/restore
 │   ├── evidence_validator.py        # EvidenceCompletenessValidator — penalty for missing required evidence types
+│   ├── evidence_quality.py          # EvidenceQualityEngine — 5-dimension quality assessment (completeness, reproducibility, validation_strength, ownership_proof, impact_proof)
 │   ├── ownership_validator.py       # OwnershipValidator — validates identity-based access violations
 │   ├── impact_validator.py          # ImpactValidator — validates demonstrated vs. theoretical impact
 │   ├── submission_readiness.py      # SubmissionReadinessEngine — evidence-aware stage→state assessment
 │   ├── consensus_engine.py          # ValidationConsensusEngine — pluggable validator consensus scoring
+│   ├── confidence.py                # ConfidenceEngine — unified explainable scoring aggregating all signals
+│   ├── impact_escalation.py         # ImpactEscalationAnalyzer — per-vuln-type escalation maps
+│   ├── investigation.py            # InvestigationEngine — real HTTP/OOB/browser investigation strategies
+│   ├── attack_chain.py             # AttackChainEngine — finding correlation and chain building
+│   ├── outcome_feedback.py          # OutcomeFeedbackEngine — thread-safe JSON Lines outcome tracking
 │   ├── dedup.py                     # Finding deduplication with serialization (to_dict/from_dict) for resume
-│   └── outcome_feedback.py          # Outcome tracking (JSON Lines → thread-safe with Lock)
+│   └── metrics.py                   # MetricsCollector — pipeline funnel metrics, per-vuln-type breakdown
 ├── scanners/
 │   ├── __init__.py
 │   ├── base.py                      # ScannerBase — shared lifecycle (detect/validate/collect/reproduce/confidence)

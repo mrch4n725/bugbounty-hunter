@@ -35,6 +35,20 @@
 - **Submission queue** — Ranked by combined score with severity/confidence/evidence-strength weighting
 - **Audit log** — Per-request CSV audit trail in output directory
 
+### Discovery Effectiveness Overhaul
+
+- **Subdomain-to-scanner pipeline** — Live subdomains from DNS + crt.sh are now auto-injected into scanner URL pool as `https://{sub}` and `http://{sub}`, giving scanners full subdomain attack surface coverage
+- **JS endpoint injection** — Both `main.py` JS intelligence loop and legacy `recon.mine_js_bundles()` path now feed discovered JS endpoints + hidden endpoints into scanner URL pool
+- **Param fuzzing expansion** — Removed 50-path hard cap, removed query-string skip guard, added param appending for URLs with existing query strings, added `max_fuzz_urls` config (default 200)
+- **GQL discovery boost** — Expanded from 9 to 21 static probe paths (Altair, Voyager, Playground, `/api/v3/graphql`), added 6 query-param-based GQL detection paths (`/api?query={__typename}`), added 6 WebSocket GQL subscription endpoints
+- **401/403 bypass probing** — 12 header-based bypass techniques (X-Forwarded-For, X-Original-URL, X-Rewrite-URL, X-Real-IP, etc.) deployed during common path probing
+- **Recon-to-IDOR param pipeline** — `_fuzzed_params` tracking dict added to `Recon` class, returned in `recon_data['fuzzed_params']` for scanner consumption
+- **InvestigationEngine real execution** — All `_execute_task()` branches replaced simulations with real HTTP/OOB/browser/Playwright strategies (XSS, SSRF, SQLi timing, LFI, SSTI, open_redirect, IDOR, replay). `boolean_sqli` remains no-op pending implementation.
+- **ConfidenceEngine** — New unified explainable confidence scoring engine aggregating evidence quality, ownership, impact, consensus, and investigation depth
+- **ImpactEscalationAnalyzer** — Per-vuln-type escalation maps for IDOR, SSRF, XSS, SQLi, SSTI, LFI, open_redirect, and subdomain_takeover
+- **OutcomeFeedbackEngine** — New engine with thread-safe JSON Lines persistence to `outcomes.jsonl`, wired into container and orchestrator post-scan pipeline
+- **EvidenceQualityEngine enhanced** — 5-dimensional assessment (completeness, reproducibility, validation_strength, ownership_proof, impact_proof) with per-dimension assessors
+
 ### Fixes
 
 - Fixed duplicate risk rendering in reports

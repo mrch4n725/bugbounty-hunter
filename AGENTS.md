@@ -74,6 +74,8 @@ models/
                                OOBCallback, AuthorizationComparison, GraphQLSchema, CommandExecution, ResponseDiff,
                                Composite, OwnershipEvidence, ImpactEvidence)
   evidence_bundle.py        — EvidenceBundle: groups evidence by category, computes quality score, submission readiness
+  confidence.py             — ConfidenceFactors, ConfidenceContribution, ConfidenceResult
+  escalation.py             — EscalationPath, EscalationResult
   metrics.py                — PipelineMetrics: total_signals, promoted counts, funnel, bottleneck, detection_coverage, validation_rate
 engines/
   evidence_engine.py        — EvidenceEngine: SHA-256 content-based dedup store(), get_evidence() by finding_id
@@ -81,6 +83,9 @@ engines/
   consensus_engine.py       — ValidationConsensusEngine: pluggable validators, weighted consensus confidence scoring
   ownership_validator.py    — OwnershipValidator: validates ownership claims from AuthorizationComparisonEvidence
   impact_validator.py       — ImpactValidator: validates impact claims from exploitation-proof evidence
+  confidence.py             — ConfidenceEngine: unified explainable scoring aggregating evidence quality + ownership + impact + consensus + investigation
+  impact_escalation.py      — ImpactEscalationAnalyzer: per-vuln-type escalation maps for IDOR/SSRF/XSS/SQLi/SSTI/LFI/open_redirect/subdomain_takeover
+  outcome_feedback.py       — OutcomeFeedbackEngine: thread-safe JSON Lines persistence, historical outcome tracking
   auth_session.py           — AuthSessionManager: OAuth flow, JWT refresh, multi-role sessions, CSRF extraction
   waf_evasion.py            — WafEvasionEngine: WAF fingerprinting, encoding/fragmentation strategy selection
   payload_intelligence.py   — PayloadIntelligenceEngine: effectiveness tracker, per-target context mutation
@@ -266,6 +271,12 @@ Scanners with `validation_rate < 0.5` and `detected >= 2` are flagged for attent
 | `engines/consensus_engine.py`      | Pluggable validator consensus engine | `ValidationConsensusEngine`, `ValidatorVote`, `ConsensusResult` — weighted scoring with 3 built-in validators |
 | `engines/ownership_validator.py`   | Ownership claim validation | `OwnershipValidator` — produces `OwnershipEvidence` from authz comparison |
 | `engines/impact_validator.py`      | Impact claim validation | `ImpactValidator` — produces `ImpactEvidence` from exploitation-proof evidence |
+| `engines/confidence.py`            | Unified explainable confidence scoring | `ConfidenceEngine` — aggregates evidence quality, ownership, impact, consensus, investigation depth into `ConfidenceResult` |
+| `engines/impact_escalation.py`     | Per-vuln-type escalation path analysis | `ImpactEscalationAnalyzer` —ESCALATION_MAP with escalation paths for 7 vulnerability types |
+| `engines/outcome_feedback.py`      | Historical outcome tracking | `OutcomeFeedbackEngine` — JSON Lines persistence, `record_outcome()`, `get_stats()`, `has_positive_outcome()` |
+| `engines/evidence_validator.py`    | Evidence completeness validation | `EvidenceCompletenessValidator` with `CONFIDENCE_PENALTY` (delta subtraction) |
+| `models/confidence.py`            | Confidence data model | `ConfidenceFactors`, `ConfidenceContribution`, `ConfidenceResult` |
+| `models/escalation.py`            | Escalation data model | `EscalationPath`, `EscalationResult` |
 
 ---
 
@@ -456,13 +467,24 @@ Every HTML report includes a `<script type="application/ld+json">` block with al
 | OutcomeEngine lock fix | `engines/outcome_feedback.py` had `self._lock = False` (a boolean). Fixed to `threading.Lock()`. File writes now properly guarded with `with self._lock:`. |
 | Ownership/Impact evidence lost | `OwnershipValidator.validate()` and `ImpactValidator.validate()` return values were discarded in `main.py` (lines 836-848). The evidence objects were never attached to findings. **Fixed**: return values are now captured and appended to `finding.evidence`, then linked via `evidence_engine`. |
 | ReplayEngine no-op | `ReplayEngine.build_bundle()` was never called from `main.py`, so `compare_across_scans()` always found zero bundles and regression detection was a silent no-op. **Fixed**: `build_bundle()` called for each finding before comparison. |
-| InvestigationEngine simulated | `InvestigationEngine._execute_task()` is entirely simulated — every strategy returns hardcoded success. No actual validation is performed. Confidence scores are inflated without real evidence. This is a known limitation; real strategies should replace simulations. |
+| InvestigationEngine real but shallow | `InvestigationEngine._execute_task()` now makes real HTTP requests (redirect follows, OOB callbacks, SSRF internal/cloud probes, SQLi timing/error detection, LFI path-traversal, SSTI template eval, open-redirect Location checks, IDOR probes). However `boolean_sqli` is still a no-op (empty `continue` branch). Confidence boosts remain hardcoded per strategy (not evidence-derived). IDOR investigation only checks `status==200` with no content comparison. |
 | VerificationEngine dead code | `VerificationEngine` was imported and instantiated in `main.py` but `verify_all()` was never called. The instantiation was removed. OOB background poller + scanner-level validation is the current active verification path. |
-| OutcomeFeedbackEngine completely dead | `OutcomeEngine.record_outcome()` is never called — no code path writes to `outcomes.jsonl`. The entire feedback loop is dead code with no integration path. |
-| Container and Engine wiring gaps | 10+ engines in `engines/` are container properties but some are never called from `main.py`: `ValidationConsensusEngine` (consensus result set but never rendered in reports), `DuplicateRiskEngine` (result set on finding but not in report output), `OutcomeFeedbackEngine` (never instantiated). |
+| OutcomeFeedbackEngine created but record_outcome uncalled | `OutcomeFeedbackEngine` is now created and wired into the container (`engines/outcome_feedback.py`). It uses thread-safe JSON Lines persistence to `outcomes.jsonl`. However `record_outcome()` is never called — no code path writes to the file. The engine is initialized but the feedback loop is incomplete. |
+| Container and Engine wiring gaps | Most engines are now wired and called in the pipeline. `ValidationConsensusEngine` (consensus result set on findings but not rendered in reports), `DuplicateRiskEngine` (result set on finding but not in report output), `OutcomeFeedbackEngine` (initialized but `record_outcome()` never called). |
 | signal_count field | `_enrich_finding()` requires explicit `signal_count=` kwarg when called from scanners that report multiple signals. Defaults to 1 if not passed. Always pass the count when merging multiple detection signals into one finding. |
 | Recon-driven param sort | `params.sort(key=...)` in scanner scan() methods sorts params in-place by recon priority. All params are still scanned — priority params go first. The sort is a no-op when recon data is absent. |
 | Per-vuln-type metrics table | Printed after pipeline funnel. `validation_rate` is `validated / detected`. Scanners with rate < 0.5 and detected >= 2 get a `← needs attention` flag. Available via `MetricsCollector.per_vuln_type_table()`. |
+| Subdomains auto-injected into scanner URLs | Live subdomains from DNS + crt.sh are automatically added to `self.urls` as `https://{sub}` + `http://{sub}` in `recon.run()`. No configuration needed. |
+| JS endpoint injection into URL pool | Both `main.py`'s JS intelligence loop and the legacy `recon.mine_js_bundles()` path feed discovered JS endpoints + hidden endpoints into `recon_data["urls"]` for scanner consumption. |
+| Param fuzzing expanded | No hardcoded 50-path cap — uses `max_fuzz_urls` config (default 200). Query-string URLs are no longer skipped — params are appended to existing query strings. Active params tracked in `_fuzzed_params` dict (`url → [param_names]`). |
+| 401/403 bypass probing | `_probe_common_paths()` now probes blocked endpoints with 12 bypass header techniques (X-Forwarded-For, X-Original-URL, X-Rewrite-URL, X-Real-IP, X-ProxyUser-IP, X-Client-IP, Client-IP, X-Auth-Token, Basic auth). |
+| GQL discovery expanded to 21+ paths | GraphQL endpoint discovery probes 21 static paths (was 9), plus 6 query-param paths (`/api?query={__typename}`), plus 6 WebSocket GQL paths. |
+| `fuzzed_params` returned but not consumed | `recon_data['fuzzed_params']` contains a dict of `{url: [param_names]}` but is never read by any scanner. The IDOR scanner does its own param discovery independently. |
+| `html_comments` returned but not consumed | `recon_data['html_comments']` contains raw comments with source URLs but is never read by any downstream module. |
+| `js_endpoints` returns used as boolean only | `recon_data['js_endpoints']` is only consumed by `classify_endpoint()` as a boolean signal (`is_json_api`). The actual endpoint URLs are fed into the URL pool via separate paths. |
+| `authenticated` flag has no behavioral impact | The `recon_data['authenticated']` boolean is printed as a warning but no scanner changes its behavior based on it. |
+| SPA Recon (`HeadlessReconBrowser`) not integrated | 965 lines of SPA analysis (XHR capture, form interaction, runtime params, framework detection) exist in `recon_spa.py` but `HeadlessReconBrowser` is never instantiated in `main.py`. The `--spa-recon` CLI flag exists but connects to nothing. |
+| ConfidenceEngine + ImpactEscalationAnalyzer added | `ConfidenceEngine` in `engines/confidence.py` aggregates evidence quality + ownership + impact + consensus + investigation depth into unified explainable scoring. `ImpactEscalationAnalyzer` in `engines/impact_escalation.py` provides per-vuln-type escalation maps (IDOR/SSRF/XSS/SQLi/SSTI/LFI/open_redirect/subdomain_takeover). Both wired via container. |
 
 ---
 
