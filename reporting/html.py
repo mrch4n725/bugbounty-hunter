@@ -433,6 +433,31 @@ class HTMLReporter(ReporterBase):
         return f'<div class="row"><strong>Structured Impact:</strong> {" | ".join(parts)}</div>'
 
     @staticmethod
+    def _format_duplicate_risk_html(f: Any) -> str:
+        dr = f.get("duplicate_risk", {}) if isinstance(f, dict) else getattr(f, "duplicate_risk", {})
+        if not dr or not isinstance(dr, dict):
+            return ""
+        likelihood = dr.get("likelihood", "")
+        labels = {"potentially_novel": "Potentially Novel", "moderate_risk": "Moderate Risk", "likely_duplicate": "Likely Duplicate"}
+        label = labels.get(likelihood, likelihood.replace("_", " ").title())
+        colors = {"potentially_novel": "#2ecc71", "moderate_risk": "#f39c12", "likely_duplicate": "#e74c3c"}
+        color = colors.get(likelihood, "#95a5a6")
+        return f'<div class="row"><strong>Duplicate Risk:</strong> <span style="color:{color};font-weight:600">{label}</span></div>'
+
+    @staticmethod
+    def _format_consensus_html(f: Any) -> str:
+        cr = f.get("consensus_result", {}) if isinstance(f, dict) else getattr(f, "consensus_result", {})
+        if not cr or not isinstance(cr, dict):
+            return ""
+        level = cr.get("consensus_level", "")
+        score = cr.get("final_score", 0)
+        if not level:
+            return ""
+        colors = {"strong": "#2ecc71", "moderate": "#f39c12", "weak": "#e74c3c", "none": "#95a5a6"}
+        color = colors.get(level, "#95a5a6")
+        return f'<div class="row"><strong>Consensus:</strong> <span style="color:{color};font-weight:600">{level}</span> ({score}/100)</div>'
+
+    @staticmethod
     def _get_confidence_reasons_html(f: Any) -> str:
         reasons = f.get("confidence_reasons")
         if not reasons or not isinstance(reasons, list) or len(reasons) == 0:
@@ -595,6 +620,8 @@ class HTMLReporter(ReporterBase):
                     {steps_html}
                     <div class="row"><strong>FP Risk:</strong> {e_fpr} | {cvss_html}</div>
                     {self._get_confidence_reasons_html(f)}
+                    {self._format_duplicate_risk_html(f)}
+                    {self._format_consensus_html(f)}
                     <div class="row"><strong>Impact:</strong> {e_impact}</div>
                     {self._get_structured_impact_html(f)}
                     <div class="row"><strong>Remediation:</strong> {e_remediation}</div>

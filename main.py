@@ -24,6 +24,7 @@ from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_dom
 from models.finding import Finding
 from app.bootstrap import bootstrap, auto_upgrade_config, print_startup_summary
 from engines.history import correlate_findings
+from app.orchestrator import run_scans
 
 
 def parse_args():
@@ -56,6 +57,8 @@ def parse_args():
         help="Delay between requests in seconds (default: 0.1)")
     parser.add_argument("--oob-host", default=None,
         help="Out-of-band callback host for SSRF and SQLi OOB verification (e.g. Burp Collaborator or interactsh URL)")
+    parser.add_argument("--allow-auto-oob", action="store_true",
+        help="Allow automatic OOB service discovery (contacts dnslog.cn / interactsh at startup). Off by default.")
     parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
     parser.add_argument("--disable-modules", nargs="+",
         choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization", "cors", "jwt", "cms"],
@@ -103,7 +106,7 @@ def parse_args():
     parser.add_argument("--disable-engine", nargs="+", default=[],
         choices=["attack_chains", "investigation", "impact", "evidence_quality",
                  "scan_budget", "asset_graph", "promotion", "replay",
-                 "duplicate_risk", "metrics"],
+                 "duplicate_risk", "consensus", "metrics"],
         help="Disable specific analysis engines")
     parser.add_argument("--rdc-noise", action="store_true",
         help="Reduce attack-chain noise by filtering same-root-cause / low-value chains.")
@@ -141,6 +144,47 @@ def parse_args():
     parser.add_argument("--no-default-creds", action="store_true",
         help="Disable automatic default-credential detection against "
              "discovered login pages (enabled by default).")
+
+    # ── New features (v1.0.0) ────────────────────────────────────────────
+    parser.add_argument("--footprint", choices=["stealth", "normal", "aggressive"], default=None,
+        help="Scan footprint profile: stealth (0.5rps, UA rotation, jitter), normal (default), aggressive (10rps)")
+    parser.add_argument("--spa-recon", action="store_true",
+        help="Enable headless browser SPA recon (Playwright-based XHR/fetch/route capture)")
+    parser.add_argument("--intel-sources", nargs="*", default=[],
+        choices=["shodan", "crtsh", "wayback", "github"],
+        help="External intelligence sources for passive recon (requires API keys configured)")
+    parser.add_argument("--shodan-key",
+        help="Shodan API key for external intelligence gathering")
+    parser.add_argument("--github-token",
+        help="GitHub token for code leak search")
+    parser.add_argument("--waf-evasion", action="store_true",
+        help="Enable WAF fingerprinting and payload evasion (encoding/fragmentation)")
+    parser.add_argument("--smuggling", action="store_true",
+        help="Enable HTTP request smuggling detection (CL.TE, TE.CL, TE.TE)")
+    parser.add_argument("--business-logic", action="store_true",
+        help="Enable business logic flaw testing (workflow bypass, race conditions, price manipulation)")
+    parser.add_argument("--prioritize-submissions", action="store_true",
+        help="Generate submission prioritisation queue (ranked by severity/confidence/evidence/validation-rate)")
+    parser.add_argument("--per-finding-export", action="store_true",
+        help="Export each finding as a standalone HTML page with all evidence")
+    parser.add_argument("--cross-scan-db",
+        help="Path to cross-scan finding database (SQLite) for dedup across runs")
+    parser.add_argument("--scan-id", default=None,
+        help="Unique scan identifier for cross-scan tracking (auto-generated if not set)")
+    parser.add_argument("--webhook-url",
+        help="Slack/Discord webhook URL for real-time finding alerts")
+    parser.add_argument("--webhook-threshold", type=int, default=60,
+        help="Minimum confidence score for webhook alerts (default: 60)")
+    parser.add_argument("--passive-import",
+        help="Path to HAR file or Burp XML export for passive analysis mode (skips active recon)")
+    parser.add_argument("--mobile-import",
+        help="Path to Burp/Charles export for mobile API mode")
+    parser.add_argument("--diff-scan",
+        help="Path to previous scan JSON output for diff/regression comparison")
+    parser.add_argument("--audit-log", action="store_true",
+        help="Enable per-request audit log (CSV) in output directory")
+    parser.add_argument("--payload-db",
+        help="Path to payload intelligence database (JSON)")
     return parser.parse_args()
 
 
@@ -320,6 +364,7 @@ def build_config(args):
         "max_urls": args.max_urls,
         "delay": args.delay,
         "oob_host": args.oob_host,
+        "allow_auto_oob": getattr(args, "allow_auto_oob", False),
         "wordlist": args.wordlist,
         "retries": args.retries,
         "autosave_interval": args.autosave_interval,
@@ -334,6 +379,7 @@ def build_config(args):
         "no_mask_curl": getattr(args, "no_mask_curl", False),
         "no_history": getattr(args, "no_history", False),
         "history_file": getattr(args, "history_file", "scan_history.json"),
+        "passive_import": getattr(args, "passive_import", ""),
         "rps": args.rps,
         "stealth": args.stealth,
         "max_js_files": args.max_js_files,
@@ -473,471 +519,6 @@ def _start_autosave(config, recon_data, all_findings, all_findings_lock, js_data
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
     return stop_event, thread
-
-
-def _run_module_with_timeout(mod_fn, module_timeout):
-    """Run a module function with a wall-clock timeout using a watchdog thread."""
-    result = []
-    exception = []
-    done = threading.Event()
-
-    def worker():
-        try:
-            r = mod_fn()
-            if r is not None:
-                result.extend(r if isinstance(r, list) else [r])
-        except Exception as e:
-            exception.append(e)
-        finally:
-            done.set()
-
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-    if not done.wait(timeout=module_timeout):
-        log(f"  [!] Module timed out after {module_timeout}s — skipping", Colors.RED)
-        return []
-    if exception:
-        raise exception[0]
-    return result
-
-
-def _collect_module_findings(modules, config, run_all, disabled_modules, all_findings, lock, prog=None):
-    module_timeout = int(config.get("module_timeout", 120))
-    total = len(modules)
-    for i, (mod_name, mod_fn) in enumerate(modules.items(), 1):
-        if mod_name in disabled_modules:
-            log(f"[-] Skipping disabled module {mod_name.upper()}", Colors.CYAN)
-            continue
-        if not (run_all or mod_name in config["modules"]):
-            continue
-        if prog:
-            prog.update(f"[{i}/{total}] {mod_name.upper()}...")
-        else:
-            log(f"[{i}/{total}] Running {mod_name.upper()}...", Colors.CYAN)
-        findings = _run_module_with_timeout(mod_fn, module_timeout)
-        if findings:
-            log(f"[!] {len(findings)} finding(s) from {mod_name.upper()}", Colors.RED)
-            with lock:
-                all_findings.extend(findings)
-        else:
-            log(f"[+] {mod_name.upper()} — nothing found", Colors.GREEN)
-    if prog:
-        prog.stop()
-
-
-def _selected_module_names(config: dict, run_all: bool, disabled_modules: set, candidates: list[str]) -> list[str]:
-    selected = []
-    requested = set(config.get("modules", []))
-    for name in candidates:
-        if name in disabled_modules:
-            continue
-        if run_all or name in requested:
-            selected.append(name)
-    return selected
-
-
-def _run_passive_scans(config, recon_data, run_all, disabled_modules, all_findings, lock, container=None):
-    """Run modules that do not send exploit/fuzz payloads.
-
-    Passive mode should still produce useful default reports. Keep this list
-    limited to GET/header/body analysis and already-collected form metadata.
-    """
-    scanner = VulnScanner(config, recon_data, container=container)
-    passive_modules: dict[str, Any] = {
-        "headers": scanner.scan_headers,
-        "clickjacking": scanner.scan_clickjacking,
-        "sensitive": scanner.scan_sensitive_data,
-        "insecure_forms": scanner.scan_insecure_forms,
-    }
-    passive_order = ["headers", "clickjacking", "sensitive", "insecure_forms"]
-    selected = _selected_module_names(config, run_all, disabled_modules, passive_order)
-
-    requested_active = [
-        name for name in config.get("modules", [])
-        if name not in ("all", *passive_order) and name not in disabled_modules
-    ]
-    if requested_active and not run_all:
-        log(
-            f"[-] Passive mode skipped active module(s): {', '.join(requested_active)}",
-            Colors.YELLOW,
-        )
-
-    if not selected:
-        log("[*] Passive mode selected no runnable passive modules.", Colors.YELLOW)
-        return
-
-    total = len(selected)
-    for i, mod_name in enumerate(selected, 1):
-        before = len(scanner._get_findings())
-        log(f"[{i}/{total}] Running {mod_name.upper()}...", Colors.CYAN)
-        try:
-            if mod_name in ("sensitive", "insecure_forms"):
-                passive_modules[mod_name](target_urls=recon_data.get("urls", []))
-            else:
-                passive_modules[mod_name]()
-        except Exception as e:
-            log(f"  [!] {mod_name} error: {e}", Colors.RED, verbose_only=True, verbose=config.get("verbose", False))
-            continue
-
-        after_findings = scanner._get_findings()
-        delta = len(after_findings) - before
-        if delta > 0:
-            log(f"[!] {delta} finding(s) from {mod_name.upper()}", Colors.RED)
-        else:
-            log(f"[+] {mod_name.upper()} — nothing found", Colors.GREEN)
-
-    with lock:
-        all_findings.clear()
-        all_findings.extend(scanner._get_findings())
-
-
-def _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, lock, container=None, capabilities=None):
-    # ── TARGET_LEVEL: modules that run once per target, not per URL ──
-    TARGET_LEVEL: set[str] = {
-        "headers", "dirb", "exposed_files", "clickjacking",
-        "subdomain_takeover", "graphql", "blind_xss", "api", "openapi",
-        "http_methods", "authorization",
-        "cors", "jwt", "cms",
-        "rate_limiting",
-    }
-
-    if config["passive"]:
-        log("[*] Passive mode — skipping active fuzzing.", Colors.YELLOW)
-        _run_passive_scans(config, recon_data, run_all, disabled_modules, all_findings, lock, container=container)
-        return
-
-    scanner = VulnScanner(config, recon_data, container=container)
-    all_findings_local: list[dict] = []
-
-    # ── OOB Background Poller (Phase 3) ───────────────────────────────
-    oob_poller = None
-    if scanner.oob and scanner.oob.oob_host:
-        from engines.oob_poller import OOBBackgroundPoller
-        oob_poller = OOBBackgroundPoller(
-            scanner.oob,
-            scanner._promote_finding_by_oob,
-            interval=config.get("oob_poll_interval", 4.0),
-            max_duration=config.get("oob_poll_max_duration", 300.0),
-            max_polls=config.get("oob_poll_max_polls", 0),
-            initial_interval=config.get("oob_poll_initial_interval", 2.0),
-            max_interval=config.get("oob_poll_max_interval", 30.0),
-        )
-        oob_poller.start()
-        log(f"[*] OOB background poller started (interval={oob_poller.interval}s, max_duration={oob_poller.max_duration}s, max_polls={oob_poller.max_polls})", Colors.CYAN)
-
-    # ── Step 1: Build module map (same keys as original _active_module_map) ──
-    module_map: dict[str, Any] = {
-        "xss": scanner.scan_xss, "sqli": scanner.scan_sqli,
-        "lfi": scanner.scan_lfi, "ssrf": scanner.scan_ssrf,
-        "xxe": scanner.scan_xxe,
-        "ssti": scanner.scan_ssti,
-        "cmd_injection": scanner.scan_command_injection,
-        "blind_xss": scanner.scan_blind_xss,
-        "open_redirect": scanner.scan_open_redirect,
-        "headers": scanner.scan_headers, "csrf": scanner.scan_csrf,
-        "dirb": scanner.scan_directory_fuzz,
-        "sensitive": scanner.scan_sensitive_data,
-        "exposed_files": scanner.scan_exposed_files,
-        "clickjacking": scanner.scan_clickjacking,
-        "http_methods": scanner.scan_http_methods,
-        "insecure_forms": scanner.scan_insecure_forms,
-        "subdomain_takeover": scanner.scan_subdomain_takeover,
-        "graphql": scanner.scan_graphql,
-        "rate_limiting": scanner.scan_rate_limiting,
-        "openapi": scanner.scan_openapi,
-        "cors": scanner.scan_cors,
-        "jwt": scanner.scan_jwt,
-        "cms": scanner.scan_cms_checks,
-    }
-    _api_scanner = ApiScanner(scanner.config, scanner.recon, container=container)
-    module_map["api"] = _api_scanner.run_all
-    module_map["idor"] = scanner.scan_idor
-    module_map["authorization"] = scanner.scan_authorization
-
-    # ── Step 2: Run TARGET_LEVEL modules first ───────────────────────────
-    target_modules = {k: v for k, v in module_map.items() if k in TARGET_LEVEL}
-    from modules.utils import ModuleProgress
-    with ModuleProgress(config, "Running target-level modules") as mp:
-        _collect_module_findings(target_modules, config, run_all, disabled_modules, all_findings_local, lock, prog=mp)
-    config.setdefault("status", {})["modules_completed"] = list(target_modules.keys())
-
-    # ── Step 3: Score and sort URLs ──────────────────────────────────────
-    urls = recon_data.get("urls", [])
-    forms = recon_data.get("forms", [])
-    disabled_engines = config.get("disabled_engines", set())
-    if "scan_budget" not in disabled_engines and container:
-        budget_engine = container.scan_budget_engine if hasattr(container, 'scan_budget_engine') else None
-        if budget_engine:
-            scores = budget_engine.compute_scores(urls)
-            sorted_urls = budget_engine.sorted_urls()
-            top_n = scores[:10]
-            log("\n[*] Top 10 scored endpoints (budget-aware):", Colors.BOLD)
-            for rank, s in enumerate(top_n, 1):
-                log(f"    {rank:>2}. [{s.score:>3}] budget={s.allocated_budget} {s.url}", Colors.CYAN)
-        else:
-            scored = [(compute_endpoint_score(u, forms, recon_data), u) for u in urls]
-            scored.sort(key=lambda x: -x[0])
-            sorted_urls = [u for _, u in scored]
-            top_n = scored[:10]
-            log("\n[*] Top 10 scored endpoints:", Colors.BOLD)
-            for rank, (score, url) in enumerate(top_n, 1):
-                log(f"    {rank:>2}. [{score:>3}] {url}", Colors.CYAN)
-    else:
-        scored = [(compute_endpoint_score(u, forms, recon_data), u) for u in urls]
-        scored.sort(key=lambda x: -x[0])
-        sorted_urls = [u for _, u in scored]
-        top_n = scored[:10]
-        log("\n[*] Top 10 scored endpoints:", Colors.BOLD)
-        for rank, (score, url) in enumerate(top_n, 1):
-            log(f"    {rank:>2}. [{score:>3}] {url}", Colors.CYAN)
-
-    # ── Step 4: Per-URL intelligent module selection ─────────────────────
-    # Data-flow: every VulnScanner scan method writes findings via
-    # self._add() into scanner.dedup.  ApiScanner and IdorScanner write
-    # into their returned list via _append_finding().  The single
-    # authoritative read is scanner._get_findings() (Step 5).  The per-URL
-    # loop intentionally discards return values — all findings reach the
-    # dedup via self._add().  Modules that don't use self._add() are
-    # collected via all_findings_local and merged in Step 5.
-    per_url_modules = {k: v for k, v in module_map.items() if k not in TARGET_LEVEL}
-
-    # Resume support: load completed URLs + dedup state from scan state
-    resume_file = os.path.join(config.get("output_dir", "reports"), ".scan_state.json")
-    completed_urls: set[str] = set()
-    saved_findings: list[dict] = []
-    if config.get("resume"):
-        try:
-            with open(resume_file, "r") as f:
-                state = json.load(f)
-            completed_urls = set(state.get("completed_urls", []))
-            saved_findings = state.get("findings", [])
-            # Restore dedup state if findings were saved
-            if saved_findings and hasattr(scanner, 'dedup'):
-                scanner.dedup = DeduplicationEngine.from_dict(
-                    {f["fingerprint"]: f for f in saved_findings}
-                )
-                log(f"[*] Resume mode: {len(completed_urls)} URLs skipped, {len(saved_findings)} previous findings restored", Colors.CYAN)
-            else:
-                log(f"[*] Resume mode: {len(completed_urls)} URLs already scanned, skipping", Colors.CYAN)
-        except (FileNotFoundError, json.JSONDecodeError):
-            log("[*] No scan state found, starting fresh", Colors.CYAN)
-
-    with ScanProgress(len(sorted_urls), config, "Scanning URLs") as prog:
-        status = config.setdefault("status", {})
-        status["total_urls"] = len(sorted_urls)
-        status["phase"] = "scanning"
-        for idx, url in enumerate(sorted_urls):
-            status["urls_scanned"] = idx + 1
-            status["current_url"] = url
-
-            # Periodic status print (every 25 URLs)
-            if config.get("status_print", False) and idx > 0 and idx % 25 == 0:
-                from modules.utils import log as _log
-                _log(f"[STATUS] {idx}/{len(sorted_urls)} URLs scanned, "
-                     f"{len(all_findings_local)} findings so far", Colors.CYAN)
-
-            # Periodic session health check (every 25 URLs)
-            if idx > 0 and idx % 25 == 0:
-                try:
-                    from modules.utils import check_session_health
-                    check_session_health(scanner.session, config, log)
-                except Exception:
-                    pass
-
-            if url in completed_urls:
-                prog.advance()
-                continue
-
-            applicable = classify_endpoint(url, forms, recon_data)
-            # Respect --modules filter
-            if not run_all:
-                applicable &= set(config["modules"])
-            # Remove disabled modules
-            applicable -= disabled_modules
-            # Keep only modules available in the per-URL map
-            applicable &= per_url_modules.keys()
-
-            if not applicable:
-                completed_urls.add(url)
-                prog.advance(url, len(all_findings_local))
-                continue
-
-            if config.get("verbose", False):
-                log(f"[*] {url} → {len(applicable)} modules selected: {sorted(applicable)}", Colors.YELLOW)
-
-            for mod_name in applicable:
-                try:
-                    mod_fn = per_url_modules[mod_name]
-                    mod_fn(target_urls=[url])  # findings written via self._add() to scanner.dedup
-                except Exception as e:
-                    log(f"  [!] {mod_name} error on {url}: {e}", Colors.RED, verbose_only=True, verbose=config.get("verbose", False))
-
-            completed_urls.add(url)
-            # Persist scan state after each URL
-            try:
-                os.makedirs(os.path.dirname(resume_file), exist_ok=True)
-                state = {
-                    "completed_urls": list(completed_urls),
-                    "target": config.get("target"),
-                    "findings": list(scanner.dedup.to_dict().values()) if hasattr(scanner, 'dedup') else [],
-                }
-                with open(resume_file, "w") as f:
-                    json.dump(state, f)
-            except Exception:
-                pass
-
-            prog.advance(url, len(all_findings_local))
-
-    # ── Step 5: Post-scan triage pipeline ───────────────────────────────
-    # NOTE: _run_reverification_loop() is deprecated — VerificationEngine handles all verification.
-    updated = scanner._get_findings()
-
-    log("[*] Running verification engine...", Colors.CYAN)
-
-    log("[*] Running chain analysis...", Colors.CYAN)
-    updated = VulnScanner.chain_analysis(updated)
-
-    log("[*] Checking self-halting conditions...", Colors.CYAN)
-    updated = VulnScanner.check_self_halt(updated)
-
-    log("[*] Enriching findings with engine evidence...", Colors.CYAN)
-    evidence_engine = getattr(container, 'evidence_engine', None) if container else None
-    enriched: list[Finding] = []
-    for f in updated:
-        obj = f
-        if evidence_engine is not None:
-            fp = obj.fingerprint or obj.get("fingerprint", "")
-            if fp:
-                linked = evidence_engine.get_evidence(fp)
-                if linked:
-                    if isinstance(obj.evidence, str):
-                        obj.evidence = [obj.evidence] if obj.evidence else []
-                    existing_ids = {id(e) for e in (obj.evidence or [])}
-                    for ev in linked:
-                        if id(ev) not in existing_ids:
-                            obj.evidence.append(ev)
-        enriched.append(obj)
-
-    log("[*] Validating evidence completeness...", Colors.CYAN)
-    from engines.evidence_validator import EvidenceCompletenessValidator
-    evidence_validated = []
-    for obj in enriched:
-        evidence_validated.append(EvidenceCompletenessValidator.validate(obj))
-    updated = evidence_validated
-
-    # ── Ownership Validation ──────────────────────────────────────────────
-    if "ownership" not in disabled_engines:
-        try:
-            log("[*] Validating ownership...", Colors.CYAN)
-            from engines.ownership_validator import OwnershipValidator
-            for obj in updated:
-                ownership_ev = OwnershipValidator.validate(obj)
-                if ownership_ev:
-                    if isinstance(obj.evidence, str):
-                        obj.evidence = [obj.evidence] if obj.evidence else []
-                    obj.evidence.append(ownership_ev)
-                    if evidence_engine is not None:
-                        fp = obj.fingerprint or ""
-                        if fp:
-                            evidence_engine.link_to_finding(ownership_ev, fp)
-            log(f"[+] Ownership validated for {len(updated)} findings", Colors.GREEN)
-        except Exception as e:
-            log(f"[!] Ownership validation failed: {e}", Colors.YELLOW)
-
-    # ── Impact Validation ────────────────────────────────────────────────
-    if "impact" not in disabled_engines:
-        try:
-            log("[*] Validating impact...", Colors.CYAN)
-            from engines.impact_validator import ImpactValidator
-            for obj in updated:
-                impact_ev = ImpactValidator.validate(obj)
-                if impact_ev:
-                    if isinstance(obj.evidence, str):
-                        obj.evidence = [obj.evidence] if obj.evidence else []
-                    obj.evidence.append(impact_ev)
-                    if evidence_engine is not None:
-                        fp = obj.fingerprint or ""
-                        if fp:
-                            evidence_engine.link_to_finding(impact_ev, fp)
-            log(f"[+] Impact validated for {len(updated)} findings", Colors.GREEN)
-        except Exception as e:
-            log(f"[!] Impact validation failed: {e}", Colors.YELLOW)
-
-    # ── Evidence Bundle ──────────────────────────────────────────────────
-    log("[*] Building evidence bundles...", Colors.CYAN)
-    from models.evidence_bundle import EvidenceBundle
-    bundle_count = 0
-    for obj in updated:
-        bundle = EvidenceBundle.from_finding(obj)
-        object.__setattr__(obj, "_evidence_bundle", bundle)
-        object.__setattr__(obj, "submission_ready", bundle.submission_ready)
-        object.__setattr__(obj, "evidence_bundle_strength", bundle.overall_strength)
-        object.__setattr__(obj, "evidence_bundle_completeness", bundle.completeness_score)
-        object.__setattr__(obj, "_pipeline_validation_complete", True)
-        bundle_count += 1
-    log(f"[+] Evidence bundles built for {bundle_count} findings", Colors.GREEN)
-
-    # ── Submission Readiness ─────────────────────────────────────────────
-    if "submission_readiness" not in disabled_engines:
-        try:
-            log("[*] Assessing submission readiness...", Colors.CYAN)
-            from engines.submission_readiness import SubmissionReadinessEngine
-            SubmissionReadinessEngine.assess_all(updated)
-            log(f"[+] Submission readiness assessed for {len(updated)} findings", Colors.GREEN)
-        except Exception as e:
-            log(f"[!] Submission readiness assessment failed: {e}", Colors.YELLOW)
-
-    # ── Validation Consensus (opt-in) ────────────────────────────────────
-    if "consensus" not in disabled_engines:
-        try:
-            log("[*] Computing validation consensus...", Colors.CYAN)
-            from engines.consensus_engine import ValidationConsensusEngine
-            consensus_for = 0
-            for obj in updated:
-                result = ValidationConsensusEngine.evaluate(obj)
-                object.__setattr__(obj, "consensus_result", result)
-                if result.consensus_level in ("strong", "moderate"):
-                    consensus_for += 1
-            log(f"[+] Consensus: {consensus_for}/{len(updated)} findings meet threshold",
-                Colors.GREEN)
-        except Exception as e:
-            log(f"[!] Validation consensus failed: {e}", Colors.YELLOW)
-
-    updated = prioritize_findings(updated)
-
-    # Merge TARGET_LEVEL findings (ApiScanner/IdorScanner don't use self._add())
-    # by fingerprint to avoid duplicating VulnScanner entries already in dedup.
-    seen_fingerprints = {f.fingerprint for f in updated if f.fingerprint}
-    seen_urls_types: set[tuple] = {
-        (f.url, f.vuln_type) for f in updated
-    }
-    for f in all_findings_local:
-        fp = f.fingerprint
-        if fp:
-            if fp not in seen_fingerprints:
-                seen_fingerprints.add(fp)
-                updated.append(f)
-        else:
-            key = (f.url, f.vuln_type)
-            if key not in seen_urls_types:
-                seen_urls_types.add(key)
-                updated.append(f)
-
-    with lock:
-        all_findings.clear()
-        all_findings.extend(updated)
-
-    # ── Evidence orphan detection ──
-    if evidence_engine is not None:
-        orphaned = evidence_engine.get_orphaned_evidence()
-        log(f"[*] Evidence engine: {len(orphaned)} orphaned evidence items (not linked to any finding)",
-            Colors.CYAN, verbose_only=True, verbose=config.get("verbose", False))
-
-    if oob_poller:
-        cbs = oob_poller.callback_count
-        oob_poller.stop()
-        reason = oob_poller.termination_reason or "stopped"
-        log(f"[*] OOB background poller stopped: {reason} ({cbs} callback(s))", Colors.CYAN)
 
 
 def _findings_to_finding(config, all_findings, recon_data, js_data):
@@ -1161,9 +742,57 @@ def run(config: dict) -> int:
     all_findings = []
     run_all = "all" in config["modules"]
     disabled_modules = set(config.get("disable_modules", []))
+
+    # ── Passive Import (HAR / Burp XML / Charles) ───────────────────────────
+    passive_import_path = config.get("passive_import", "")
+    if passive_import_path and os.path.isfile(passive_import_path):
+        log(f"[*] Loading passive import: {passive_import_path}", Colors.CYAN)
+        try:
+            ext = os.path.splitext(passive_import_path)[1].lower()
+            from modules.passive_import import BurpXmlImporter, HarImporter, CharlesImporter
+            import_result = None
+            if ext in (".xml",):
+                import_result = BurpXmlImporter.import_xml(passive_import_path)
+            elif ext in (".har", ".har.gz"):
+                import_result = HarImporter.import_har(passive_import_path)
+            elif ext in (".chls", ".chlsj"):
+                import_result = CharlesImporter.import_session(passive_import_path)
+            if import_result:
+                imported = import_result.to_recon_dict()
+                log(f"  [+] Imported {len(imported.get('urls', []))} URLs, "
+                     f"{len(imported.get('forms', []))} forms, "
+                     f"{len(imported.get('parameters', []))} params", Colors.GREEN)
+                # Pre-populate recon_data so recon step can skip active crawling
+                for key, val in imported.items():
+                    if val:
+                        if isinstance(val, list):
+                            existing = set(recon_data.get(key, []))
+                            recon_data[key] = list(existing | set(val))
+                        elif isinstance(val, dict):
+                            recon_data.setdefault(key, {}).update(val)
+                        else:
+                            recon_data.setdefault(key, val)
+        except Exception as e:
+            log(f"[!] Passive import failed: {e}", Colors.YELLOW)
+
     recon, recon_data = _run_recon_if_needed(
         config, _should_run_recon(config, run_all, disabled_modules), container=container
     )
+
+    # ── External Intelligence Gathering (after recon, enriches recon_data) ──
+    if not config.get("passive", False) and container and hasattr(container, 'external_intel'):
+        try:
+            log("[*] Gathering external intelligence...", Colors.CYAN)
+            intel_data = container.external_intel.gather(config["target"], config)
+            if intel_data:
+                for key in ("subdomains", "urls", "js_urls"):
+                    existing = set(recon_data.get(key, []))
+                    new = set(intel_data.get(key, []))
+                    if new:
+                        recon_data[key] = list(existing | new)
+                        log(f"  [+] {len(new)} additional {key} from external intel", Colors.GREEN)
+        except Exception as e:
+            log(f"[!] External intelligence failed: {e}", Colors.YELLOW)
 
     # ── Auto default-credential detection (after recon, before scans) ──
     # Enabled by default; opt out with --no-default-creds.
@@ -1339,11 +968,11 @@ def run(config: dict) -> int:
         config, recon_data, all_findings, all_findings_lock, js_data=js_data, container=container
     )
     try:
-        _run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, all_findings_lock, container=container, capabilities=capabilities)
+        run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, all_findings_lock, container=container, capabilities=capabilities)
     except KeyboardInterrupt:
         log("\n[!] Scan interrupted — saving partial report...", Colors.YELLOW)
 
-    # Merge JS secret findings AFTER _run_scans (so they appear after scanner findings)
+    # Merge JS secret findings AFTER run_scans (so they appear after scanner findings)
     all_findings.extend(js_findings)
 
     # ── Convert to Finding instances for engine processing ───────────────

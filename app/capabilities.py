@@ -225,12 +225,13 @@ class CapabilityRegistry:
         host = self.config.get("oob_host", "") or ""
         if host:
             return True, host
-        available = self._detect_oob_services()
-        if available:
-            host = available[0]
-            self._oob_auto_host = host
-            self.config["oob_host"] = host
-            return True, f"auto:{host}"
+        if self.config.get("allow_auto_oob", False):
+            available = self._detect_oob_services()
+            if available:
+                host = available[0]
+                self._oob_auto_host = host
+                self.config["oob_host"] = host
+                return True, f"auto:{host}"
         return False, "configure --oob-host to enable"
 
     def _detect_oob_services(self) -> list[str]:

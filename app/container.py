@@ -14,6 +14,14 @@ from engines.ownership_validator import OwnershipValidator
 from engines.impact_validator import ImpactValidator
 from engines.submission_readiness import SubmissionReadinessEngine
 from engines.consensus_engine import ValidationConsensusEngine
+from engines.auth_session import AuthSessionManager
+from engines.waf_evasion import WafEvasionEngine
+from engines.payload_intelligence import PayloadIntelligenceEngine
+from engines.semantic_analyzer import SemanticResponseAnalyzer
+from engines.audit_log import AuditLogger
+from engines.footprint import FootprintManager
+from engines.cross_scan_dedup import CrossScanDatabase
+from modules.external_intel import ExternalIntelligenceGatherer
 from modules.utils import BrowserValidator, OOBDetectionFramework
 
 from app.capabilities import CapabilityRegistry
@@ -50,6 +58,14 @@ class ApplicationContainer:
         self._impact_validator: ImpactValidator | None = None
         self._submission_readiness_engine: SubmissionReadinessEngine | None = None
         self._validation_consensus_engine: ValidationConsensusEngine | None = None
+        self._auth_session_manager: AuthSessionManager | None = None
+        self._waf_evasion_engine: WafEvasionEngine | None = None
+        self._payload_intelligence: PayloadIntelligenceEngine | None = None
+        self._semantic_analyzer: SemanticResponseAnalyzer | None = None
+        self._audit_logger: AuditLogger | None = None
+        self._footprint_manager: FootprintManager | None = None
+        self._external_intel: ExternalIntelligenceGatherer | None = None
+        self._cross_scan_db: CrossScanDatabase | None = None
 
     # ── Service accessors (lazy, cached) ─────────────────────────────────
 
@@ -167,6 +183,58 @@ class ApplicationContainer:
         if self._validation_consensus_engine is None:
             self._validation_consensus_engine = ValidationConsensusEngine()
         return self._validation_consensus_engine
+
+    # ── New engine accessors ─────────────────────────────────────────────
+
+    @property
+    def auth_session_manager(self) -> AuthSessionManager:
+        if self._auth_session_manager is None:
+            self._auth_session_manager = AuthSessionManager(self.config)
+        return self._auth_session_manager
+
+    @property
+    def waf_evasion_engine(self) -> WafEvasionEngine:
+        if self._waf_evasion_engine is None:
+            self._waf_evasion_engine = WafEvasionEngine(self.config)
+        return self._waf_evasion_engine
+
+    @property
+    def payload_intelligence(self) -> PayloadIntelligenceEngine:
+        if self._payload_intelligence is None:
+            self._payload_intelligence = PayloadIntelligenceEngine(self.config)
+        return self._payload_intelligence
+
+    @property
+    def semantic_analyzer(self) -> SemanticResponseAnalyzer:
+        if self._semantic_analyzer is None:
+            self._semantic_analyzer = SemanticResponseAnalyzer()
+        return self._semantic_analyzer
+
+    @property
+    def audit_logger(self) -> AuditLogger:
+        if self._audit_logger is None:
+            self._audit_logger = AuditLogger(self.config.get("output", "reports"))
+        return self._audit_logger
+
+    @property
+    def footprint_manager(self) -> FootprintManager:
+        if self._footprint_manager is None:
+            self._footprint_manager = FootprintManager(self.config)
+        return self._footprint_manager
+
+    @property
+    def external_intel(self) -> ExternalIntelligenceGatherer:
+        if self._external_intel is None:
+            self._external_intel = ExternalIntelligenceGatherer(self.config)
+        return self._external_intel
+
+    @property
+    def cross_scan_database(self) -> CrossScanDatabase | None:
+        if self._cross_scan_db is None:
+            db_path = self.config.get("cross_scan_db_path")
+            if db_path:
+                self._cross_scan_db = CrossScanDatabase(db_path)
+        return self._cross_scan_db
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 

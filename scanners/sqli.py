@@ -691,7 +691,7 @@ class SQLiScanner(ScannerBase):
                         request_str=_build_curl("POST", url, dict(self.session.headers), data=payload, cookies=safe_cookies_dict(self.session.cookies)),
                         response_excerpt_str=resp.text[:500] if resp else "")
                     if f:
-                        self._enrich_finding(f, 0, f["verification_stage"])
+                        self._enrich_finding(f, 0, f["verification_stage"], signal_count=1)
                         self._add_finding(f)
                 break
 
@@ -709,7 +709,7 @@ class SQLiScanner(ScannerBase):
                             request_str=_build_curl("POST", url, dict(self.session.headers), data=post_data, cookies=safe_cookies_dict(self.session.cookies)),
                             response_excerpt_str=resp.text[:500] if resp else "")
                         if f:
-                            self._enrich_finding(f, 0, f["verification_stage"])
+                            self._enrich_finding(f, 0, f["verification_stage"], signal_count=1)
                             self._add_finding(f)
                         break
             else:

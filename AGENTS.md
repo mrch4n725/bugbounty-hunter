@@ -36,8 +36,12 @@ modules/
   idor.py                   — IdorScanner (multiple inheritance: ScannerModuleBase, VulnScanner), param-based IDOR
   scanner_base.py           — ScannerModuleBase: shared utility methods for ApiScanner/IdorScanner
   recon.py                  — Reconnaissance, crawling, subdomain discovery, JS analysis
+  recon_spa.py              — HeadlessReconBrowser: Playwright-based SPA spidering, XHR/fetch capture, runtime params
+  external_intel.py         — ExternalIntelligenceGatherer: Shodan, crt.sh, Wayback Machine, GitHub leak search
+  passive_import.py          — BurpXmlImporter, HarImporter, CharlesImporter: passive analysis from proxy exports
+  mobile_import.py          — MobileApiImporter: Burp/Charles import for mobile API testing
 scanners/
-  __init__.py               — Exports: all 25 ScannerBase subclasses, discover_scanner_classes()
+  __init__.py               — Exports: all ScannerBase subclasses, discover_scanner_classes()
   base.py                   — ScannerBase with 5-phase lifecycle + finalize() returning list[dict]
   xss.py                    — XSSScanner: reflected, stored, DOM, form, DOM fragment, JSON reflection, SVG XSS
   headers.py                — HeadersScanner: security header audit
@@ -60,6 +64,9 @@ scanners/
   command_injection.py      — CommandInjectionScanner: time/OOB-based, argument injection, Windows CMDI
   graphql.py                — GraphQLScanner: introspection, batching, query depth, auth
   idor.py                   — IdorScannerAdapter: wraps modules.idor.IdorScanner.run_all()
+  tech_specific.py          — TechSpecificScannerRegistry: framework-specific probes (WP, Spring, Rails, Laravel, GQL)
+  smuggling.py              — RequestSmugglingScanner: CL.TE, TE.CL, TE.TE, HTTP/2 downgrade
+  business_logic.py         — BusinessLogicScanner: workflow bypass, race conditions, price manipulation
 models/
   config.py                 — ScanConfig dataclass with use_new_scanners: bool
   finding.py                — Finding class with dict-compat shim, strict __getitem__, content-fingerprinted to_dict()
@@ -67,17 +74,32 @@ models/
                                OOBCallback, AuthorizationComparison, GraphQLSchema, CommandExecution, ResponseDiff,
                                Composite, OwnershipEvidence, ImpactEvidence)
   evidence_bundle.py        — EvidenceBundle: groups evidence by category, computes quality score, submission readiness
+  metrics.py                — PipelineMetrics: total_signals, promoted counts, funnel, bottleneck, detection_coverage, validation_rate
 engines/
   evidence_engine.py        — EvidenceEngine: SHA-256 content-based dedup store(), get_evidence() by finding_id
   submission_readiness.py   — SubmissionReadinessEngine: overrides mechanical from_verification_stage() with evidence-aware assessment
   consensus_engine.py       — ValidationConsensusEngine: pluggable validators, weighted consensus confidence scoring
   ownership_validator.py    — OwnershipValidator: validates ownership claims from AuthorizationComparisonEvidence
   impact_validator.py       — ImpactValidator: validates impact claims from exploitation-proof evidence
+  auth_session.py           — AuthSessionManager: OAuth flow, JWT refresh, multi-role sessions, CSRF extraction
+  waf_evasion.py            — WafEvasionEngine: WAF fingerprinting, encoding/fragmentation strategy selection
+  payload_intelligence.py   — PayloadIntelligenceEngine: effectiveness tracker, per-target context mutation
+  semantic_analyzer.py      — SemanticResponseAnalyzer: PII/financial/credential detection, IDOR response comparison
+  diff.py                   — ScanDiffEngine: JSON scan comparison, GitHub Actions annotations
+  webhook.py                — WebhookNotifier: Slack/Discord posting for high-confidence findings
+  audit_log.py              — AuditLogger: per-request CSV audit trail
+  footprint.py              — FootprintManager: stealth/normal/aggressive profiles, UA rotation, request signing
+  cross_scan_dedup.py       — CrossScanDatabase: SQLite-backed finding persistence across scans, regression detection
 reporting/
   base.py                   — ReporterBase, assess_finding_impact, group_by_root_cause
   html.py                   — HTMLReporter: type-specific evidence rendering (collapsible, thumbnails, side-by-side)
   json_report.py            — JSONReporter
   txt.py                    — TXTReporter
+  prioritization.py         — SubmissionPrioritizer: ranked submission queue by severity/confidence/evidence/validation-rate
+  per_finding.py            — PerFindingExporter: standalone per-finding HTML export with all evidence
+version.py                  — __version__ = "1.0.0"
+CHANGELOG.md                — Release history
+```
   markdown.py               — MarkdownReporter
   hackerone.py              — HackerOneReporter: type-specific evidence blocks
   bugcrowd.py               — BugcrowdReporter: type-specific evidence blocks

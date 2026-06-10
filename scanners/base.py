@@ -77,6 +77,15 @@ class ScannerBase:
         self.verbose = config.get("verbose", False)
         self.session = make_session(config)
         self.base_url = config.get("target", "").rstrip("/")
+        # ── Footprint profile (stealth/normal/aggressive) ─────────────────
+        if self.container and hasattr(self.container, 'footprint_manager'):
+            try:
+                from urllib.parse import urlparse
+                domain = urlparse(self.base_url).netloc.split(":")[0]
+                profile = self.container.footprint_manager.get_profile()
+                self.container.footprint_manager.apply_to_session(self.session, profile, domain)
+            except Exception:
+                pass
 
         self._lock = threading.Lock()
         self.dedup = DeduplicationEngine()
@@ -236,6 +245,7 @@ class ScannerBase:
             os.path.dirname(os.path.dirname(__file__)), "payloads", f"{payload_type}.yaml"
         )
         list_types = {"lfi", "ssrf"}
+        result: Any = self._payload_fallback(payload_type)
         try:
             with open(yaml_path, "r") as f:
                 loaded = yaml.safe_load(f)
@@ -247,12 +257,42 @@ class ScannerBase:
                         if isinstance(cat, list):
                             flat.extend(cat)
                     if flat:
-                        return flat
-                if isinstance(raw, (dict, list)):
-                    return raw
+                        result = flat
+                elif isinstance(raw, (dict, list)):
+                    result = raw
         except (FileNotFoundError, yaml.YAMLError):
             pass
-        return self._payload_fallback(payload_type)
+        # ── Payload Intelligence: reorder by effectiveness ──────────────
+        if self.container and hasattr(self.container, 'payload_intelligence'):
+            try:
+                tech = self.config.get("technology", {})
+                tech_stack = str(tech.get("primary", "")) if isinstance(tech, dict) else ""
+                pi = self.container.payload_intelligence
+                if isinstance(result, list):
+                    ordered = pi.get_ordered_payloads(payload_type, tech_stack, all_payloads=result)
+                    if ordered:
+                        seen = set(ordered)
+                        result = ordered + [p for p in result if p not in seen]
+                elif isinstance(result, dict):
+                    all_items: list[str] = []
+                    for cat_list in result.values():
+                        if isinstance(cat_list, list):
+                            all_items.extend(cat_list)
+                    if all_items:
+                        ordered = pi.get_ordered_payloads(payload_type, tech_stack, all_payloads=all_items)
+                        if ordered:
+                            seen = set(ordered)
+                            ordered_list = ordered + [p for p in all_items if p not in seen]
+                            idx = 0
+                            for key in result:
+                                sub = result[key]
+                                if isinstance(sub, list):
+                                    n = len(sub)
+                                    result[key] = ordered_list[idx:idx + n]
+                                    idx += n
+            except Exception:
+                pass
+        return result
 
     def _payload_fallback(self, payload_type: str) -> Any:
         fallbacks = {
@@ -311,7 +351,7 @@ class ScannerBase:
     def _add_capability_confidence_reasons(self, f: Finding) -> None:
         add_capability_confidence_reasons(f)
 
-    def _enrich_finding(self, f, evidence_count: int, verification_stage_value: str) -> None:
+    def _enrich_finding(self, f, evidence_count: int, verification_stage_value: str, signal_count: int = 0) -> None:
         from models.finding import VerificationStage, EvidenceStrength
         stage_enum = VerificationStage(verification_stage_value)
         signal_map = {
@@ -320,7 +360,7 @@ class ScannerBase:
             VerificationStage.EXPLOITABLE: 3,
             VerificationStage.VERIFIED: 3,
         }
-        signals = signal_map.get(stage_enum, 1)
+        signals = signal_count if signal_count > 0 else signal_map.get(stage_enum, 1)
         if self.SCANNER_MATURITY >= 4:
             fp_risk = "LOW"
         elif self.SCANNER_MATURITY == 3:
@@ -368,6 +408,25 @@ class ScannerBase:
                 Colors.RED if sev in ("CRITICAL", "HIGH") else Colors.YELLOW)
 
             link_finding_evidence(f, self.evidence_engine)
+
+            # ── Record payload effectiveness ─────────────────────────
+            if self.container and hasattr(self.container, 'payload_intelligence'):
+                try:
+                    payload = f.get("payload", "") or f.get("request", "")[:100]
+                    tech = self.config.get("technology", {})
+                    tech_stack = str(tech.get("primary", "")) if isinstance(tech, dict) else ""
+                    waf = str(tech.get("waf", [None])[0]) if isinstance(tech, dict) and tech.get("waf") else None
+                    self.container.payload_intelligence.record_payload(
+                        payload=payload,
+                        payload_type=f.vuln_type.lower(),
+                        tech_stack=tech_stack or None,
+                        waf_name=waf,
+                        triggered=True,
+                        response_time=0.0,
+                        target_url=f.url,
+                    )
+                except Exception:
+                    pass
 
             # ── Replay snapshot capture ──────────────────────────────
             if self.container and hasattr(self.container, 'replay_engine'):

@@ -26,6 +26,15 @@ from engines.submission_readiness import SubmissionReadinessEngine
 from engines.consensus_engine import ValidationConsensusEngine
 from engines.ownership_validator import OwnershipValidator
 from engines.impact_validator import ImpactValidator
+from engines.auth_session import AuthSessionManager
+from engines.waf_evasion import WafEvasionEngine, WafFingerprint, WAFDetector
+from engines.payload_intelligence import PayloadIntelligenceEngine
+from engines.semantic_analyzer import SemanticResponseAnalyzer, ClassificationResult
+from engines.diff import ScanDiffEngine
+from engines.webhook import WebhookNotifier
+from engines.audit_log import AuditLogger
+from engines.footprint import FootprintManager, FootprintProfile
+from engines.cross_scan_dedup import CrossScanDatabase
 
 __all__ = [
     "ValidationEngine",
@@ -58,4 +67,17 @@ __all__ = [
     "ValidationConsensusEngine",
     "OwnershipValidator",
     "ImpactValidator",
+    "AuthSessionManager",
+    "WafEvasionEngine",
+    "WafFingerprint",
+    "WAFDetector",
+    "PayloadIntelligenceEngine",
+    "SemanticResponseAnalyzer",
+    "ClassificationResult",
+    "ScanDiffEngine",
+    "WebhookNotifier",
+    "AuditLogger",
+    "FootprintManager",
+    "FootprintProfile",
+    "CrossScanDatabase",
 ]

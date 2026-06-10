@@ -27,7 +27,7 @@ from modules.utils import (
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 from models.finding import Finding
 from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs
 
 XXE_PAYLOADS = {
     "in_band": [
@@ -440,7 +440,7 @@ class XXEScanner(ScannerBase):
                     f["signal_count"] = signal_count
                     for ev in evidence_list:
                         self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
-                    self._enrich_finding(f, len(evidence_list), f["verification_stage"])
+                    self._enrich_finding(f, len(evidence_list), f["verification_stage"], signal_count=signal_count)
                     self._add_finding(f)
                 log(f"  [XXE{' Error' if is_error else ''} {label}] {url}", Colors.RED, verbose_only=True, verbose=self.verbose)
 
@@ -487,7 +487,7 @@ class XXEScanner(ScannerBase):
                 f["signal_count"] = 2
                 self.evidence_engine.store(ev)
                 self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
-                self._enrich_finding(f, 1, f["verification_stage"])
+                self._enrich_finding(f, 1, f["verification_stage"], signal_count=2)
                 self._add_finding(f)
                 extra.append(f)
             log(f"  [XXE OOB] {url_str}", Colors.RED, verbose_only=True, verbose=self.verbose)

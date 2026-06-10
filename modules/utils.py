@@ -1708,6 +1708,21 @@ def make_session(config: Dict[str, Any]) -> requests.Session:
     return session
 
 
+def _audit_log_result(t0: float, url: str, method: str, status: int,
+                      config: dict | None = None,
+                      result: object = None) -> object:
+    """Log request to audit_logger (if configured) and return *result*."""
+    if config:
+        auditor = config.get("_audit_logger")
+        if auditor is not None:
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            try:
+                auditor.log_request(method, url, {}, status, elapsed_ms)
+            except Exception:
+                pass
+    return result
+
+
 def safe_get(
     session: requests.Session,
     url: str,
@@ -1718,10 +1733,15 @@ def safe_get(
     **kwargs,
 ) -> Optional[requests.Response]:
     """HTTP GET with logging on failure and scope-checked redirects."""
+    _t0 = time.monotonic()
+    _resp: Optional[requests.Response] = None
+    _status: int = 0
     try:
         response = session.get(
             url, timeout=timeout, allow_redirects=allow_redirects, **kwargs
         )
+        _resp = response
+        _status = response.status_code if response is not None else 0
         # Check redirect targets against scope
         if config and allow_redirects and response.history:
             enforcer = config.get("scope_enforcer")
@@ -1731,32 +1751,37 @@ def safe_get(
                         redirect_target = resp.headers["Location"]
                         if not redirect_target.startswith("/") and not enforcer.check_url(redirect_target):
                             log(f"[!] Redirect to out-of-scope URL blocked: {redirect_target}", Colors.YELLOW)
-                            return None
+                            return _audit_log_result(_t0, url, "GET", _status, config)
                         if redirect_target.startswith("/"):
                             from urllib.parse import urljoin
                             redirect_target = urljoin(url, redirect_target)
                             if not enforcer.check_url(redirect_target):
                                 log(f"[!] Redirect to out-of-scope URL blocked: {redirect_target}", Colors.YELLOW)
-                                return None
+                                return _audit_log_result(_t0, url, "GET", _status, config)
         if raise_for_status:
             response.raise_for_status()
-        return response
     except requests.exceptions.Timeout:
         log(f"[!] Timeout accessing {url}", Colors.YELLOW)
-        return None
+        _resp = None
+        _status = 0
     except requests.exceptions.ConnectionError:
         log(f"[!] Connection error accessing {url}", Colors.YELLOW)
-        return None
+        _resp = None
+        _status = 0
     except requests.exceptions.HTTPError as e:
         status = e.response.status_code if e.response is not None else "?"
         log(f"[!] HTTP error accessing {url}: {status}", Colors.YELLOW)
-        return None
+        _resp = None
+        _status = status if isinstance(status, int) else 0
     except requests.exceptions.RequestException as e:
         log(f"[!] Request error accessing {url}: {e}", Colors.YELLOW)
-        return None
+        _resp = None
+        _status = 0
     except Exception as e:
         log(f"[!] Unexpected error accessing {url}: {e}", Colors.RED)
-        return None
+        _resp = None
+        _status = 0
+    return _audit_log_result(_t0, url, "GET", _status, config, _resp)
 
 
 def safe_post(
@@ -1770,10 +1795,15 @@ def safe_post(
     **kwargs,
 ) -> Optional[requests.Response]:
     """HTTP POST with logging on failure and scope-checked redirects."""
+    _t0 = time.monotonic()
+    _resp: Optional[requests.Response] = None
+    _status: int = 0
     try:
         response = session.post(
             url, data=data, timeout=timeout, allow_redirects=allow_redirects, **kwargs
         )
+        _resp = response
+        _status = response.status_code if response is not None else 0
         # Check redirect targets against scope
         if config and allow_redirects and response.history:
             enforcer = config.get("scope_enforcer")
@@ -1783,32 +1813,37 @@ def safe_post(
                         redirect_target = resp.headers["Location"]
                         if not redirect_target.startswith("/") and not enforcer.check_url(redirect_target):
                             log(f"[!] Redirect to out-of-scope URL blocked: {redirect_target}", Colors.YELLOW)
-                            return None
+                            return _audit_log_result(_t0, url, "POST", _status, config)
                         if redirect_target.startswith("/"):
                             from urllib.parse import urljoin
                             redirect_target = urljoin(url, redirect_target)
                             if not enforcer.check_url(redirect_target):
                                 log(f"[!] Redirect to out-of-scope URL blocked: {redirect_target}", Colors.YELLOW)
-                                return None
+                                return _audit_log_result(_t0, url, "POST", _status, config)
         if raise_for_status:
             response.raise_for_status()
-        return response
     except requests.exceptions.Timeout:
         log(f"[!] Timeout posting to {url}", Colors.YELLOW)
-        return None
+        _resp = None
+        _status = 0
     except requests.exceptions.ConnectionError:
         log(f"[!] Connection error posting to {url}", Colors.YELLOW)
-        return None
+        _resp = None
+        _status = 0
     except requests.exceptions.HTTPError as e:
         status = e.response.status_code if e.response is not None else "?"
         log(f"[!] HTTP error posting to {url}: {status}", Colors.YELLOW)
-        return None
+        _resp = None
+        _status = status if isinstance(status, int) else 0
     except requests.exceptions.RequestException as e:
         log(f"[!] Request error posting to {url}: {e}", Colors.YELLOW)
-        return None
+        _resp = None
+        _status = 0
     except Exception as e:
         log(f"[!] Unexpected error posting to {url}: {e}", Colors.RED)
-        return None
+        _resp = None
+        _status = 0
+    return _audit_log_result(_t0, url, "POST", _status, config, _resp)
 
 
 def normalize_url(base_url: str, relative: str) -> str:
@@ -2090,6 +2125,26 @@ def classify_endpoint(
     if has_cmd:
         modules.update({"cmd_injection", "ssrf"})
 
+    # ── Technology-based ADDITIVE module routing ─────────────────────────
+    # Reads detected technology from recon_data and adds extra per-URL
+    # modules that are relevant to the known tech stack. This NEVER removes
+    # modules — it enables additional specialized probes on top of defaults.
+    tech_data = recon_data.get("technology", {})
+    if isinstance(tech_data, dict):
+        for category in ("cms", "framework", "language"):
+            detected = tech_data.get(category, [])
+            if isinstance(detected, list):
+                for tech in detected:
+                    extra = TECH_MODULE_MAP.get(tech.lower(), set())
+                    if extra:
+                        modules.update(extra)
+        # Also check for GraphQL via path signal (already in TECH_MODULE_MAP
+        # but added here for completeness when tech data has it as framework)
+        detected_frameworks = tech_data.get("framework", [])
+        if isinstance(detected_frameworks, list):
+            if any("graphql" in fw.lower() for fw in detected_frameworks):
+                modules.add("graphql")
+
     return modules
 
 
@@ -2211,6 +2266,22 @@ _CLASSIFY_ALWAYS: set[str] = {
     "cors", "jwt", "rate_limiting",
 }
 
+# ── Technology → Extra per-URL modules (additive, never subtractive) ─────
+# These modules run IN ADDITION to the modules selected by URL/param signals.
+# Each framework gets specialized probes that only make sense when that
+# technology is detected on the target.
+TECH_MODULE_MAP: dict[str, set[str]] = {
+    "wordpress": set(),
+    "drupal": set(),
+    "joomla": set(),
+    "spring": set(),
+    "rails": set(),
+    "laravel": set(),
+    "django": set(),
+    "express": set(),
+    "graphql": {"graphql"},
+    "asp.net": set(),
+}
 
 # ── Role-based session helpers (Phase 5: Authorization) ──────────────────
 

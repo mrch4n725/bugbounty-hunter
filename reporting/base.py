@@ -531,7 +531,7 @@ class ReporterBase:
                      'component', 'request_response', 'what_is_it', 'grouped_urls',
                      'business_impact', 'demonstrated_impact', 'historical',
                      'replay_bundle', 'chains', 'chain_impact', 'duplicate_risk',
-                     'finding_state', 'confidence_reasons'):
+                     'consensus_result', 'finding_state', 'confidence_reasons'):
             if hasattr(f, attr):
                 val = getattr(f, attr)
                 if val is not None and val != "":
@@ -694,6 +694,32 @@ class ReporterBase:
         if ia.get("demonstrated_impact"):
             parts.append(f"Demonstrated: {ia['demonstrated_impact']}")
         return " | ".join(parts)
+
+    @staticmethod
+    @staticmethod
+    def _format_duplicate_risk(f: Any) -> str:
+        dr = f.get("duplicate_risk", {}) if isinstance(f, dict) else getattr(f, "duplicate_risk", {})
+        if not dr or not isinstance(dr, dict):
+            return ""
+        likelihood = dr.get("likelihood", "")
+        labels = {
+            "potentially_novel": "Potentially Novel",
+            "moderate_risk": "Moderate Risk",
+            "likely_duplicate": "Likely Duplicate",
+        }
+        label = labels.get(likelihood, likelihood.replace("_", " ").title())
+        return f"Duplicate Risk: {label}"
+
+    @staticmethod
+    def _format_consensus(f: Any) -> str:
+        cr = f.get("consensus_result", {}) if isinstance(f, dict) else getattr(f, "consensus_result", {})
+        if not cr or not isinstance(cr, dict):
+            return ""
+        level = cr.get("consensus_level", "")
+        score = cr.get("final_score", "")
+        if not level:
+            return ""
+        return f"Consensus: {level} ({score}/100)"
 
     @staticmethod
     def _validate_screenshot_path(path: str) -> bool:

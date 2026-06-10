@@ -188,6 +188,8 @@ class HackerOneReporter(ReporterBase):
 **Confidence Reasons:** {self._get_confidence_reasons_h1(f) or '—'}
 **Submission Ready:** {'✅ YES' if f.get('submission_ready', False) else '—'}
 **Evidence Bundle:** {f.get('evidence_bundle_strength', '—').replace('_', ' ').title() or '—'}
+**Duplicate Risk:** {ReporterBase._format_duplicate_risk(f) or '—'}
+**Consensus:** {ReporterBase._format_consensus(f) or '—'}
 
 #### Summary
 {what}

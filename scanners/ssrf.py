@@ -523,7 +523,7 @@ class SSRFScanner(ScannerBase):
                                 signal_count = 2
                             if oob_host and self.validation:
                                 signal_count = 3
-                            self._enrich_finding(f, signal_count, f["verification_stage"])
+                            self._enrich_finding(f, len(evidence_list), f["verification_stage"], signal_count=signal_count)
                             if self._add_finding(f):
                                 fingerprint = f.get("fingerprint", "")
                                 if fingerprint and self.evidence_engine is not None:
@@ -569,7 +569,7 @@ class SSRFScanner(ScannerBase):
                 ],
             )
             if f:
-                self._enrich_finding(f, 2, f["verification_stage"])
+                self._enrich_finding(f, 1, f["verification_stage"], signal_count=2)
                 if self._add_finding(f):
                     fingerprint = f.get("fingerprint", "")
                     if fingerprint and self.evidence_engine is not None:

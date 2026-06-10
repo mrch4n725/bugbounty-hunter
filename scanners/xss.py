@@ -474,7 +474,7 @@ class XSSScanner(ScannerBase):
                                 self.evidence_engine.store(ev)
                                 self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
                             signal_stage = VerificationStage.VALIDATED.value if confirmed else VerificationStage.DETECTED.value
-                            self._enrich_finding(f, len(ev_list), signal_stage)
+                            self._enrich_finding(f, len(ev_list), signal_stage, signal_count=2 if confirmed else 1)
                             self._add_finding(f)
                         break
             except Exception as e:
@@ -541,7 +541,8 @@ class XSSScanner(ScannerBase):
                         signal_stage = f["verification_stage"]
                         if detection.context == "json_reflection" and confirmed:
                             signal_stage = VerificationStage.VALIDATED.value
-                        self._enrich_finding(f, len(evidence), signal_stage)
+                        signal_count = 2 if confirmed else 1
+                        self._enrich_finding(f, len(evidence), signal_stage, signal_count=signal_count)
                         self._add_finding(f)
             except Exception as e:
                 log(f"  [XSS] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)

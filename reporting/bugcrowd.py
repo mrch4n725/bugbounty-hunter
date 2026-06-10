@@ -169,6 +169,8 @@ class BugcrowdReporter(ReporterBase):
 | Parameter | `{f.get('parameter', '—')}` |
 | False Positive Risk | {f.get('false_positive_risk', '—')} |
 | Confidence Reasons | {self._get_confidence_reasons_bc(f) or '—'} |
+| Duplicate Risk | {ReporterBase._format_duplicate_risk(f) or '—'} |
+| Consensus | {ReporterBase._format_consensus(f) or '—'} |
 | Submission Ready | {'✅ YES' if f.get('submission_ready', False) else '—'} |
 | Evidence Bundle | {f.get('evidence_bundle_strength', '—').replace('_', ' ').title() or '—'} |
 

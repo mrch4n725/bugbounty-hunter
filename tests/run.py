@@ -58,6 +58,8 @@ def section(title: str) -> None:
 section("1. Core Imports")
 import main
 from modules import utils, scanner, reporter, api_scanner, idor
+from app import orchestrator
+from app.orchestrator import _run_passive_scans
 check("All five modules import cleanly", True)
 
 from modules.utils import (
@@ -611,6 +613,7 @@ check("authorization disable flag parsed",
 section("19. Passive Scan Dispatch")
 
 _orig_main_vuln_scanner = main.VulnScanner
+_orig_orch_vuln_scanner = orchestrator.VulnScanner
 created_scanners = []
 
 class FakePassiveScanner:
@@ -642,6 +645,7 @@ class FakePassiveScanner:
 
 try:
     main.VulnScanner = FakePassiveScanner
+    orchestrator.VulnScanner = FakePassiveScanner
     passive_config = {
         "target": "https://ex.com",
         "modules": ["all"],
@@ -649,7 +653,7 @@ try:
     }
     passive_findings = []
     passive_lock = threading.Lock()
-    main._run_passive_scans(
+    _run_passive_scans(
         passive_config,
         {"urls": ["https://ex.com"], "forms": []},
         run_all=True,
@@ -663,7 +667,7 @@ try:
 
     created_scanners.clear()
     selected_findings = []
-    main._run_passive_scans(
+    _run_passive_scans(
         {"target": "https://ex.com", "modules": ["headers", "xss"], "verbose": False},
         {"urls": ["https://ex.com"], "forms": []},
         run_all=False,
@@ -675,6 +679,7 @@ try:
           created_scanners[-1].calls == ["headers"])
 finally:
     main.VulnScanner = _orig_main_vuln_scanner
+    orchestrator.VulnScanner = _orig_orch_vuln_scanner
 
 # ═══════════════════════════════════════════════════════════
 # Scanner maturity levels

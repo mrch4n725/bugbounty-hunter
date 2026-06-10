@@ -89,6 +89,8 @@ class TXTReporter(ReporterBase):
                     f'    CVSS        : {cvss_score:.1f} ({cvss_rating})',
                     f'    FP Risk     : {fpr or "—"}',
                     f'    Confidence R: {self._get_confidence_reasons_txt(f)}',
+                    f'    Duplicate   : {ReporterBase._format_duplicate_risk(f) or "—"}',
+                    f'    Consensus   : {ReporterBase._format_consensus(f) or "—"}',
                     f'    URL         : {f.get("url", "N/A")}',
                     f'    Parameter   : {f.get("parameter", "N/A")}',
                     f'    Details     : {f.get("details", "N/A")}',

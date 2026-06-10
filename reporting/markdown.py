@@ -90,6 +90,8 @@ class MarkdownReporter(ReporterBase):
 **Evidence Strength:** {evidence_strength or '—'}
 **False Positive Risk:** {fpr or '—'}
 **Confidence Reasons:** {self._get_confidence_reasons_md(finding) or '—'}
+**Duplicate Risk:** {ReporterBase._format_duplicate_risk(finding) or '—'}
+**Consensus:** {ReporterBase._format_consensus(finding) or '—'}
 
 ---
 

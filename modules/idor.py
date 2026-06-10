@@ -364,7 +364,7 @@ class IdorScanner(ScannerModuleBase):
                 and len(resp.text) > 300
                 and abs(len(resp.text) - baseline_len) < 5000
                 and resp.text != baseline.text):
-            self._append_finding(findings, finding(
+            f = finding(
                 "IDOR - Insecure Direct Object Reference",
                 test_url, "critical",
                 f"Parameter '{param}' changed from {original_val} to {new_val} "
@@ -378,7 +378,23 @@ class IdorScanner(ScannerModuleBase):
                     f"Send GET request to {test_url} with parameter '{param}'={new_val}",
                     "Observe that the endpoint returns accessible content, indicating an insecure direct object reference",
                 ],
-            ))
+            )
+            # ── Semantic response analysis ──────────────────────────────────────
+            if self.container and hasattr(self.container, 'semantic_analyzer'):
+                try:
+                    sa = self.container.semantic_analyzer
+                    analysis = sa.analyze_idor_pair(
+                        original_response=baseline.text,
+                        target_response=resp.text,
+                    )
+                    if analysis.get("idor_detected") or analysis.get("patterns_found"):
+                        if isinstance(f, dict):
+                            f["_semantic_analysis"] = analysis
+                        else:
+                            object.__setattr__(f, "_semantic_analysis", analysis)
+                except Exception:
+                    pass
+            self._append_finding(findings, f)
             log(f"  [IDOR Seq] {test_url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
 
     def _test_form_field(self, findings: list[dict], c: dict,
@@ -403,7 +419,7 @@ class IdorScanner(ScannerModuleBase):
             resp = safe_get(self.session, test_url, self.timeout, raise_for_status=False)
 
         if resp and resp.status_code == 200 and len(resp.text) > 300:
-            self._append_finding(findings, finding(
+            f = finding(
                 "IDOR - Insecure Direct Object Reference",
                 action, "critical",
                 f"Form field '{field_name}' changed from {original_val} to {new_val} "
@@ -417,7 +433,20 @@ class IdorScanner(ScannerModuleBase):
                     f"Submit {method} request to {action} with form field '{field_name}'={new_val}",
                     "Observe that the endpoint returns accessible content, indicating an insecure direct object reference",
                 ],
-            ))
+            )
+            # ── Semantic response analysis ──────────────────────────────────
+            if self.container and hasattr(self.container, 'semantic_analyzer'):
+                try:
+                    sa = self.container.semantic_analyzer
+                    result = sa.classify_response(resp.text, url=action)
+                    if result and result.matched_patterns:
+                        if isinstance(f, dict):
+                            f["_semantic_analysis"] = result
+                        else:
+                            object.__setattr__(f, "_semantic_analysis", result)
+                except Exception:
+                    pass
+            self._append_finding(findings, f)
             log(f"  [IDOR Form] {action[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
 
     # ── Encoded ID manipulation (base64 / JWT) ────────────────────────────
