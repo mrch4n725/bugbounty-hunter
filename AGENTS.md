@@ -8,6 +8,14 @@ This document is written for AI coding agents and human contributors. It capture
 
 BugBounty Hunter is a **high-discovery vulnerability scanner with first-class validation and evidence generation**. It does not choose between being a scanner or a reporting platform — it is both. The project aims to discover the maximum number of real vulnerabilities while automatically validating, documenting, and packaging findings into high-quality reports suitable for rapid triage and responsible disclosure.
 
+### Detection-first philosophy
+
+The scanner prioritizes detection coverage above all else. Every vulnerability class has multiple independent detection signals that fire on different attack vectors. Validation, exploitation, and verification deepen confidence on top of the detection layer. This means:
+
+- **All parameters are scanned** regardless of recon signals — recon-driven targeting reorders, never excludes
+- **FP hardening pre-checks** run before probe dispatch to avoid wasted requests (baseline reflection checks, platform detection, parameter name gates)
+- **Signal counting** tracks how many independent signals contributed to each finding; `signal_count` is stored on the finding for downstream metrics
+
 Findings progress through stages:
 
 ```
@@ -16,7 +24,7 @@ Detected → Validated → Exploitable → Verified
 
 Each finding carries a confidence score (0–100), evidence strength (Weak/Moderate/Strong/Verified), false-positive risk, CVSS-like severity, and full reproduction steps.
 
-### Entry point
+### Data flow
 
 ```
 main.py                     — CLI arg parsing, orchestration, autosave, --dry-run, --resume, --legacy-scanners
@@ -31,25 +39,25 @@ modules/
 scanners/
   __init__.py               — Exports: all 25 ScannerBase subclasses, discover_scanner_classes()
   base.py                   — ScannerBase with 5-phase lifecycle + finalize() returning list[dict]
-  xss.py                    — XSSScanner: reflected, stored, DOM, form XSS
+  xss.py                    — XSSScanner: reflected, stored, DOM, form, DOM fragment, JSON reflection, SVG XSS
   headers.py                — HeadersScanner: security header audit
-  sqli.py                   — SQLiScanner: error-based, boolean, time-based, OOB
-  ssrf.py                   — SSRFScanner: cloud metadata + OOB callback confirmation
+  sqli.py                   — SQLiScanner: error-based, boolean, time-based, OOB, second-order, header, JSON body
+  ssrf.py                   — SSRFScanner: cloud metadata + OOB callback, redirect DNS, protocol smuggling, DNS timing
   clickjacking.py           — ClickjackingScanner: framing protection (X-Frame-Options/CSP)
   csrf.py                   — CSRFScanner: anti-CSRF token validation
   insecure_forms.py         — InsecureFormsScanner: form action/transport security
   http_methods.py           — HttpMethodsScanner: HTTP method override/fuzzing
-  lfi.py                    — LFIScanner: path traversal detection with inject_param
+  lfi.py                    — LFIScanner: path traversal, log poisoning, zip slip, /proc/self
   open_redirect.py          — OpenRedirectScanner: open redirect with inject_param
   exposed_files.py          — ExposedFilesScanner: common sensitive path probing
   directory_fuzz.py         — DirectoryFuzzScanner: directory enumeration
   subdomain_takeover.py     — SubdomainTakeoverScanner: CNAME-based takeover checks
   sensitive_data.py         — SensitiveDataScanner: secret/key pattern scanning
-  ssti.py                   — SSTIScanner: template injection via inject_param
+  ssti.py                   — SSTIScanner: template injection, polyglot, filter bypass, error fingerprint
   rate_limiting.py          — RateLimitingScanner: burst detection with TimingEvidence
   blind_xss.py              — BlindXSSScanner: OOB-based blind XSS
-  xxe.py                    — XXEScanner: error/OOB-based XXE
-  command_injection.py      — CommandInjectionScanner: time/OOB-based CMDI
+  xxe.py                    — XXEScanner: error/OOB-based, XInclude, SVG upload, JSON-to-XML
+  command_injection.py      — CommandInjectionScanner: time/OOB-based, argument injection, Windows CMDI
   graphql.py                — GraphQLScanner: introspection, batching, query depth, auth
   idor.py                   — IdorScannerAdapter: wraps modules.idor.IdorScanner.run_all()
 models/
@@ -158,6 +166,54 @@ All outbound HTTP uses `safe_get()` / `safe_post()` from `utils.py`. These enfor
 
 HTML reports use `html.escape()` on every user-provided field at render time. Copy buttons use `data-copy` attributes with a single delegated `document.addEventListener` listener — no `onclick=` attributes on individual elements.
 
+### 2j. FP hardening pre-checks
+
+Every new detection signal is paired with a pre-check gate that runs before the probe is dispatched:
+
+- **Baseline reflection checks**: Send the payload to a param-free URL first; if it reflects, skip the probe (prevents false positives from global reflection)
+- **Platform detection**: Check server banner, cookies, or known endpoints before dispatching platform-specific probes (e.g., Windows-only CMDI payloads skip on Linux servers)
+- **Parameter name gates**: Skip probes on params that can't possibly accept the payload type (e.g., numeric-only IDs for SSTI)
+
+These pre-checks prevent wasted HTTP requests and false-positive inflation.
+
+### 2k. Signal counting
+
+`signal_count` tracks how many independent detection signals contributed to a finding. It is passed explicitly to `_enrich_finding()` and stored on the finding object. This enables downstream metrics like detection/validation ratio and coverage analysis.
+
+Signal count rules:
+- XSS: reflected + DOM fragment + JSON reflection + SVG = up to 4
+- SQLi: error + boolean + time + OOB + second-order + header + JSON body = up to 7
+- SSRF: cloud metadata + redirect + protocol smuggling + DNS timing + OOB = up to 5
+- CMDI: time + OOB + argument injection + Windows = up to 4
+- XXE: in-band + error + XInclude + SVG + JSON-to-XML + OOB = up to 6
+
+### 2l. Recon-driven parameter targeting
+
+All parameters are scanned — recon signals only REORDER, never exclude. Targeting prioritizes:
+
+| Scanner | Recon signal used | Priority params |
+|---|---|---|
+| XSS | JS endpoint context from `js_endpoints` and `js_urls` | Params referenced in JS files first |
+| SQLi | RESTful path patterns + baseline timings | Numeric/ID params, slow-query params first |
+| SSRF | URL-like param values from original query string | Params with `://` values, then name-matched |
+| CMDI | Tool/file-path keyword matching | `cmd`, `exec`, `run`, `shell`, `file`, `path` etc. |
+| XXE | XML endpoint detection + param name matching | `.xml`/`.soap` URLs, `xml`/`data`-named params |
+| LFI | File-path keyword matching | `file`, `path`, `read`, `include`, `page` etc. |
+| SSTI | Template-context keyword matching | `name`, `message`, `content`, `template`, `view` etc. |
+
+### 2m. Per-vuln-type metrics breakdown
+
+Post-scan, the `MetricsCollector` produces a per-vuln-type table (printed after pipeline funnel):
+
+```
+Vuln Type       Detected  Validated  Rate      Status
+──────────────── ────────  ─────────  ─────     ────────────
+xss             12        8          0.67      ✓
+sqli            5         1          0.20      ← needs attention
+```
+
+Scanners with `validation_rate < 0.5` and `detected >= 2` are flagged for attention. This highlights modules where detection outpaces validation (high FP or low confidence).
+
 ---
 
 ## 3. Key Files
@@ -173,10 +229,10 @@ HTML reports use `html.escape()` on every user-provided field at render time. Co
 | `modules/idor.py` | Parameter-based IDOR detection with AuthorizationComparisonEvidence | `IdorScanner(ScannerModuleBase)` with ownership validation (`verify_ownership()`), role sessions |
 | `modules/recon.py` | Crawling, subdomain discovery, JS analysis | Recon class |
 | `scanners/base.py` | ScannerBase 5-phase lifecycle | `ScannerBase` (init → prepare → scan → finalize → findings) |
-| `scanners/xss.py` | XSS detection via ScannerBase | `XSSScanner(ScannerBase)`: reflected, stored, DOM, form |
+| `scanners/xss.py` | XSS detection via ScannerBase | `XSSScanner(ScannerBase)`: reflected, stored, DOM, form, DOM fragment, JSON reflection, SVG XSS |
 | `scanners/headers.py` | Security header audit via ScannerBase | `HeadersScanner(ScannerBase)` |
-| `scanners/sqli.py` | SQLi detection via ScannerBase | `SQLiScanner(ScannerBase)`: error, boolean, time, OOB |
-| `scanners/ssrf.py` | SSRF detection via ScannerBase | `SSRFScanner(ScannerBase)`: cloud metadata + OOB |
+| `scanners/sqli.py` | SQLi detection via ScannerBase | `SQLiScanner(ScannerBase)`: error, boolean, time, OOB, second-order, header, JSON body |
+| `scanners/ssrf.py` | SSRF detection via ScannerBase | `SSRFScanner(ScannerBase)`: cloud metadata + OOB, redirect DNS, protocol smuggling, DNS timing |
 | `models/config.py` | ScanConfig dataclass | `ScanConfig` with `use_new_scanners: bool = True` |
 | `models/finding.py` | Finding class with dict-compat shim | `Finding` with strict `__getitem__`, content-fingerprinted `to_dict()` |
 | `models/evidence.py` | Evidence type hierarchy (12 subclasses) | `EvidenceBase`, `HttpRequestEvidence`, `BrowserExecutionEvidence`, `ScreenshotEvidence`, `TimingEvidence`, `OOBCallbackEvidence`, `AuthorizationComparisonEvidence`, `GraphQLSchemaEvidence`, `CommandExecutionEvidence`, `ResponseDiffEvidence`, `CompositeEvidence`, `OwnershipEvidence`, `ImpactEvidence` |
@@ -382,6 +438,9 @@ Every HTML report includes a `<script type="application/ld+json">` block with al
 | VerificationEngine dead code | `VerificationEngine` was imported and instantiated in `main.py` but `verify_all()` was never called. The instantiation was removed. OOB background poller + scanner-level validation is the current active verification path. |
 | OutcomeFeedbackEngine completely dead | `OutcomeEngine.record_outcome()` is never called — no code path writes to `outcomes.jsonl`. The entire feedback loop is dead code with no integration path. |
 | Container and Engine wiring gaps | 10+ engines in `engines/` are container properties but some are never called from `main.py`: `ValidationConsensusEngine` (consensus result set but never rendered in reports), `DuplicateRiskEngine` (result set on finding but not in report output), `OutcomeFeedbackEngine` (never instantiated). |
+| signal_count field | `_enrich_finding()` requires explicit `signal_count=` kwarg when called from scanners that report multiple signals. Defaults to 1 if not passed. Always pass the count when merging multiple detection signals into one finding. |
+| Recon-driven param sort | `params.sort(key=...)` in scanner scan() methods sorts params in-place by recon priority. All params are still scanned — priority params go first. The sort is a no-op when recon data is absent. |
+| Per-vuln-type metrics table | Printed after pipeline funnel. `validation_rate` is `validated / detected`. Scanners with rate < 0.5 and detected >= 2 get a `← needs attention` flag. Available via `MetricsCollector.per_vuln_type_table()`. |
 
 ---
 

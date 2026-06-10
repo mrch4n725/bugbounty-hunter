@@ -26,6 +26,13 @@ from modules.utils import (
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
+POLYGLOT_PROBES = ["{{7*'7'}}${7*7}#{7*7}*{7*7}"]
+BYPASS_PAYLOADS = [
+    '{%raw%}{{7*7}}{%endraw%}',
+    '{{ [].class.base.subclasses() }}',
+    '｛｛7*7｝｝',
+]
+
 SSTI_PAYLOADS = {
     "arithmetic": [
         "{{7*7}}", "{{7+7}}", "{{7-7}}",
@@ -96,10 +103,50 @@ class SSTIScanner(ScannerBase):
                 return True
         return False
 
+    def _error_fingerprint(self, url: str, parameter: str) -> str | None:
+        test_url = self._inject_param(url, parameter, "{{")
+        resp = safe_get(self.session, test_url, self.timeout)
+        if not resp:
+            return None
+        body = resp.text
+        if "jinja2.exceptions" in body:
+            return "jinja2"
+        if "freemarker.core" in body:
+            return "freemarker"
+        if "org.thymeleaf" in body:
+            return "thymeleaf"
+        if "velocity.app" in body:
+            return "velocity"
+        return None
+
     def detect(self, url: str, parameter: str) -> DetectionResult | None:
         if self._has_pre_existing_result(url, parameter):
             return None
+        engine_from_error = self._error_fingerprint(url, parameter)
+        if engine_from_error:
+            self._detected_engine = engine_from_error
+        test_value = "__SSTI_REFLECT_TEST__"
+        reflect_url = self._inject_param(url, parameter, test_value)
+        reflect_resp = safe_get(self.session, reflect_url, self.timeout)
+        reflects_content = reflect_resp and test_value in reflect_resp.text
+        if reflects_content:
+            for payload in POLYGLOT_PROBES:
+                test_url = self._inject_param(url, parameter, payload)
+                resp = safe_get(self.session, test_url, self.timeout)
+                if resp:
+                    body = resp.text
+                    if "7777777" in body or "49" in body:
+                        second = "{{7*'7'}}${7*7}"
+                        second_url = self._inject_param(url, parameter, second)
+                        second_resp = safe_get(self.session, second_url, self.timeout)
+                        second_confirmed = second_resp and ("7777777" in second_resp.text or "49" in second_resp.text)
+                        signals = ["Polyglot detection"]
+                        if second_confirmed:
+                            signals.append("Dual arithmetic confirmed")
+                            return DetectionResult(url=test_url, parameter=parameter, payload=payload, context="polyglot_dual", raw_response=resp, evidence_signals=signals)
+                        return DetectionResult(url=test_url, parameter=parameter, payload=payload, context="polyglot", raw_response=resp, evidence_signals=signals)
         payloads = SSTI_PAYLOADS
+        standard_sent_no_eval = False
         for payload in payloads.get("arithmetic", []):
             test_url = self._inject_param(url, parameter, payload)
             resp = safe_get(self.session, test_url, self.timeout)
@@ -108,6 +155,8 @@ class SSTIScanner(ScannerBase):
             body = resp.text
             arithmetic_possible = any(e in body for e in ["49", "14"])
             raw_payload_absent = payload not in body
+            if payload == "{{7*7}}" and not arithmetic_possible:
+                standard_sent_no_eval = True
             if arithmetic_possible and raw_payload_absent:
                 second_payload = "{{7-7}}" if "7*7" in payload else "{{7+7}}"
                 if payload.count("*") > 0:
@@ -152,6 +201,35 @@ class SSTIScanner(ScannerBase):
                     raw_response=resp,
                     evidence_signals=["Template syntax reflected"],
                 )
+        if standard_sent_no_eval:
+            for payload in BYPASS_PAYLOADS:
+                test_url = self._inject_param(url, parameter, payload)
+                resp = safe_get(self.session, test_url, self.timeout)
+                if resp and "49" in resp.text:
+                    second = "{{7-7}}"
+                    second_url = self._inject_param(url, parameter, second)
+                    second_resp = safe_get(self.session, second_url, self.timeout)
+                    second_confirmed = second_resp and "0" in second_resp.text and "{{7-7}}" not in second_resp.text
+                    signals = ["Filter bypass SSTI"]
+                    if second_confirmed:
+                        signals.append("Dual arithmetic confirmed")
+                    return DetectionResult(
+                        url=test_url,
+                        parameter=parameter,
+                        payload=payload,
+                        context="bypass",
+                        raw_response=resp,
+                        evidence_signals=signals,
+                    )
+        if engine_from_error:
+            return DetectionResult(
+                url=url,
+                parameter=parameter,
+                payload="{{",
+                context="error_fingerprint",
+                raw_response=None,
+                evidence_signals=[f"Engine identified from error: {engine_from_error}"],
+            )
         return None
 
     def validate(self, detection: DetectionResult) -> dict | None:
@@ -261,12 +339,14 @@ class SSTIScanner(ScannerBase):
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
+        template_params = {"template", "name", "message", "content", "body", "title", "subject", "text", "input", "value", "data", "html", "page", "view"}
         for url in urls:
             if not self._in_scope(url):
                 continue
             try:
                 parsed = urlparse(url)
                 params = list(parse_qs(parsed.query).keys())
+                params.sort(key=lambda p: 0 if p.lower() in template_params else 1)
                 for param in params:
                     detection = self.detect(url, param)
                     if detection is None:
@@ -274,7 +354,7 @@ class SSTIScanner(ScannerBase):
                     validation = self.validate(detection)
                     exploitation = self.exploit(detection, validation)
 
-                    has_arithmetic = detection.context == "arithmetic"
+                    has_arithmetic = detection.context in ("arithmetic", "polyglot_dual", "bypass")
                     confirmed_engine = validation and validation.get("confirmed")
                     read_proof = exploitation.get("confirmed")
 

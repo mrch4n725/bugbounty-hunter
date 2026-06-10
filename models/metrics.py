@@ -11,6 +11,8 @@ class PipelineMetrics:
     submission_ready: int = 0
     funnel: dict[str, float] = field(default_factory=dict)
     bottleneck: str = ""
+    detection_coverage: dict[str, int] = field(default_factory=dict)
+    validation_rate: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -21,4 +23,6 @@ class PipelineMetrics:
             "submission_ready": self.submission_ready,
             "funnel": self.funnel,
             "bottleneck": self.bottleneck,
+            "detection_coverage": self.detection_coverage,
+            "validation_rate": self.validation_rate,
         }

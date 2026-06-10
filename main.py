@@ -1528,6 +1528,8 @@ def run(config: dict) -> int:
             metrics = container.metrics_collector.collect(all_findings)
             config["_pipeline_metrics"] = metrics
             log(container.metrics_collector.summary_string(), Colors.CYAN)
+            log("Per-vuln-type detection/validation breakdown:", Colors.CYAN)
+            log(container.metrics_collector.per_vuln_type_table(), Colors.CYAN)
         except Exception as e:
             log(f"[!] Metrics collection failed: {e}", Colors.YELLOW)
 

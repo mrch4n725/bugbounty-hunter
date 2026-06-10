@@ -46,11 +46,11 @@
 
 BugBounty Hunter is a **high-discovery vulnerability scanner with first-class validation and evidence generation**. It does not force you to choose between a scanner and a reporting platform — it is both. The goal is to discover the maximum number of real vulnerabilities while automatically validating, documenting, and packaging findings into high-quality reports suitable for rapid triage and responsible disclosure.
 
-It combines multithreaded reconnaissance, intelligence-led module selection, and multi-signal verification to produce findings that are ready for submission to HackerOne, Bugcrowd, or any bug bounty program — complete with curl reproduction commands, response excerpts, CVSS vectors, impact assessments, and step-by-step reproduction instructions.
+It combines multithreaded reconnaissance, intelligence-led module selection, multi-signal verification, and per-vuln-type metrics to produce findings that are ready for submission to HackerOne, Bugcrowd, or any bug bounty program — complete with curl reproduction commands, response excerpts, CVSS vectors, impact assessments, step-by-step reproduction instructions, and detection/validation ratio breakdowns per vulnerability type.
 
 Key capabilities:
 
-- **27+ scan modules** — XSS, SQLi, SSTI, SSRF, XXE, Command Injection, Blind XSS, LFI, Open Redirect, CSRF, IDOR, GraphQL, API, JWT, CORS, and more
+- **27+ scan modules** — XSS (reflected, stored, DOM, DOM fragment, JSON reflection, SVG), SQLi (error, boolean, time, OOB, second-order, header, JSON body), SSTI (polyglot, filter bypass, error fingerprint), SSRF (cloud metadata, redirect DNS, protocol smuggling, DNS timing, OOB), XXE (in-band, error, XInclude, SVG upload, JSON-to-XML, OOB), CMDI (time, OOB, argument injection, Windows), Blind XSS, LFI (path traversal, log poisoning, zip slip, /proc/self), Open Redirect, CSRF, IDOR, GraphQL, API, JWT, CORS, and more
 - **Evidence chain** — every finding progresses through Detection → Validation → Exploitation → Verification with confidence scoring
 - **Ownership validation** — cross-user authorization violations confirmed via content-diff comparison, producing `OwnershipEvidence` with identity tracking
 - **Impact validation** — demonstrated vs. theoretical impact distinguished by examining exploitation-proof evidence (browser exec, OOB callbacks, command execution, secret validation)
@@ -58,7 +58,7 @@ Key capabilities:
 - **Consensus-based confidence** — pluggable validator engine (evidence completeness, verification stage, reproduction quality) produces weighted consensus scores
 - **Out-of-band (OOB) confirmation** — SSRF, XXE, Command Injection, Blind XSS, and SQLi confirmed via DNS/HTTP callbacks (Interactsh / Burp Collaborator)
 - **Browser-based XSS validation** — Playwright executes payloads in a headless Chromium instance and captures screenshots of successful execution
-- **Intelligence-led scanning** — each URL is classified by signals (query params, path patterns, forms) and only relevant modules run
+- **Intelligence-led scanning** — each URL is classified by signals (query params, path patterns, forms) and only relevant modules run; recon-driven parameter targeting prioritizes high-value params first while scanning all parameters
 - **Scope enforcement** — every outbound request, including redirect chains, is validated against allowed targets
 - **Canonical Finding model** — all findings normalized to the `Finding` dataclass with UUIDv7 identifiers, SHA-256 root-cause fingerprints, CVSS vectors, impact narratives, and remediation guidance
 - **Submission-ready reports** — HTML, JSON, TXT, Markdown, HackerOne, and Bugcrowd formats with CVSS scoring, impact assessment, remediation guidance, structured evidence, and curl reproduction commands
@@ -87,7 +87,7 @@ Recon ──▶ Intelligence ──▶ Active Checks ──▶ Verification ─�
    - **Live secret validation** — AWS keys tested against STS, GitHub tokens against the API, Slack tokens validated by format
    - **Multi-signal analysis** — SQLi requires 2+ independent signals (error, boolean, time, OOB) before Confirmed
 
-5. **Post-Scan** — Findings pass through a pipeline: duplicate risk assessment, CVSS/impact narrative enrichment, pipeline metrics collection (funnel/bottleneck analysis), and regression comparison against previous scan outputs.
+5. **Post-Scan** — Findings pass through a pipeline: duplicate risk assessment, CVSS/impact narrative enrichment, pipeline metrics collection (funnel/bottleneck analysis + per-vuln-type detection/validation ratio breakdown), and regression comparison against previous scan outputs.
 
 6. **Validation Maturity** — Reports apply a multi-engine validation pipeline:
    - **OwnershipValidator** — examines authorization comparison evidence to confirm identity-based access violations
@@ -307,7 +307,7 @@ module_params:
 | `--disable-modules` | — | Modules to skip when running `all` |
 | `--output`, `-o` | `reports` | Report output directory |
 | `--format`, `-f` | `html` | Output format: `html`, `json`, `txt`, `markdown-report`, `hackerone`, `bugcrowd`, `chatgpt` |
-| `--threads` | `10` | Number of concurrent worker threads |
+| `--threads` | `5` | Number of concurrent worker threads |
 | `--timeout` | `10` | HTTP request timeout in seconds |
 | `--crawl-depth` | `2` | Recon crawl depth (0 = target only) |
 | `--max-urls` | `200` | Maximum URLs to collect during recon |
@@ -350,13 +350,13 @@ module_params:
 | Module | CLI Name | Type | Description |
 |--------|----------|------|-------------|
 | Recon | `recon` | Setup | Crawler, subdomain DNS, robots/sitemap, JS intelligence |
-| XSS | `xss` | Per-URL | Context-aware reflected XSS (HTML/attribute/JS/URL contexts) with Playwright execution verification and screenshot capture |
-| SQLi | `sqli` | Per-URL | Error-based, boolean-based, time-based blind, and OOB callback — requires 2+ signals for Confirmed, OOB for Verified |
-| LFI | `lfi` | Per-URL | Path traversal and local file inclusion detection |
-| SSRF | `ssrf` | Per-URL | OOB callback + cloud metadata endpoint verification |
-| XXE | `xxe` | Per-URL | In-band file read, error-based leak, OOB blind XXE via callback |
-| SSTI | `ssti` | Per-URL | 4-stage template injection detection (arithmetic evaluation, command execution) |
-| Command Injection | `cmd_injection` | Per-URL | Output-based (`uid=`), time-based (≥5s delay), OOB callback (nslookup/curl) |
+| XSS | `xss` | Per-URL | Context-aware reflected XSS (HTML/attribute/JS/URL contexts) + DOM fragment injection + JSON reflection + SVG onload. Playwright execution verification with screenshot capture. Uses JS file analysis from recon to prioritize params found in endpoint context. Signal count tracks reflected + DOM fragment + JSON reflection + SVG (up to 4). |
+| SQLi | `sqli` | Per-URL | Error-based, boolean-based, time-based blind, OOB callback, second-order injection, header injection, JSON body injection — requires 2+ signals for Confirmed, OOB for Verified. RESTful path patterns and baseline crawl timings reorder params by likelihood. Signal count: error + boolean + time + OOB + second-order + header + JSON body (up to 7). |
+| LFI | `lfi` | Per-URL | Path traversal, log poisoning, zip slip, /proc/self/environ — with file-path keyword param prioritization (`file`, `path`, `read`, `include`, `page`, etc.). |
+| SSRF | `ssrf` | Per-URL | Cloud metadata endpoint probe + redirect-driven DNS exfil + protocol smuggling (gopher/file) + DNS timing oracle + OOB callback. URL-like param values (`://`) get priority. Signal count: metadata + redirect + protocol smuggling + DNS timing + OOB (up to 5). |
+| XXE | `xxe` | Per-URL | In-band file read, error-based leak, XInclude, SVG upload, JSON-to-XML conversion, OOB blind XXE via callback. XML endpoint detection (.xml/.soap/.wsdl) reorders params. Signal count: in-band + error + XInclude + SVG + JSON-to-XML + OOB (up to 6). |
+| SSTI | `ssti` | Per-URL | Arithmetic polyglot evaluation, multi-engine filter bypass, error fingerprint matching — 3-stage pipeline (detect → validate → exploit). Template-context params (`name`, `message`, `content`, `template`) prioritized. |
+| Command Injection | `cmd_injection` | Per-URL | Time-based (≥5s delay), OOB callback (nslookup/curl), argument injection, Windows-specific (dir/type/ping). Tool keyword param prioritization (`cmd`, `exec`, `run`, `shell`, `file`). Signal count: time + OOB + argument + Windows (up to 4). |
 | Blind XSS | `blind_xss` | Target-level | Inject OOB-payload into forms/params; poll for callback from admin browser |
 | Open Redirect | `open_redirect` | Per-URL | Redirect parameter abuse with external domain detection |
 | Headers | `headers` | Target-level | Missing security headers, server disclosure, CORS (origin reflection), cookie analysis, subdomain scan |

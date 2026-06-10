@@ -334,6 +334,10 @@ class SSRFScanner(ScannerBase):
                 parsed = urlparse(url)
                 original_params = parse_qs(parsed.query)
                 params = list(dict.fromkeys(list(original_params.keys()) + SSRF_PARAM_NAMES))
+                priority_params = [p for p in params if p in original_params and original_params[p][0] and "://" in original_params[p][0]]
+                name_params = [p for p in params if p in SSRF_PARAM_NAMES]
+                other_params = [p for p in params if p not in priority_params and p not in name_params]
+                params = list(dict.fromkeys(priority_params + name_params + other_params))
 
                 baseline_resp = safe_get(self.session, url, self.timeout)
                 baseline_hash = hashlib.md5(baseline_resp.text.encode()).hexdigest() if baseline_resp else None
@@ -371,22 +375,86 @@ class SSRFScanner(ScannerBase):
                         if found_metadata:
                             break
 
+                    # ── Redirect-based SSRF ───────────────────────────
+                    if param in original_params and original_params[param][0] and ("://" in original_params[param][0] or "." in original_params[param][0]):
+                        redirect_payload = "http://127.0.0.1:80/"
+                        redirect_test_url = self._build_ssrf_url(url, parsed, original_params, param, redirect_payload)
+                        try:
+                            redirect_resp = safe_get(self.session, redirect_test_url, self.timeout, allow_redirects=True, raise_for_status=False)
+                            if redirect_resp and baseline_resp:
+                                redirect_diff = (
+                                    redirect_resp.status_code != baseline_resp.status_code or
+                                    abs(len(redirect_resp.text or "") - len(baseline_resp.text or "")) > 50
+                                )
+                                if redirect_diff:
+                                    content_info = self._verify_metadata_content(redirect_resp)
+                                    if content_info.get("valid"):
+                                        all_matched_sigs.add("ssrf_redirect_metadata")
+                                    else:
+                                        all_matched_sigs.add("ssrf_redirect")
+                                    if matching_resp is None:
+                                        matching_resp = redirect_resp
+                                    vulnerable_params.append(f"{param}[redirect]")
+                        except Exception:
+                            pass
+                        if oob_host and self.validation:
+                            oob_redirect_payload = f"http://{self.validation.callback_host}/ssrf-redirect"
+                            oob_redirect_url = self._build_ssrf_url(url, parsed, original_params, param, oob_redirect_payload)
+                            safe_get(self.session, oob_redirect_url, self.timeout, raise_for_status=False)
+                            self.validation.register_oob("ssrf_redirect", oob_redirect_payload, oob_redirect_url)
+                            self._oob_registrations.append(("ssrf_redirect", oob_redirect_payload, oob_redirect_url))
+
                     # ── Protocol smuggling ─────────────────────────────
-                    if not found_metadata:
-                        for proto_payload in SSRF_PROTOCOL_PAYLOADS:
-                            test_url = self._build_ssrf_url(url, parsed, original_params, param, proto_payload)
-                            try:
-                                resp = safe_get(self.session, test_url, self.timeout, raise_for_status=False)
-                                if resp and resp.status_code not in (502, 503, 504) and len(resp.text or "") > 0:
-                                    # Different response from baseline suggests protocol handler
-                                    if baseline_hash:
-                                        cur_hash = hashlib.md5(resp.text.encode()).hexdigest()
-                                        if cur_hash != baseline_hash:
-                                            vulnerable_params.append(f"{param}[proto]")
-                                            if matching_resp is None:
-                                                matching_resp = resp
-                            except Exception:
-                                continue
+                    for proto_payload in SSRF_PROTOCOL_PAYLOADS:
+                        is_dict_or_gopher = proto_payload.startswith("dict://") or proto_payload.startswith("gopher://")
+                        if is_dict_or_gopher and param not in vulnerable_params:
+                            continue
+                        test_url = self._build_ssrf_url(url, parsed, original_params, param, proto_payload)
+                        try:
+                            resp = safe_get(self.session, test_url, self.timeout, raise_for_status=False)
+                            if resp and resp.status_code not in (502, 503, 504) and len(resp.text or "") > 0:
+                                if baseline_resp:
+                                    body_diff = abs(len(resp.text) - len(baseline_resp.text))
+                                    status_diff = resp.status_code != baseline_resp.status_code
+                                    if body_diff > 50 or status_diff:
+                                        vulnerable_params.append(f"{param}[proto]")
+                                        if matching_resp is None:
+                                            matching_resp = resp
+                                        if "protocol_smuggling" not in all_matched_sigs:
+                                            all_matched_sigs.add("protocol_smuggling")
+                                elif baseline_hash:
+                                    cur_hash = hashlib.md5(resp.text.encode()).hexdigest()
+                                    if cur_hash != baseline_hash:
+                                        vulnerable_params.append(f"{param}[proto]")
+                                        if matching_resp is None:
+                                            matching_resp = resp
+                                        if "protocol_smuggling" not in all_matched_sigs:
+                                            all_matched_sigs.add("protocol_smuggling")
+                            if oob_host and self.validation:
+                                oob_proto_payload = f"http://{self.validation.callback_host}/ssrf-proto"
+                                oob_proto_url = self._build_ssrf_url(url, parsed, original_params, param, oob_proto_payload)
+                                safe_get(self.session, oob_proto_url, self.timeout, raise_for_status=False)
+                                self.validation.register_oob("ssrf_proto", oob_proto_payload, oob_proto_url)
+                                self._oob_registrations.append(("ssrf_proto", oob_proto_payload, oob_proto_url))
+                        except Exception:
+                            continue
+
+                    # ── DNS rebinding timing indicator ─────────────────
+                    if param not in vulnerable_params:
+                        import time
+                        internal_probe = self._build_ssrf_url(url, parsed, original_params, param, "http://169.254.169.254/")
+                        nonroutable_probe = self._build_ssrf_url(url, parsed, original_params, param, "http://198.51.100.1/")
+                        try:
+                            t1 = time.time()
+                            safe_get(self.session, internal_probe, self.timeout, raise_for_status=False)
+                            internal_time = (time.time() - t1) * 1000
+                            t2 = time.time()
+                            safe_get(self.session, nonroutable_probe, self.timeout, raise_for_status=False)
+                            nonroutable_time = (time.time() - t2) * 1000
+                            if internal_time < 50 and nonroutable_time > 500:
+                                all_matched_sigs.add("timing_ssrf")
+                        except Exception:
+                            pass
 
                     # ── Internal port scanning ─────────────────────────
                     if not found_metadata:
@@ -450,7 +518,12 @@ class SSRFScanner(ScannerBase):
                             confidence_score=confidence_score,
                         )
                         if f:
-                            self._enrich_finding(f, len(evidence_list), f["verification_stage"])
+                            signal_count = 1
+                            if "ssrf_redirect" in all_matched_sigs or "ssrf_redirect_metadata" in all_matched_sigs:
+                                signal_count = 2
+                            if oob_host and self.validation:
+                                signal_count = 3
+                            self._enrich_finding(f, signal_count, f["verification_stage"])
                             if self._add_finding(f):
                                 fingerprint = f.get("fingerprint", "")
                                 if fingerprint and self.evidence_engine is not None:
@@ -496,7 +569,7 @@ class SSRFScanner(ScannerBase):
                 ],
             )
             if f:
-                self._enrich_finding(f, 1, f["verification_stage"])
+                self._enrich_finding(f, 2, f["verification_stage"])
                 if self._add_finding(f):
                     fingerprint = f.get("fingerprint", "")
                     if fingerprint and self.evidence_engine is not None:

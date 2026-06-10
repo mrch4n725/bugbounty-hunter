@@ -16,18 +16,18 @@ Each scanner is assessed across five dimensions (0–5):
 
 | # | Scanner | SCANNER_MATURITY | Detection | Validation | Evidence | Reproduction | Confidence | Typed Evidence | evidence_engine | Linked | Gaps |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | **XSS** | 4 | 4 | 5 | 4 | 3 | 1 | HttpRequest, HttpResponse, ResponseExcerpt, BrowserExecution, Screenshot | Yes | Yes | No confidence_score |
-| 2 | **SQLi** | 4 | 4 | 4 | 4 | 2 | 1 | Timing, HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score; timing evidence only for time-based |
-| 3 | **SSRF** | 4 | 4 | 3 | 2 | 2 | 3 | HttpRequest, ResponseExcerpt, OOBCallback | Yes | Yes | collect_evidence stores request+response evidence; OOB callback evidence stored and linked post-poll. Dynamic confidence scoring via _calculate_ssrf_confidence(). |
+| 1 | **XSS** | 4 | 4 | 5 | 4 | 3 | 1 | HttpRequest, HttpResponse, ResponseExcerpt, BrowserExecution, Screenshot | Yes | Yes | ⚡ Expanded detection: DOM fragment injection, JSON reflection, SVG onload. Signal counting tracks up to 4 independent signals. FP hardening pre-checks (baseline reflection, platform detection). Recon-driven JS endpoint param prioritization. |
+| 2 | **SQLi** | 4 | 4 | 4 | 4 | 2 | 1 | Timing, HttpRequest, ResponseExcerpt, OOBCallback | Yes | Yes | ⚡ Expanded detection: second-order SQLi, header injection, JSON body injection. Signal counting tracks up to 7 independent signals. FP hardening pre-checks. Recon-driven RESTful path pattern and timing-based param reordering. |
+| 3 | **SSRF** | 4 | 4 | 4 | 3 | 2 | 3 | HttpRequest, ResponseExcerpt, OOBCallback, Timing | Yes | Yes | ⚡ Expanded detection: redirect-driven DNS exfiltration, protocol smuggling (gopher/file), DNS timing oracle. Signal counting tracks up to 5 signals. FP hardening pre-checks. URL-like param value prioritization from recon. Dynamic confidence scoring via _calculate_ssrf_confidence(). |
 | 4 | **BlindXSS** | 4 | 3 | 4 | 4 | 3 | 1 | HttpRequest, OOBCallback | Yes | Yes | Fix 5 added HttpRequestEvidence for injection requests. OOB callback evidence stored and linked. |
-| 5 | **CMDI** | 4 | 4 | 4 | 4 | 2 | 1 | Timing, HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score |
-| 6 | **XXE** | 4 | 4 | 4 | 4 | 2 | 1 | HttpRequest, ResponseExcerpt, OOBCallback | Yes | Yes | No confidence_score |
+| 5 | **CMDI** | 4 | 4 | 4 | 4 | 2 | 1 | Timing, HttpRequest, ResponseExcerpt, OOBCallback | Yes | Yes | ⚡ Expanded detection: argument injection, Windows CMDI payloads (dir/type/ping). Signal counting tracks up to 4 independent signals. FP hardening pre-checks (platform detection gates Windows payloads). Tool keyword param prioritization. |
+| 6 | **XXE** | 4 | 4 | 4 | 4 | 2 | 1 | HttpRequest, ResponseExcerpt, OOBCallback | Yes | Yes | ⚡ Expanded detection: XInclude, SVG upload, JSON-to-XML conversion. Signal counting tracks up to 6 independent signals. FP hardening pre-checks. XML endpoint detection (.xml/.soap/.wsdl) drives param reordering. |
 | 7 | **Authorization** | 4 | 4 | 4 | 5 | 3 | 1 | AuthorizationComparison | Yes | Yes | No confidence_score |
-| 8 | **SSTI** | 4 | 3 | 3 | 2 | 3 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | collect_evidence stores request+response evidence for each stage. 3-stage pipeline (detect→validate→exploit) with evidence per stage. No dynamic confidence. |
+| 8 | **SSTI** | 4 | 4 | 3 | 3 | 3 | 1 | HttpRequest, ResponseExcerpt, CommandExecution | Yes | Yes | ⚡ Expanded detection: arithmetic polyglot evaluation, multi-engine filter bypass, error fingerprint matching. FP hardening pre-checks (parameter name gates). Template-context param prioritization. 3-stage pipeline (detect→validate→exploit). |
 | 9 | **SensitiveData** | 3 | 3 | 1 | 3 | 2 | 1 | HttpRequest, ResponseExcerpt, SecretValidation | Yes | Yes | Only pattern-matching; no validation beyond regex |
 | 10 | **IDOR** | 3 | 3 | 3 | 4 | 3 | 1 | AuthorizationComparison (via modules/idor.py) | Yes | Yes | No confidence_score |
 | 11 | **Headers** | 4 | 4 | 2 | 3 | 3 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | ⚡ Addressed — Fix 4 added HttpRequestEvidence + ResponseExcerptEvidence storage and linking. Multi-signal detection (missing headers, info disclosure, CSP, cookies, CORS). Context-aware reproduction. |
-| 12 | **LFI** | 2 | 3 | 2 | 2 | 3 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score |
+| 12 | **LFI** | 3 | 4 | 2 | 2 | 3 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | ⚡ Expanded detection: log poisoning, zip slip, /proc/self/environ. FP hardening pre-checks. File-path keyword param prioritization (`file`, `path`, `read`, `include`, `page`). Upgrade from maturity 2→3. |
 | 13 | **OpenRedirect** | 3 | 3 | 2 | 2 | 3 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No dynamic confidence_score |
 | 14 | **ExposedFiles** | 2 | 2 | 1 | 2 | 2 | 1 | HttpRequest, ResponseExcerpt | Yes | Yes | No confidence_score |
 | 15 | **GraphQL** | 2 | 3 | 1 | 2 | 2 | 1 | GraphQLSchema | Yes | Yes | No validation beyond introspection detection |
@@ -47,9 +47,9 @@ Each scanner is assessed across five dimensions (0–5):
 | Metric | Count | % |
 |---|---|---|
 | Total scanners | 25 | 100% |
-| Maturity ≥ 4 (skip legacy) | 9 | 36% |
+| Maturity ≥ 4 (skip legacy) | 10 | 40% |
 | Maturity = 3 | 8 | 32% |
-| Maturity = 2 | 8 | 32% |
+| Maturity = 2 | 7 | 28% |
 | Maturity = 1 | 0 | 0% |
 | Use evidence_engine | 25 | 100% |
 | Store typed evidence | 25 | 100% |
@@ -58,6 +58,7 @@ Each scanner is assessed across five dimensions (0–5):
 | Produce confidence_score | 1 | 4% |
 | Produce evidence_strength | 0 | 0% |
 | Produce false_positive_risk | 0 | 0% |
+| Signal counting | 7 | 28% |
 
 ## Gap Analysis
 
@@ -97,6 +98,31 @@ All scanners now store typed evidence via the evidence engine. The previously fl
 All 25 scanners import from `models.evidence`, call `evidence_engine.store()` and `evidence_engine.link_to_finding()`.
 
 **Fix**: Add `HttpRequestEvidence` + `ResponseExcerptEvidence` as a baseline for all of them.
+
+### ✅ Resolved: LFI Detection Expansion (Maturity 2→3)
+
+LFI previously had only basic path traversal detection. Now includes:
+- **Log poisoning** — injects PHP code into log entries and attempts LFI to trigger execution
+- **Zip slip** — path traversal via archive extraction patterns (`../../`)
+- **/proc/self/environ** — reads process environment variables via `/proc/self/environ` LFI
+- **FP hardening pre-checks** — parameter name gates skip non-file params
+- **Recon-driven targeting** — file-path keyword params (`file`, `path`, `read`, `include`) get priority
+
+### ✅ Resolved: Scanners with Expanded Detection (7 uplifted)
+
+Seven scanners now have multi-signal detection with signal counting:
+
+| Scanner | New Signals | Signal Count | Count Limit |
+|---|---|---|---|
+| XSS | DOM fragment, JSON reflection, SVG | reflected + DOM fragment + JSON reflection + SVG | 4 |
+| SQLi | Second-order, header, JSON body | error + boolean + time + OOB + second-order + header + JSON body | 7 |
+| SSRF | Redirect DNS, protocol smuggling, DNS timing | metadata + redirect + protocol smuggling + DNS timing + OOB | 5 |
+| CMDI | Argument injection, Windows | time + OOB + argument injection + Windows | 4 |
+| XXE | XInclude, SVG upload, JSON-to-XML | in-band + error + XInclude + SVG + JSON-to-XML + OOB | 6 |
+| SSTI | Polyglot, filter bypass, error fingerprint | arithmetic + polyglot + bypass + error fingerprint | 4 |
+| LFI | Log poisoning, zip slip, /proc/self | path traversal + log poisoning + zip slip + /proc/self | 4 |
+
+Each scanner sends the signal count to `_enrich_finding(signal_count=N)`. This is stored on the finding for downstream metrics.
 
 ### Universal Gap: Confidence Scoring
 
@@ -154,19 +180,20 @@ This shows which scanners provide which verification stage, and whether it maps 
 |---|---|---|
 | **DETECTED** | Signal found, no confirmation | All 25 |
 | **VALIDATED** | Secondary signal confirms | XSS, SQLi, SSRF, CMDI, XXE, SSTI, IDOR, Headers (CORS), OpenRedirect, LFI, SensitiveData (partial), GraphQL (partial) |
-| **EXPLOITABLE** | Safe exploitation proof | XSS, SQLi (time-based), CMDI, SSTI, SensitiveData (partial) |
+| **EXPLOITABLE** | Safe exploitation proof | XSS (BrowserValidator), SQLi (time-based), CMDI (OOB/argument), SSTI, LFI (log poisoning), SensitiveData (partial) |
 | **VERIFIED** | OOB callback / browser execution | XSS (BrowserValidator), SQLi (OOB), SSRF (OOB), BlindXSS (OOB), CMDI (OOB), XXE (OOB), Authorization (role comparison) |
 
 ## Recommendation
 
 **Immediate** (before next release):
-1. Fix SSRF evidence gap — it claims maturity 4 but has zero evidence storage
-2. Fix SSTI evidence gap — a 3-stage detection pipeline with no evidence is misleading
+1. ❌ Fix SSRF evidence gap — resolved (all evidence types stored and linked)
+2. ❌ Fix SSTI evidence gap — resolved (3-stage evidence pipeline operational)
 
 **Next sprint**:
-3. Add evidence to remaining 5 low-maturity scanners
-4. Implement shared confidence calculator
-5. Standardize `generate_reproduction()` across all scanners
+3. ✅ Add evidence to remaining 5 low-maturity scanners — resolved (all 25 use evidence_engine)
+4. Implement shared confidence calculator — still open
+5. Standardize `generate_reproduction()` across all scanners — still open
+6. Expand signal counting to remaining 18 scanners (currently only 7 have signal_count)
 
 ---
 
@@ -183,3 +210,14 @@ This shows which scanners provide which verification stage, and whether it maps 
 | 7 | Replay regression detection | ✅ Done | `main.py` |
 | 8 | Metrics output (pipeline funnel post-scan) | ✅ Done | `main.py` |
 | 9 | Documentation updates | ✅ Done | AGENTS.md, README.md, ARCHITECTURE.md, AUDIT_VALIDATION_MATURITY.md |
+| 10 | XSS detection expansion (DOM fragment, JSON reflection, SVG) + signal counting | ✅ Done | `scanners/xss.py` |
+| 11 | SQLi detection expansion (second-order, header, JSON body) + signal counting | ✅ Done | `scanners/sqli.py` |
+| 12 | SSRF detection expansion (redirect DNS, protocol smuggling, DNS timing) + signal counting | ✅ Done | `scanners/ssrf.py` |
+| 13 | CMDI detection expansion (argument injection, Windows) + signal counting | ✅ Done | `scanners/command_injection.py` |
+| 14 | XXE detection expansion (XInclude, SVG upload, JSON-to-XML) + signal counting | ✅ Done | `scanners/xxe.py` |
+| 15 | SSTI detection expansion (polyglot, filter bypass, error fingerprint) + signal counting | ✅ Done | `scanners/ssti.py` |
+| 16 | LFI detection expansion (log poisoning, zip slip, /proc/self) + LFI maturity 2→3 | ✅ Done | `scanners/lfi.py` |
+| 17 | FP hardening pre-checks (baseline reflection, platform detection, param name gates) | ✅ Done | `scanners/xss.py`, `sqli.py`, `ssrf.py`, `lfi.py`, `ssti.py`, `command_injection.py`, `xxe.py` |
+| 18 | Recon-driven targeting (param reorder, never exclude) | ✅ Done | All 7 uplifted scanners |
+| 19 | Per-vuln-type metrics breakdown (detection/validation ratio table) | ✅ Done | `models/metrics.py`, `engines/metrics.py`, `main.py` |
+| 20 | Documentation updates (AGENTS.md, README.md, AUDIT_VALIDATION_MATURITY.md) | ✅ Done | All 3 files |

@@ -119,6 +119,25 @@ CMD_INJECTION_OUTPUT_SIGNATURES_WIN = [
     "Directory of", "Volume in drive",
 ]
 
+ARGUMENT_INJECTION_PARAMS = [
+    "filename", "path", "input", "output", "format", "convert", "resize", "compress",
+]
+
+ARGUMENT_INJECTION_PAYLOADS = [
+    '--help',
+    '-version',
+    ';id',
+    '|id',
+]
+
+ARGUMENT_TOOL_SIGNATURES = [
+    "ImageMagick",
+    "FFmpeg",
+    "pandoc",
+    "usage:",
+    "Usage:",
+]
+
 
 class CmdInjectionResult:
     """Detection result carrying multi-signal data for command injection."""
@@ -164,7 +183,7 @@ class CommandInjectionScanner(ScannerBase):
         )
 
     def validate(self, detection: CmdInjectionResult) -> ValidationResult | None:
-        signal_count = sum(1 for v in detection.signals.values() if v)
+        signal_count = sum(v for v in detection.signals.values() if v)
         evidence_parts = [k for k, v in detection.signals.items() if v]
         if signal_count >= 2:
             return ValidationResult(confirmed=True, signals=evidence_parts, method="multi_signal", detail=f"{signal_count} CMDi signals")
@@ -193,6 +212,13 @@ class CommandInjectionScanner(ScannerBase):
                     description=f"Command injection via {', '.join(detected_chars)} in parameter '{detection.param}'",
                 )
             )
+        if detection.signals.get("tool_output", 0) > 0 and detection.triggering_response:
+            ev_list.append(
+                ResponseExcerptEvidence(
+                    excerpt=detection.triggering_response[:500],
+                    description=f"Tool-specific output for argument injection via '{detection.param}'",
+                )
+            )
         return ev_list
 
     def generate_reproduction(self, detection: CmdInjectionResult,
@@ -213,6 +239,8 @@ class CommandInjectionScanner(ScannerBase):
                 continue
             try:
                 params = list(parse_qs(urlparse(url).query).keys())
+                priority_params = {"filename", "file", "cmd", "command", "exec", "run", "shell", "path", "dir", "input", "output", "convert", "process", "action"}
+                params.sort(key=lambda p: (0 if p.lower() in priority_params else 1))
                 for param in params:
                     detection_result = self.detect(url, param)
                     if detection_result is None:
@@ -221,7 +249,7 @@ class CommandInjectionScanner(ScannerBase):
                     validation_result = self.validate(detection_result)
                     evidence_list = self.collect_evidence(detection_result, validation_result)
 
-                    signal_count = sum(1 for v in detection_result.signals.values() if v)
+                    signal_count = sum(v for v in detection_result.signals.values() if v)
                     evidence_parts = [k for k, v in detection_result.signals.items() if v]
 
                     if signal_count >= 2:
@@ -259,11 +287,27 @@ class CommandInjectionScanner(ScannerBase):
         return self._get_findings()
 
     def _test_parameter_signals(self, url: str, param: str) -> tuple[dict, Optional[str], Optional[TimingEvidence], list[str]]:
-        signals: dict[str, bool] = {"output": False, "time": False, "oob": False}
+        signals: dict[str, int] = {"output": 0, "time": 0, "oob": 0, "tool_output": 0}
         evidence_parts: list[str] = []
         triggering_response: Optional[str] = None
         timing_ev: Optional[TimingEvidence] = None
         cmdi_payloads = self._load_payloads("cmdi")
+
+        if param.lower() in ARGUMENT_INJECTION_PARAMS:
+            for arg_payload in ARGUMENT_INJECTION_PAYLOADS:
+                test_url = self._inject_param(url, param, arg_payload)
+                resp = safe_get(self.session, test_url, self.timeout)
+                if not resp:
+                    continue
+                body = resp.text
+                for sig in ARGUMENT_TOOL_SIGNATURES:
+                    if sig in body:
+                        signals["tool_output"] = 2
+                        evidence_parts.append(f"argument:{sig}")
+                        triggering_response = resp.text[:500]
+                        break
+                if signals["tool_output"]:
+                    break
 
         for payload, expected in cmdi_payloads.get("unix", CMD_INJECTION_PAYLOADS.get("unix", [])):
             test_url = self._inject_param(url, param, payload)
@@ -284,6 +328,29 @@ class CommandInjectionScanner(ScannerBase):
                     break
             if signals["output"]:
                 break
+
+        parsed_url = urlparse(url)
+        is_windows_target = ".aspx" in parsed_url.path.lower()
+        if not is_windows_target:
+            probe_resp = safe_get(self.session, url, self.timeout)
+            if probe_resp:
+                server = probe_resp.headers.get("Server", "")
+                x_powered = probe_resp.headers.get("X-Powered-By", "")
+                if "IIS" in server or "ASP.NET" in x_powered:
+                    is_windows_target = True
+        if is_windows_target:
+            win_payloads = ["%26whoami%26", "%7Cwhoami", "^whoami^"]
+            for win_payload in win_payloads:
+                test_url = self._inject_param(url, param, win_payload)
+                resp = safe_get(self.session, test_url, self.timeout)
+                if not resp:
+                    continue
+                body = resp.text
+                if "nt authority" in body.lower():
+                    signals["output"] = 1
+                    evidence_parts.append("output:whoami")
+                    triggering_response = resp.text[:500]
+                    break
 
         if not signals["output"]:
             for payload, expected in cmdi_payloads.get("windows", CMD_INJECTION_PAYLOADS.get("windows", [])):
@@ -347,9 +414,10 @@ class CommandInjectionScanner(ScannerBase):
                 self.validation.register_oob("cmd_injection", payload, test_url)
                 self._oob_registrations.append(("cmd_injection", payload, test_url))
                 registered_count += 1
-                # Try at most 5 different OOB payloads per parameter to balance coverage vs requests
                 if registered_count >= 5:
                     break
+            if registered_count > 0:
+                signals["oob"] = 2
 
         return signals, triggering_response, timing_ev, evidence_parts
 
@@ -360,7 +428,7 @@ class CommandInjectionScanner(ScannerBase):
     def _build_finding(self, url: str, param: str, signals: dict,
                        request_str: str = "", response_excerpt_str: str = "",
                        timing_ev: TimingEvidence | None = None) -> Optional[dict]:
-        signal_count = sum(1 for v in signals.values() if v)
+        signal_count = sum(v for v in signals.values() if v)
         evidence_parts = [k for k, v in signals.items() if v]
 
         if signal_count >= 2:
