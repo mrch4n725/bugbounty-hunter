@@ -114,9 +114,17 @@ python3 main.py --target https://example.com
 
 # One-command scan with sensible defaults
 python3 main.py --target https://example.com --auto
+
+# HackerOne-aware scan (scope enforcement, duplicate filtering, strategy)
+python3 main.py --target https://target.com --format hackerone --programme example-program --h1-api user:token --h1-strict
+
+# Just a HackerOne-format report (no API needed)
+python3 main.py --target https://target.com --format hackerone
 ```
 
 `--auto` sets safe defaults (`rps=3`, `threads=5`, `autosave=60s`) and outputs a ChatGPT-optimized markdown report. Reports are written to `reports/` by default (override with `--output`).
+
+For HackerOne integration, `--h1-api <user:token>` replaces the old `--h1-username` + `--h1-token`, and `--h1-strict` replaces old `--scope-strict` + `--skip-likely-duplicates` — simpler and fewer flags.
 
 ---
 
@@ -345,6 +353,11 @@ module_params:
 | `--auth-header` | — | Auth header for a role in format `role_name:Header:Value` (repeatable). E.g. `--auth-header user_b:'Authorization:Bearer tok_b'` |
 | `--auto` | off | Auto mode: sensible defaults for a quick scan (`rps=3`, `threads=5`, `autosave=60s`, `format=chatgpt`). Single-command convenience — just `python main.py --target https://x.com --auto`. |
 | `--legacy-scanners` | off | Fall back to legacy inline scanner logic in `modules/scanner.py` (not recommended; ScannerBase is the default). |
+| `--h1-api` | — | HackerOne API credentials as `username:token` (or `H1_API` env var) — fetches scope, bounty data, disclosed reports for programme-aware scanning |
+| `--h1-strict` | off | H1 strict mode: enables scope enforcement, duplicate filtering, and programme-aware ScanStrategy. Replaces old `--scope-strict` + `--skip-likely-duplicates`. |
+| `--programme` | — | Programme handle to pull scope and intel for this scan |
+| `--best-programme` | off | Auto-select highest-scoring programme and set target to its top asset |
+| `--list-programmes` | off | Print all accessible programmes ranked by expected value and exit |
 | `--disable-engine` | — | Disable specific post-scan engines: `attack_chains`, `investigation`, `impact`, `evidence_quality`, `scan_budget`, `asset_graph`, `promotion`, `replay`, `duplicate_risk`, `consensus`, `metrics`, `confidence`, `impact_escalation` |
 | `--verbose`, `-v` | off | Per-request and per-finding diagnostic output |
 
@@ -768,12 +781,19 @@ BugBounty Hunter is built for bug bounty hunters who want to maximise their yiel
 
 ### Intelligent Target Selection
 
-The `--best-programme` flag selects the most lucrative programme by analysing HackerOne/Bugcrowd data:
+The `--best-programme` flag selects the most lucrative programme, while `--h1-strict` enables full H1 compliance:
+
+```bash
+python3 main.py --h1-api user:token --best-programme
+python3 main.py --target https://target.com --programme handle --h1-api user:token --h1-strict --format hackerone
+```
 
 - **Saturation scoring** — avoids heavily tested programmes (saturation > 0.8)
 - **Expected value calculation** — factors bounty range × in-scope asset count × disclosure recency
 - **Recent disclosure analysis** — targets where specific vuln types (IDOR, XSS) were recently accepted
 - **Strategy generation** — `ScanStrategy` in `modules/strategy.py` auto-prioritises modules based on programme intelligence (e.g., 2 sessions + IDOR disclosures → prioritise IDOR/auth)
+- **Scope enforcement** — `--h1-strict` aborts if no programme intel available, qualifies findings by programme scope
+- **Duplicate filtering** — `--h1-strict` excludes findings that match previously disclosed reports
 
 ### Yield-Optimised Report Output
 
@@ -789,6 +809,7 @@ Reports are formatted for **rapid triage acceptance**:
 - **`--mode idor`** — Two-session IDOR testing with 4-phase pipeline (harvest → compare → ownership validation → evidence) produces high-confidence ownership-violation findings that are immediately actionable
 - **`--best-programme`** — Automatically evaluates programmes across H1 and Bugcrowd, selects the one with highest expected value, and tunes modules to match its history
 - **`--list-programmes`** — Shows all available programmes with saturation, expected value, and recent disclosure stats
+- **`--h1-strict`** — Combined H1 compliance mode: scope enforcement, duplicate filtering (excludes findings matching disclosed reports), and programme-aware strategy in a single flag. Use alongside `--format hackerone` for submission-ready output.
 
 ---
 
