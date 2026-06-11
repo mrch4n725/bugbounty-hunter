@@ -19,7 +19,7 @@ from scanners.blind_xss import BlindXSSScanner
 from scanners.xxe import XXEScanner
 from scanners.command_injection import CommandInjectionScanner
 from scanners.graphql import GraphQLScanner
-from scanners.idor import IdorScannerAdapter
+from scanners.idor import IdorScanner
 from scanners.openapi import OpenAPIScanner
 from scanners.authorization import AuthorizationScanner
 from scanners.cors import CORSScanner
@@ -49,7 +49,7 @@ __all__ = [
     "XXEScanner",
     "CommandInjectionScanner",
     "GraphQLScanner",
-    "IdorScannerAdapter",
+    "IdorScanner",
     "OpenAPIScanner",
     "AuthorizationScanner",
     "CORSScanner",

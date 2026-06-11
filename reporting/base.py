@@ -340,6 +340,11 @@ class ReporterBase:
                 object.__setattr__(f, "evidence_bundle_strength", bundle.overall_strength)
                 object.__setattr__(f, "evidence_bundle_completeness", bundle.completeness_score)
 
+        # Submission risk score computation
+        for f in self.findings:
+            risk_score = self._compute_submission_risk_score(f)
+            object.__setattr__(f, "submission_risk_score", risk_score)
+
         # Submission readiness assessment — overrides mechanical state
         if not pipeline_done and "submission_readiness" not in disabled_engines:
             SubmissionReadinessEngine.assess_all(self.findings)
@@ -531,7 +536,7 @@ class ReporterBase:
                      'component', 'request_response', 'what_is_it', 'grouped_urls',
                      'business_impact', 'demonstrated_impact', 'historical',
                      'replay_bundle', 'chains', 'chain_impact', 'duplicate_risk',
-                     'consensus_result', 'finding_state', 'confidence_reasons'):
+                      'consensus_result', 'submission_risk_score', 'finding_state', 'confidence_reasons'):
             if hasattr(f, attr):
                 val = getattr(f, attr)
                 if val is not None and val != "":
@@ -720,6 +725,72 @@ class ReporterBase:
         if not level:
             return ""
         return f"Consensus: {level} ({score}/100)"
+
+    @staticmethod
+    def _compute_submission_risk_score(f: Any) -> int:
+        score = 0
+        dr = f.get("duplicate_risk", {}) if isinstance(f, dict) else getattr(f, "duplicate_risk", {})
+        cr = f.get("consensus_result", {}) if isinstance(f, dict) else getattr(f, "consensus_result", {})
+        stage = f.get("verification_stage", "") if isinstance(f, dict) else getattr(f, "verification_stage", "")
+        bundle = getattr(f, "_evidence_bundle", None) if not isinstance(f, dict) else f.get("_evidence_bundle")
+
+        # Base risk from verification stage
+        stage_risk = {"verified": 10, "exploitable": 20, "validated": 35, "detected": 55}
+        score += stage_risk.get(stage, 55)
+
+        # Duplicate risk adjustment
+        if isinstance(dr, dict):
+            likelihood = dr.get("likelihood", "")
+            if likelihood == "likely_duplicate":
+                score += 25
+            elif likelihood == "moderate_risk":
+                score += 10
+
+        # Consensus adjustment
+        if isinstance(cr, dict):
+            level = cr.get("consensus_level", "none")
+            if level == "strong":
+                score -= 15
+            elif level == "moderate":
+                score -= 5
+            elif level == "weak":
+                score += 5
+
+        # Evidence bundle adjustment
+        if bundle is not None:
+            if isinstance(bundle, dict):
+                ready = bundle.get("submission_ready", False)
+                strength = bundle.get("overall_strength", "")
+            else:
+                ready = bundle.submission_ready if hasattr(bundle, "submission_ready") else False
+                strength = bundle.overall_strength if hasattr(bundle, "overall_strength") else ""
+            if ready:
+                score -= 10
+            if strength == "verified":
+                score -= 10
+            elif strength == "weak":
+                score += 10
+
+        return max(0, min(100, score))
+
+    @staticmethod
+    def _format_submission_risk_paragraph(f: Any) -> str:
+        score = f.get("submission_risk_score", 0) if isinstance(f, dict) else getattr(f, "submission_risk_score", 0)
+        if not score and score != 0:
+            score = ReporterBase._compute_submission_risk_score(f)
+
+        if score <= 20:
+            return (f"This finding has a low submission risk score of {score}/100. "
+                    "Strong evidence and validation signals suggest it is suitable for immediate submission.")
+        elif score <= 45:
+            return (f"This finding has a moderate submission risk score of {score}/100. "
+                    "The evidence is reasonably strong, but consider reviewing duplicate risk and consensus signals before submission.")
+        elif score <= 70:
+            return (f"This finding has an elevated submission risk score of {score}/100. "
+                    "Weak consensus or verification stage indicators suggest additional validation may be beneficial before submission.")
+        else:
+            return (f"This finding has a high submission risk score of {score}/100. "
+                    "Limited validation signals and potential duplicate risk suggest further investigation is strongly recommended before submission.")
 
     @staticmethod
     def _validate_screenshot_path(path: str) -> bool:

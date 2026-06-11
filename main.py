@@ -163,6 +163,8 @@ def parse_args():
         help="Enable WAF fingerprinting and payload evasion (encoding/fragmentation)")
     parser.add_argument("--business-logic", action="store_true",
         help="Enable business logic flaw testing (workflow bypass, race conditions, price manipulation)")
+    parser.add_argument("--record-outcome", action="store_true",
+        help="Record investigation results and confidence scores to outcomes.jsonl for future calibration")
     parser.add_argument("--prioritize-submissions", action="store_true",
         help="Generate submission prioritisation queue (ranked by severity/confidence/evidence/validation-rate)")
     parser.add_argument("--per-finding-export", action="store_true",
@@ -442,6 +444,7 @@ def build_config(args):
         "programme": getattr(args, "programme", None),
         "scope_strict": getattr(args, "scope_strict", False),
         "skip_likely_duplicates": getattr(args, "skip_likely_duplicates", False),
+        "record_outcome": getattr(args, "record_outcome", False),
         "force": getattr(args, "force", False),
         "mode": getattr(args, "mode", None),
         "session_a": getattr(args, "session_a", None),

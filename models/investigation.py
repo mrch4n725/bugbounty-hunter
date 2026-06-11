@@ -53,6 +53,7 @@ class InvestigationResult:
     confidence_delta: int = 0
     success: bool = False
     next_strategy: str | None = None
+    reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -61,4 +62,5 @@ class InvestigationResult:
             "confidence_delta": self.confidence_delta,
             "success": self.success,
             "next_strategy": self.next_strategy,
+            "reason": self.reason,
         }

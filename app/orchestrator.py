@@ -972,21 +972,22 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
             log(f"[!] Confidence scoring failed: {e}", Colors.YELLOW)
 
     # ── Outcome Recording (record every finding for future feedback loop) ──
-    if container and hasattr(container, 'outcome_feedback_engine'):
+    if config.get("record_outcome", False) and container and hasattr(container, 'outcome_feedback_engine'):
         try:
             ofe = container.outcome_feedback_engine
             recorded = 0
             for obj in updated:
                 fp = obj.fingerprint or ""
                 if fp:
+                    cs = obj.confidence_score or 0
                     ofe.record_outcome(
                         finding_fingerprint=fp,
                         outcome="detected",
-                        notes=f"{obj.vuln_type} @ {obj.url}",
+                        notes=f"{obj.vuln_type} @ {obj.url} | confidence={cs}",
                     )
                     recorded += 1
             if recorded:
-                log(f"[*] Recorded {recorded} outcome(s) for future feedback", Colors.CYAN,
+                log(f"[*] Recorded {recorded} outcome(s) to outcomes.jsonl", Colors.CYAN,
                     verbose_only=True, verbose=config.get("verbose", False))
         except Exception as e:
             log(f"[!] Outcome recording failed: {e}", Colors.YELLOW,
@@ -1030,7 +1031,7 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
             log(f"[!] Payload intelligence stats failed: {e}", Colors.YELLOW,
                 verbose_only=True, verbose=config.get("verbose", False))
 
-    # ── Outcome Feedback (historical outcomes check) ───────────────────────
+    # ── Outcome Feedback (historical outcomes check + confidence calibration) ──
     if container and hasattr(container, 'outcome_feedback_engine'):
         try:
             ofe = container.outcome_feedback_engine
@@ -1038,12 +1039,44 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
             if stats.get("total_records", 0) > 0:
                 log(f"[*] Outcome feedback: {stats['total_records']} historical outcome(s), "
                     f"${stats.get('total_bounty', 0):.2f} total bounty", Colors.CYAN)
+                # Compute per-vuln-type positive-outcome rate
+                vuln_stats: dict[str, dict[str, int]] = {}
+                all_records = ofe.get_all()
+                for recs in all_records.values():
+                    for r in recs:
+                        vt = r.notes.split(" @ ")[0] if " @ " in r.notes else ""
+                        if vt:
+                            vuln_stats.setdefault(vt, {"total": 0, "positive": 0})
+                            vuln_stats[vt]["total"] += 1
+                            if r.outcome in ("accepted", "bounty_paid"):
+                                vuln_stats[vt]["positive"] += 1
+
                 for obj in updated:
                     fp = obj.fingerprint or ""
                     if fp and ofe.has_positive_outcome(fp):
                         object.__setattr__(obj, "_historical_outcome", "positive")
                         log(f"    {obj.vuln_type} @ {obj.url}: previously accepted/bounty paid",
                             Colors.GREEN, verbose_only=True, verbose=config.get("verbose", False))
+                    # Confidence calibration: boost findings whose vuln_type has high positive rate
+                    vt = (obj.vuln_type or "").lower()
+                    if vt in vuln_stats:
+                        vs = vuln_stats[vt]
+                        rate = vs["positive"] / max(vs["total"], 1)
+                        if rate >= 0.5 and vt in vuln_stats:
+                            multiplier = 1.0 + (rate * 0.15)
+                            new_score = min(100, int((obj.confidence_score or 25) * multiplier))
+                            if new_score > (obj.confidence_score or 0):
+                                old = obj.confidence_score or 25
+                                object.__setattr__(obj, "confidence_score", new_score)
+                                from models.finding import ConfidenceLevel
+                                object.__setattr__(obj, "confidence_label",
+                                    ConfidenceLevel.from_score(new_score).value)
+                                reasons = list(getattr(obj, "confidence_reasons", []) or [])
+                                delta = new_score - old
+                                reason = f"+{delta} via outcome_calibration: {vt} has {rate:.0%} positive-outcome rate"
+                                if reason not in reasons:
+                                    reasons.append(reason)
+                                    object.__setattr__(obj, "confidence_reasons", reasons)
         except Exception as e:
             log(f"[!] Outcome feedback check failed: {e}", Colors.YELLOW,
                 verbose_only=True, verbose=config.get("verbose", False))

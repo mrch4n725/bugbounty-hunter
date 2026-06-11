@@ -357,6 +357,10 @@ class Finding:
             result["chain_data"] = self.chains
         if hasattr(self, "duplicate_risk"):
             result["duplicate_risk"] = self.duplicate_risk
+        if hasattr(self, "consensus_result"):
+            result["consensus_result"] = self.consensus_result
+        if hasattr(self, "submission_risk_score"):
+            result["submission_risk_score"] = self.submission_risk_score
         if hasattr(self, "_escalation_result"):
             result["escalation_result"] = self._escalation_result
         if hasattr(self, "_best_escalation_path"):

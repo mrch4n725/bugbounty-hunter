@@ -588,14 +588,13 @@ class SQLiScanner(ScannerBase):
                         break
 
         baseline_delays = []
-        for _ in range(5):
+        for _ in range(3):
             b_start = time.time()
             safe_get(self.session, url, 15, raise_for_status=False)
             baseline_delays.append(time.time() - b_start)
-        baseline_mean = statistics.mean(baseline_delays) if baseline_delays else 1.0
-        baseline_stdev = statistics.stdev(baseline_delays) if len(baseline_delays) > 1 else 0.5
-        baseline_ms = baseline_mean * 1000
-        min_time_threshold = max(baseline_mean + 3 * baseline_stdev, 5.0)
+        baseline_median = statistics.median(baseline_delays) if baseline_delays else 1.0
+        baseline_ms = baseline_median * 1000
+        min_time_threshold = max(3.0, baseline_median * 3)
         for payload in payloads.get("time_based", []):
             test_url = inject_param(url, param, payload)
             delays = []
@@ -605,16 +604,16 @@ class SQLiScanner(ScannerBase):
                 time_resp = safe_get(self.session, test_url, 15, raise_for_status=False)
                 delays.append(time.time() - start)
             min_delay = min(delays)
-            if min_delay > min_time_threshold and all(d > max(baseline_mean + 3 * baseline_stdev, 4.0) for d in delays):
+            if all(d > min_time_threshold for d in delays):
                 signals["time"] = True
                 triggered_ms = min_delay * 1000
                 timing_evidence = TimingEvidence(
                     baseline_time_ms=baseline_ms,
                     triggered_time_ms=triggered_ms,
                     total_attempts=len(delays),
-                    description=f"Time-based SQLi on param '{param}': {triggered_ms:.0f}ms vs baseline {baseline_mean:.2f}s ±{baseline_stdev:.2f}s",
+                    description=f"Time-based SQLi on param '{param}': {triggered_ms:.0f}ms vs baseline {baseline_median:.2f}s",
                 )
-                evidence_parts.append(f"time:delays={delays}, baseline_mean={baseline_mean:.2f}s, baseline_stdev={baseline_stdev:.2f}s, threshold={min_time_threshold:.2f}s")
+                evidence_parts.append(f"time:delays={delays}, baseline_median={baseline_median:.2f}s, threshold={min_time_threshold:.2f}s")
                 if time_resp:
                     triggering_response = time_resp.text[:500]
                 break
@@ -796,17 +795,18 @@ class SQLiScanner(ScannerBase):
                 if true_hash != false_hash:
                     signals["boolean"] = True
 
-            baseline_start = time.time()
-            safe_post(self.session, url, data=json.dumps({"id": "1"}), headers=headers, timeout=15, raise_for_status=False)
-            baseline_delay = time.time() - baseline_start
-            if baseline_delay < 0.5:
-                baseline_delay = 0.5
+            baseline_delays_p = []
+            for _ in range(3):
+                b_start = time.time()
+                safe_post(self.session, url, data=json.dumps({"id": "1"}), headers=headers, timeout=15, raise_for_status=False)
+                baseline_delays_p.append(time.time() - b_start)
+            baseline_median_p = statistics.median(baseline_delays_p) if baseline_delays_p else 1.0
             time_payload = '{"id": "\' OR SLEEP(5)--"}'
             time_start = time.time()
             time_resp = safe_post(self.session, url, data=time_payload, headers=headers, timeout=15, raise_for_status=False)
             time_delay = time.time() - time_start
-            min_threshold = max(baseline_delay + 4, 5.0)
-            if time_resp and time_delay > min_threshold:
+            min_threshold_p = max(3.0, baseline_median_p * 3)
+            if time_resp and time_delay > min_threshold_p:
                 signals["time"] = True
 
             signal_count = sum(1 for v in signals.values() if v)

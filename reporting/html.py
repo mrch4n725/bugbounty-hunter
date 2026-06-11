@@ -467,6 +467,23 @@ class HTMLReporter(ReporterBase):
         return f'<div class="row"><strong>Consensus:</strong> <span style="color:{color};font-weight:600">{level}</span> ({score}/100)</div>'
 
     @staticmethod
+    def _format_submission_risk_html(f: Any) -> str:
+        from reporting.base import ReporterBase
+        score = f.get("submission_risk_score", 0) if isinstance(f, dict) else getattr(f, "submission_risk_score", 0)
+        if not score and score != 0:
+            score = ReporterBase._compute_submission_risk_score(f)
+        if score <= 20:
+            color = "#2ecc71"
+        elif score <= 45:
+            color = "#3498db"
+        elif score <= 70:
+            color = "#f39c12"
+        else:
+            color = "#e74c3c"
+        para = ReporterBase._format_submission_risk_paragraph(f)
+        return f'<div class="row"><strong>Submission Risk:</strong> <span style="color:{color};font-weight:600">{score}/100</span><br><em style="color:#666;font-size:0.9em">{para}</em></div>'
+
+    @staticmethod
     def _get_confidence_reasons_html(f: Any) -> str:
         reasons = f.get("confidence_reasons")
         if not reasons or not isinstance(reasons, list) or len(reasons) == 0:
@@ -631,6 +648,7 @@ class HTMLReporter(ReporterBase):
                     {self._get_confidence_reasons_html(f)}
                     {self._format_duplicate_risk_html(f)}
                     {self._format_consensus_html(f)}
+                    {self._format_submission_risk_html(f)}
                     <div class="row"><strong>Impact:</strong> {e_impact}</div>
                     {self._get_structured_impact_html(f)}
                     <div class="row"><strong>Remediation:</strong> {e_remediation}</div>

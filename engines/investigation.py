@@ -401,6 +401,7 @@ class InvestigationEngine:
     def _build_result(
         self, task: InvestigationTask, success: bool, delta: int,
         next_strategy: str | None, evidence_fp: str,
+        reason: str = "",
     ) -> InvestigationResult:
         task.completed = True
         task.result_fingerprint = evidence_fp
@@ -410,6 +411,7 @@ class InvestigationEngine:
             confidence_delta=delta if success else 0,
             success=success,
             next_strategy=next_strategy,
+            reason=reason,
         )
 
     def _make_request(
@@ -479,11 +481,13 @@ class InvestigationEngine:
 
     def _exec_oob(self, task: InvestigationTask, finding: Finding, strategy: str) -> InvestigationResult:
         if not self.oob:
-            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="",
+                reason="capability_unavailable")
         fp = finding.fingerprint or ""
         payload_url = self.oob.callback_url
         if not payload_url:
-            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="",
+                reason="capability_unavailable")
 
         # Use the target URL param if available
         probe_url = f"{finding.url}&oob={hashlib.md5(payload_url.encode()).hexdigest()[:8]}" if "?" in (finding.url or "") else finding.url
@@ -527,8 +531,15 @@ class InvestigationEngine:
             ]
 
         fp = finding.fingerprint or ""
+        probe_url_tmpl = finding.url
         for target in targets:
-            resp, req_ev, resp_ev = self._make_request(target, finding, timeout=5)
+            probe_url = probe_url_tmpl
+            if "?" in (probe_url or ""):
+                probe_url = f"{probe_url}&ssrf_url={target}"
+            elif probe_url:
+                probe_url = f"{probe_url}?ssrf_url={target}"
+
+            resp, req_ev, resp_ev = self._make_request(probe_url, finding, timeout=10)
             if resp is not None and resp.status_code < 500:
                 if req_ev:
                     self._record_evidence(req_ev, fp)
@@ -536,12 +547,20 @@ class InvestigationEngine:
                     self._record_evidence(resp_ev, fp)
                 return self._build_result(task, success=True,
                     delta=CONFIDENCE_BOOST.get(strategy, 30),
-                    next_strategy=next_s, evidence_fp=resp_ev.to_dict().get("evidence_type", "ssrf_probe") if resp_ev else fp)
+                    next_strategy=next_s,
+                    evidence_fp=self._record_evidence(
+                        ResponseDiffEvidence(
+                            original_response=finding.response_excerpt or "",
+                            new_response=f"SSRF probe returned status {resp.status_code} for {target}",
+                            comparison=f"SSRF probe via param injection to {target}",
+                            status=EvidenceStatus.VERIFIED,
+                        ), fp))
         return self._build_result(task, success=False, delta=0, next_strategy=next_s, evidence_fp="")
 
     def _exec_browser(self, task: InvestigationTask, finding: Finding, strategy: str) -> InvestigationResult:
         if not self.browser:
-            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="")
+            return self._build_result(task, success=False, delta=0, next_strategy=None, evidence_fp="",
+                reason="capability_unavailable")
         fp = finding.fingerprint or ""
 
         try:
@@ -576,20 +595,88 @@ class InvestigationEngine:
         elif strategy == "vertical_idor":
             next_s = "ownership_validation"
 
-        resp, req_ev, resp_ev = self._make_request(finding.url, finding)
-        if resp is None:
-            return self._build_result(task, success=False, delta=0, next_strategy=next_s, evidence_fp="")
-        fp = finding.fingerprint or ""
-        if req_ev:
-            self._record_evidence(req_ev, fp)
-        if resp_ev:
-            self._record_evidence(resp_ev, fp)
+        role_sessions = build_role_sessions(self.config, self.session)
+        if len(role_sessions) < 2:
+            return self._build_result(task, success=False, delta=0, next_strategy=next_s, evidence_fp="",
+                reason="capability_unavailable")
 
-        # IDOR detection via status / response diff
-        if resp.status_code == 200:
+        fp = finding.fingerprint or ""
+        roles = list(role_sessions.keys())
+        default_role = roles[0]
+        other_roles = roles[1:]
+        default_sess = role_sessions[default_role]
+
+        try:
+            resp_a = default_sess.get(finding.url, timeout=15, allow_redirects=False)
+        except Exception:
+            return self._build_result(task, success=False, delta=0, next_strategy=next_s, evidence_fp="")
+
+        req_ev = HttpRequestEvidence(
+            method="GET", url=finding.url,
+            headers=dict(resp_a.request.headers) if resp_a.request else {},
+            description=f"IDOR probe as {default_role}: {finding.url}",
+            status=EvidenceStatus.COLLECTED,
+        )
+        resp_ev = HttpResponseEvidence(
+            status_code=resp_a.status_code,
+            headers=dict(resp_a.headers),
+            body=resp_a.text[:4000],
+            description=f"Response as {default_role}: {finding.url}",
+            status=EvidenceStatus.VERIFIED if resp_a.ok else EvidenceStatus.COLLECTED,
+        )
+        self._record_evidence(req_ev, fp)
+        self._record_evidence(resp_ev, fp)
+
+        body_a = resp_a.text or ""
+        status_a = resp_a.status_code
+        success_count = 0
+
+        for alt_role in other_roles:
+            alt_sess = role_sessions[alt_role]
+            try:
+                resp_b = alt_sess.get(finding.url, timeout=10, allow_redirects=False)
+            except Exception:
+                continue
+            body_b = resp_b.text or ""
+            status_b = resp_b.status_code
+
+            # Both succeed but bodies differ → data leakage
+            if status_a == 200 and status_b == 200 and body_a != body_b:
+                success_count += 1
+                authz_ev = AuthorizationComparisonEvidence(
+                    url=finding.url,
+                    original_role=default_role,
+                    target_role=alt_role,
+                    original_status=status_a,
+                    target_status=status_b,
+                    original_body_excerpt=body_a[:500],
+                    target_body_excerpt=body_b[:500],
+                    body_diff_detected=True,
+                    description=f"Cross-account IDOR ({strategy}): {default_role} vs {alt_role} differ at {finding.url}",
+                    status=EvidenceStatus.ANALYZED,
+                )
+                self._record_evidence(authz_ev, fp)
+            # Status bypass: alt gets content default role cannot
+            elif status_a != 200 and status_b == 200:
+                success_count += 1
+                authz_ev = AuthorizationComparisonEvidence(
+                    url=finding.url,
+                    original_role=default_role,
+                    target_role=alt_role,
+                    original_status=status_a,
+                    target_status=status_b,
+                    original_body_excerpt="",
+                    target_body_excerpt=body_b[:500],
+                    body_diff_detected=True,
+                    description=f"Status bypass ({strategy}): {default_role} got {status_a}, {alt_role} got {status_b} at {finding.url}",
+                    status=EvidenceStatus.ANALYZED,
+                )
+                self._record_evidence(authz_ev, fp)
+
+        if success_count:
             return self._build_result(task, success=True,
                 delta=CONFIDENCE_BOOST.get(strategy, 20),
-                next_strategy=next_s, evidence_fp=resp_ev.to_dict().get("evidence_type", "idor_probe") if resp_ev else fp)
+                next_strategy=next_s, evidence_fp=fp)
         return self._build_result(task, success=False, delta=0, next_strategy=next_s, evidence_fp="")
 
     def _exec_sqli(self, task: InvestigationTask, finding: Finding, strategy: str) -> InvestigationResult:
