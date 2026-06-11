@@ -350,19 +350,40 @@ class HackerOneClient:
             expected_value_score=d.get("expected_value_score", 0.0),
         )
 
-    def list_programmes_ranked(self) -> list[ProgrammeIntel]:
+    @staticmethod
+    def _provisional_score(attrs: dict) -> float:
+        """Quick score from list data — no extra API calls."""
+        payout = attrs.get("payout", {}) or {}
+        raw_max = attrs.get("maximum_bounty", {}) or payout
+        crit = int(raw_max.get("critical", 0) if isinstance(raw_max, dict) else raw_max.get("maximum", 0) or 0)
+        high = int(raw_max.get("high", 0) if isinstance(raw_max, dict) else 0)
+        med = int(raw_max.get("medium", 0) if isinstance(raw_max, dict) else 0)
+        total = crit * 0.05 + high * 0.15 + med * 0.30
+        if attrs.get("offers_bounties", False) or attrs.get("bounty", False):
+            total += 10
+        return total
+
+    def list_programmes_ranked(self, top_n: int = 20) -> list[ProgrammeIntel]:
         cache_data = _load_cache(self._cache_path)
         try:
             programmes = self.get_programmes()
         except HackerOneAPIError as e:
             print(f"[!] HackerOne API error: {e}")
             return []
-        ranked = []
+        # Score provisionally from list data, pick top candidates
+        scored = []
         for p in programmes:
             attrs = p.get("attributes", {}) or {}
             handle = attrs.get("handle", "")
             if not handle:
                 continue
+            score = self._provisional_score(attrs)
+            scored.append((score, handle, attrs))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        candidates = scored[:top_n]
+        # Build detailed intel only for the top candidates
+        ranked: list[ProgrammeIntel] = []
+        for _, handle, attrs in candidates:
             cached = cache_data.get(handle)
             if cached and not _is_cache_stale(cached):
                 intel = self._dict_to_intel(cached["intel"])
