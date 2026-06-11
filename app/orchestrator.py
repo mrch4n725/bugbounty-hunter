@@ -168,6 +168,7 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
         "cors", "jwt", "cms",
         "rate_limiting",
         "tech_specific", "business_logic",
+        "auth_bypass", "smuggling",
         "recon",
     }
 
@@ -292,6 +293,8 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
         "cms": scanner.scan_cms_checks,
         "tech_specific": _run_tech,
         "business_logic": _run_bl,
+        "auth_bypass": scanner.scan_auth_bypass,
+        "smuggling": scanner.scan_smuggling,
         "recon": lambda: [],
     }
     _api_scanner = ApiScanner(scanner.config, scanner.recon, container=container)

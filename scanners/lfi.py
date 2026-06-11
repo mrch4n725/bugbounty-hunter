@@ -16,6 +16,7 @@ from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
     safe_cookies_dict,
+    inject_param,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 import base64
@@ -76,14 +77,6 @@ class LFIScanner(ScannerBase):
         return self._payloads
 
     @staticmethod
-    def _inject_param(url: str, param: str, value: str) -> str:
-        from urllib.parse import urlencode, urlunparse
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query, keep_blank_values=True)
-        params[param] = [value]
-        new_query = urlencode(params, doseq=True)
-        return urlunparse(parsed._replace(query=new_query))
-
     def detect(self, url: str, parameter: str) -> DetectionResult | None:
         payloads = self._get_payloads()
         baseline_resp = safe_get(self.session, url, self.timeout)
@@ -92,7 +85,7 @@ class LFIScanner(ScannerBase):
         baseline_body = baseline_resp.text or ""
         for payload in payloads:
             try:
-                test_url = self._inject_param(url, parameter, payload)
+                test_url = inject_param(url, parameter, payload)
                 resp = safe_get(self.session, test_url, self.timeout)
                 if resp:
                     body = resp.text
@@ -158,7 +151,7 @@ class LFIScanner(ScannerBase):
             ]
             for payload in zip_payloads:
                 try:
-                    test_url = self._inject_param(url, parameter, payload)
+                    test_url = inject_param(url, parameter, payload)
                     resp = safe_get(self.session, test_url, self.timeout)
                     if resp:
                         body = resp.text
@@ -267,7 +260,7 @@ class LFIScanner(ScannerBase):
             ]
             extras_hit = 0
             for alt in extra_payloads:
-                alt_url = self._inject_param(detection.url, detection.parameter, alt)
+                alt_url = inject_param(detection.url, detection.parameter, alt)
                 ar = safe_get(self.session, alt_url, self.timeout)
                 if ar and any(s in (ar.text or "") for s in LFI_SIGNATURES):
                     extras_hit += 1
@@ -364,7 +357,7 @@ class LFIScanner(ScannerBase):
                                         "/proc/self/environ",
                                     ]
                                     for log_path in log_paths:
-                                        log_test_url = self._inject_param(url, param, log_path)
+                                        log_test_url = inject_param(url, param, log_path)
                                         log_resp = safe_get(self.session, log_test_url, self.timeout)
                                         if log_resp:
                                             log_body = log_resp.text or ""
@@ -388,7 +381,7 @@ class LFIScanner(ScannerBase):
                                 "/proc/self/fd/0",
                             ]
                             for proc_path in proc_paths:
-                                proc_test_url = self._inject_param(url, param, proc_path)
+                                proc_test_url = inject_param(url, param, proc_path)
                                 proc_resp = safe_get(self.session, proc_test_url, self.timeout)
                                 if proc_resp:
                                     proc_body = proc_resp.text or ""

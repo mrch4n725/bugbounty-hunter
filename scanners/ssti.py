@@ -23,6 +23,7 @@ from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
     safe_cookies_dict,
+    inject_param,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
@@ -81,14 +82,6 @@ class SSTIScanner(ScannerBase):
     TARGET_LEVEL = False
 
     @staticmethod
-    def _inject_param(url: str, param: str, value: str) -> str:
-        from urllib.parse import urlencode, urlunparse
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query, keep_blank_values=True)
-        params[param] = [value]
-        new_query = urlencode(params, doseq=True)
-        return urlunparse(parsed._replace(query=new_query))
-
     def _has_pre_existing_result(self, url: str, parameter: str) -> bool:
         """Fetch page without payload — skip if result values already present in baseline."""
         baseline = safe_get(self.session, url, self.timeout)
@@ -104,7 +97,7 @@ class SSTIScanner(ScannerBase):
         return False
 
     def _error_fingerprint(self, url: str, parameter: str) -> str | None:
-        test_url = self._inject_param(url, parameter, "{{")
+        test_url = inject_param(url, parameter, "{{")
         resp = safe_get(self.session, test_url, self.timeout)
         if not resp:
             return None
@@ -126,18 +119,18 @@ class SSTIScanner(ScannerBase):
         if engine_from_error:
             self._detected_engine = engine_from_error
         test_value = "__SSTI_REFLECT_TEST__"
-        reflect_url = self._inject_param(url, parameter, test_value)
+        reflect_url = inject_param(url, parameter, test_value)
         reflect_resp = safe_get(self.session, reflect_url, self.timeout)
         reflects_content = reflect_resp and test_value in reflect_resp.text
         if reflects_content:
             for payload in POLYGLOT_PROBES:
-                test_url = self._inject_param(url, parameter, payload)
+                test_url = inject_param(url, parameter, payload)
                 resp = safe_get(self.session, test_url, self.timeout)
                 if resp:
                     body = resp.text
                     if "7777777" in body or "49" in body:
                         second = "{{7*'7'}}${7*7}"
-                        second_url = self._inject_param(url, parameter, second)
+                        second_url = inject_param(url, parameter, second)
                         second_resp = safe_get(self.session, second_url, self.timeout)
                         second_confirmed = second_resp and ("7777777" in second_resp.text or "49" in second_resp.text)
                         signals = ["Polyglot detection"]
@@ -148,7 +141,7 @@ class SSTIScanner(ScannerBase):
         payloads = SSTI_PAYLOADS
         standard_sent_no_eval = False
         for payload in payloads.get("arithmetic", []):
-            test_url = self._inject_param(url, parameter, payload)
+            test_url = inject_param(url, parameter, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if not resp:
                 continue
@@ -167,7 +160,7 @@ class SSTIScanner(ScannerBase):
                     second_payload = "{{7*7}}"
                 else:
                     second_payload = "{{7-7}}"
-                second_url = self._inject_param(url, parameter, second_payload)
+                second_url = inject_param(url, parameter, second_payload)
                 second_resp = safe_get(self.session, second_url, self.timeout)
                 second_confirmed = False
                 if second_resp:
@@ -203,11 +196,11 @@ class SSTIScanner(ScannerBase):
                 )
         if standard_sent_no_eval:
             for payload in BYPASS_PAYLOADS:
-                test_url = self._inject_param(url, parameter, payload)
+                test_url = inject_param(url, parameter, payload)
                 resp = safe_get(self.session, test_url, self.timeout)
                 if resp and "49" in resp.text:
                     second = "{{7-7}}"
-                    second_url = self._inject_param(url, parameter, second)
+                    second_url = inject_param(url, parameter, second)
                     second_resp = safe_get(self.session, second_url, self.timeout)
                     second_confirmed = second_resp and "0" in second_resp.text and "{{7-7}}" not in second_resp.text
                     signals = ["Filter bypass SSTI"]
@@ -236,7 +229,7 @@ class SSTIScanner(ScannerBase):
         payloads = SSTI_PAYLOADS
         engine_sigs = []
         for engine, payload, expected in payloads.get("engine_fingerprint", []):
-            test_url = self._inject_param(detection.url, detection.parameter, payload)
+            test_url = inject_param(detection.url, detection.parameter, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if resp and expected and expected in resp.text:
                 engine_sigs.append(engine)
@@ -245,7 +238,7 @@ class SSTIScanner(ScannerBase):
         verified_engine = None
         engine_bodies = []
         for engine_name, fp_payload, expected in payloads.get("engine_fingerprint", []):
-            test_url = self._inject_param(detection.url, detection.parameter, fp_payload)
+            test_url = inject_param(detection.url, detection.parameter, fp_payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if resp:
                 engine_bodies.append((engine_name, resp.text))
@@ -268,7 +261,7 @@ class SSTIScanner(ScannerBase):
     def exploit(self, detection: DetectionResult, validation: dict | None = None) -> dict:
         payloads = SSTI_PAYLOADS
         for payload in payloads.get("read_proof", []):
-            test_url = self._inject_param(detection.url, detection.parameter, payload)
+            test_url = inject_param(detection.url, detection.parameter, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if resp and len(resp.text) > 500 and payload not in resp.text:
                 return {"confirmed": True, "proof": f"Read-proof payload '{payload}' produced {len(resp.text)} chars of output", "response": resp}

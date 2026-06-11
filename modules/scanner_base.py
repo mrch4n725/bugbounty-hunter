@@ -25,6 +25,7 @@ class ScannerModuleBase(VulnScanner):
     """Minimal base for scanner modules. Subclasses provide scan logic."""
 
     def __init__(self, config: dict, recon_data: dict, container=None):
+        super().__init__(config, recon_data, container=container)
         self.config    = config
         self.recon     = recon_data
         self.container = container
@@ -81,18 +82,11 @@ class ScannerModuleBase(VulnScanner):
                 result.append(f)
         return result
 
-    @staticmethod
-    def _inject_param(url: str, param: str, payload: str) -> str:
-        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-        try:
-            parsed = urlparse(url)
-            qs = parse_qs(parsed.query, keep_blank_values=True)
-            qs[param] = [payload]
-            new_query = urlencode(qs, doseq=True)
-            return urlunparse(parsed._replace(query=new_query))
-        except Exception:
-            return url
+    def _inject_param(self, url: str, param: str, value: str) -> str:
+        from modules.utils import inject_param
+        return inject_param(url, param, value)
 
+    @staticmethod
     def _get_module_param(self, module_name: str, key: str, default=None):
         return self.config.get("module_params", {}).get(module_name, {}).get(key, default)
 

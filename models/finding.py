@@ -204,6 +204,8 @@ class Finding:
     }
 
     def __getitem__(self, key: str) -> Any:
+        if key == "confidence":
+            return self.confidence_label
         if key in self._DICT_ATTR_MAP:
             key = self._DICT_ATTR_MAP[key]
         try:

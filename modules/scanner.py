@@ -29,7 +29,7 @@ from modules.utils import (
     reset_seen_findings, _build_curl,
     enrich_finding_confidence, add_capability_confidence_reasons,
     link_finding_evidence, collect_and_link_evidence,
-    safe_cookies_dict,
+    safe_cookies_dict, inject_param,
 )
 from engines import ValidationEngine, EvidenceEngine, DeduplicationEngine
 from engines.baseline import BaselineFingerprinter
@@ -678,7 +678,7 @@ class VulnScanner:
                 # Retry with simpler payload
                 simple_payloads = ["<script>alert(1)</script>", "<img src=x onerror=alert(1)>"]
                 for sp in simple_payloads:
-                    test_url = self._inject_param(url, param or "q", sp)
+                    test_url = inject_param(url, param or "q", sp)
                     exec_result = self.browser.check_xss_execution(test_url, sp)
                     if exec_result and (exec_result.get("alert_fired") or exec_result.get("dom_mutation")):
                         f["verification_stage"] = VerificationStage.VERIFIED.value
@@ -903,16 +903,6 @@ class VulnScanner:
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
-    def _inject_param(self, url: str, param: str, payload: str) -> str:
-        try:
-            parsed = urlparse(url)
-            qs = parse_qs(parsed.query, keep_blank_values=True)
-            qs[param] = [payload]
-            new_query = urlencode(qs, doseq=True)
-            return urlunparse(parsed._replace(query=new_query))
-        except Exception:
-            return url
-
     def _urls_with_params(self) -> list[str]:
         return [u for u in self.recon.get("urls", []) if "?" in u]
 
@@ -1110,7 +1100,7 @@ class VulnScanner:
         # Stage 1: Arithmetic reflection detection
         arithmetic_results = []
         for payload in ssti_payloads.get("arithmetic", SSTI_PAYLOADS.get("arithmetic", [])):
-            test_url = self._inject_param(url, param, payload)
+            test_url = inject_param(url, param, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if not resp:
                 continue
@@ -1139,7 +1129,7 @@ class VulnScanner:
         # Stage 2: Engine fingerprinting
         engine_sigs = []
         for engine, payload, expected in ssti_payloads.get("engine_fingerprint", SSTI_PAYLOADS.get("engine_fingerprint", [])):
-            test_url = self._inject_param(url, param, payload)
+            test_url = inject_param(url, param, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if resp and expected and expected in resp.text:
                 engine_sigs.append(engine)
@@ -1150,7 +1140,7 @@ class VulnScanner:
         verified_engine = None
         engine_bodies = []
         for engine_name, fp_payload, expected in ssti_payloads.get("engine_fingerprint", SSTI_PAYLOADS.get("engine_fingerprint", [])):
-            test_url = self._inject_param(url, param, fp_payload)
+            test_url = inject_param(url, param, fp_payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if resp:
                 engine_bodies.append((engine_name, resp.text))
@@ -1169,7 +1159,7 @@ class VulnScanner:
         read_proof = []
         if verified_engine or has_arithmetic:
             for payload in ssti_payloads.get("read_proof", SSTI_PAYLOADS.get("read_proof", [])):
-                test_url = self._inject_param(url, param, payload)
+                test_url = inject_param(url, param, payload)
                 resp = safe_get(self.session, test_url, self.timeout)
                 if resp and len(resp.text) > 500 and payload not in resp.text:
                     read_proof.append(payload)
@@ -1241,7 +1231,7 @@ class VulnScanner:
             lower_baseline = baseline_resp.text.lower()
             baseline_sql_errors = {err for err in SQLI_ERRORS if err in lower_baseline}
         for payload in payloads.get("error_based", []):
-            test_url = self._inject_param(url, param, payload)
+            test_url = inject_param(url, param, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if not resp:
                 continue
@@ -1261,8 +1251,8 @@ class VulnScanner:
                 baseline_hash = hashlib.md5(baseline.text.encode()).hexdigest()
                 baseline_len = len(baseline.text)
                 for true_cond, false_cond in boolean_pairs:
-                    true_url = self._inject_param(url, param, f"{original_value} {true_cond}")
-                    false_url = self._inject_param(url, param, f"{original_value} {false_cond}")
+                    true_url = inject_param(url, param, f"{original_value} {true_cond}")
+                    false_url = inject_param(url, param, f"{original_value} {false_cond}")
                     true_resp = safe_get(self.session, true_url, self.timeout)
                     false_resp = safe_get(self.session, false_url, self.timeout)
                     if not (true_resp and false_resp):
@@ -1289,7 +1279,7 @@ class VulnScanner:
         baseline_stdev = statistics.stdev(baseline_delays) if len(baseline_delays) > 1 else 0.5
         min_time_threshold = max(baseline_mean + 3 * baseline_stdev, 5.0)
         for payload in payloads.get("time_based", []):
-            test_url = self._inject_param(url, param, payload)
+            test_url = inject_param(url, param, payload)
             delays = []
             time_resp = None
             for _ in range(2):
@@ -1306,7 +1296,7 @@ class VulnScanner:
 
         # ── UNION-based (column counting via ORDER BY + UNION SELECT NULL) ──
         for payload in payloads.get("union", []):
-            test_url = self._inject_param(url, param, payload)
+            test_url = inject_param(url, param, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if not resp:
                 continue
@@ -1334,7 +1324,7 @@ class VulnScanner:
         if oob_host:
             for payload in payloads.get("oob", []):
                 formatted = payload.replace("{oob}", f"{self.oob.callback_token}.{oob_host}")
-                test_url = self._inject_param(url, param, formatted)
+                test_url = inject_param(url, param, formatted)
                 safe_get(self.session, test_url, self.timeout, raise_for_status=False)
                 self.oob.register_interaction("sqli", formatted, test_url)
                 # Delay then poll for callback — OOB provides strongest evidence
@@ -1553,7 +1543,7 @@ class VulnScanner:
 
     def _build_ssrf_url(self, url: str, parsed, original_params: dict, param: str, payload: str) -> str:
         if param in original_params:
-            return self._inject_param(url, param, payload)
+            return inject_param(url, param, payload)
         separator = "&" if parsed.query else "?"
         return f"{url}{separator}{urlencode({param: payload})}"
 
@@ -1586,7 +1576,7 @@ class VulnScanner:
 
         # Output-based detection
         for payload, expected in cmdi_payloads.get("unix", CMD_INJECTION_PAYLOADS.get("unix", [])):
-            test_url = self._inject_param(url, param, payload)
+            test_url = inject_param(url, param, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if not resp:
                 continue
@@ -1607,7 +1597,7 @@ class VulnScanner:
 
         if not signals["output"]:
             for payload, expected in cmdi_payloads.get("windows", CMD_INJECTION_PAYLOADS.get("windows", [])):
-                test_url = self._inject_param(url, param, payload)
+                test_url = inject_param(url, param, payload)
                 resp = safe_get(self.session, test_url, self.timeout)
                 if not resp:
                     continue
@@ -1630,7 +1620,7 @@ class VulnScanner:
             safe_get(self.session, url, timeout=15, raise_for_status=False)
             baseline_delay = time.time() - baseline_start
             for payload, min_delay in cmdi_payloads.get("time_based", CMD_INJECTION_PAYLOADS.get("time_based", [])):
-                test_url = self._inject_param(url, param, payload)
+                test_url = inject_param(url, param, payload)
                 delays = []
                 time_resp = None
                 for _ in range(2):
@@ -1649,7 +1639,7 @@ class VulnScanner:
         if oob_host:
             for payload_template in cmdi_payloads.get("oob", CMD_INJECTION_PAYLOADS.get("oob", [])):
                 payload = payload_template.replace("{oob}", f"{self.oob.callback_token}.{oob_host}")
-                test_url = self._inject_param(url, param, payload)
+                test_url = inject_param(url, param, payload)
                 safe_get(self.session, test_url, self.timeout, raise_for_status=False)
                 self.oob.register_interaction("cmd_injection", payload, test_url)
                 time.sleep(1)
@@ -1733,7 +1723,7 @@ class VulnScanner:
         all_payloads = list(base) + polyglots
 
         for payload in all_payloads:
-            test_url = self._inject_param(url, param, payload)
+            test_url = inject_param(url, param, payload)
             self._record_second_order(url, param, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if not resp:
@@ -1746,7 +1736,7 @@ class VulnScanner:
             # Use context-aware payloads for this context
             context_payloads = CONTEXT_XSS_PAYLOADS.get(context, [payload])
             for ctx_payload in context_payloads:
-                ctx_url = self._inject_param(url, param, ctx_payload)
+                ctx_url = inject_param(url, param, ctx_payload)
                 ctx_resp = safe_get(self.session, ctx_url, self.timeout)
                 if not ctx_resp:
                     continue
@@ -1914,7 +1904,7 @@ class VulnScanner:
                     baseline_body = baseline_resp.text if baseline_resp else ""
                     for payload in lfi_payloads:
                         try:
-                            test_url = self._inject_param(url, param, payload)
+                            test_url = inject_param(url, param, payload)
                             resp = safe_get(self.session, test_url, self.timeout)
                             if resp:
                                 body = resp.text
@@ -1963,7 +1953,7 @@ class VulnScanner:
                 for param in redirect_params:
                     for payload in OPEN_REDIRECT_PAYLOADS:
                         try:
-                            test_url = self._inject_param(url, param, payload)
+                            test_url = inject_param(url, param, payload)
                             resp = safe_get(self.session, test_url, self.timeout, allow_redirects=False)
                             if not resp:
                                 continue
@@ -3051,6 +3041,12 @@ class VulnScanner:
             return result
         return []
 
+    def scan_smuggling(self, target_urls: list[str] | None = None) -> list[dict]:
+        """Dispatch to RequestSmugglingScanner (ScannerBase)."""
+        if result := self._dispatch_to_scanner("smuggling"):
+            return result
+        return []
+
     def scan_cms_checks(self, target_urls: list[str] | None = None) -> list[dict]:
         """Scan for CMS-specific vulnerabilities based on technology fingerprint.
 
@@ -3068,13 +3064,16 @@ class VulnScanner:
 
         detected_platforms = set(all_cms + all_frameworks)
 
+        platform_lower_map = {k.lower(): (k, v) for k, v in CMS_CHECKS.items()}
         for platform in detected_platforms:
-            checks = CMS_CHECKS.get(platform, [])
+            pl = platform.lower()
+            checks = []
+            if pl in platform_lower_map:
+                checks = platform_lower_map[pl][1]
             if not checks:
-                # Check partial matches (e.g. "WordPress" in detected name)
-                for key, value in CMS_CHECKS.items():
-                    if key.lower() in platform.lower():
-                        checks = value
+                for pl_key, (orig_key, val) in platform_lower_map.items():
+                    if pl_key in pl:
+                        checks = val
                         break
 
             for check in checks:

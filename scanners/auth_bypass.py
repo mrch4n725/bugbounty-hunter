@@ -6,24 +6,20 @@ Tests:
 - alg: none JWT bypass
 - role claim manipulation in JWTs
 - header-based access bypass (X-Original-URL, X-Rewrite-URL, etc.)
-- HTTP method override (GET → DELETE, etc.)
+- HTTP method override (GET to DELETE, etc.)
 
 Maturity: Level 2 (Detect + Validate)
 """
 
 import base64
 import json
-import re
-from typing import Any
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse
 
 from models.finding import Finding
-from models.evidence import HttpRequestEvidence, ResponseExcerptEvidence
 from modules.utils import (
-    safe_get, safe_post, finding, log, Colors, _build_curl,
-    VerificationStage,
+    safe_get, finding, log, Colors, _build_curl,
 )
-from scanners.base import ScannerBase, DetectionResult, ValidationResult
+from scanners.base import ScannerBase
 
 
 NULL_TOKEN_VARIANTS = [
@@ -60,8 +56,6 @@ HEADER_BYPASS_SET = [
     ("Authorization", "Basic YWRtaW46YWRtaW4="),
 ]
 
-
-# Common admin/restricted paths to test bypasses against
 SENSITIVE_PATHS = [
     "/admin", "/administrator", "/admin/", "/api/admin",
     "/api/v1/admin", "/api/v2/admin",
@@ -80,7 +74,6 @@ class AuthBypassScanner(ScannerBase):
     TARGET_LEVEL = True
 
     def _build_jwt(self, header: dict, payload: dict) -> str:
-        """Build a JWT string from header and payload dicts."""
         def _b64(data: dict) -> str:
             raw = json.dumps(data, separators=(",", ":")).encode()
             return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
@@ -96,7 +89,6 @@ class AuthBypassScanner(ScannerBase):
         return paths
 
     def _is_protected(self, url: str) -> bool:
-        """Check if an endpoint returns 401/403/302 to login page."""
         resp = safe_get(self.session, url, self.timeout, raise_for_status=False,
                         allow_redirects=False)
         if not resp:
@@ -109,8 +101,7 @@ class AuthBypassScanner(ScannerBase):
                 return True
         return False
 
-    def _test_null_token(self, url: str, findings: list) -> None:
-        """Test if null/undefined/empty tokens are accepted."""
+    def _test_null_token(self, url: str) -> None:
         auth_headers = ["Authorization", "X-Auth-Token", "X-API-Key", "Token"]
         for header in auth_headers:
             for token in NULL_TOKEN_VARIANTS:
@@ -143,12 +134,10 @@ class AuthBypassScanner(ScannerBase):
                             verbose_only=True, verbose=self.verbose)
                     return
 
-    def _test_jwt_none_algorithm(self, url: str, findings: list) -> None:
-        """Test JWT endpoints with alg: none tokens."""
+    def _test_jwt_none_algorithm(self, url: str) -> None:
         for jwt_body in JWT_NONE_ALG_PAYLOADS:
-            token = jwt_body
             resp = safe_get(self.session, url, self.timeout,
-                            headers={"Authorization": f"Bearer {token}"},
+                            headers={"Authorization": f"Bearer {jwt_body}"},
                             raise_for_status=False)
             if resp and resp.status_code == 200:
                 f_dict = finding(
@@ -161,7 +150,7 @@ class AuthBypassScanner(ScannerBase):
                     response_excerpt=(resp.text or "")[:500],
                     steps_to_reproduce=[
                         f"Send request to {url} with Authorization: "
-                        f"Bearer {token[:60]}...",
+                        f"Bearer {jwt_body[:60]}...",
                         "This JWT has 'alg: none' — no signature required",
                         f"Server returned HTTP {resp.status_code}, "
                         "confirming the unsigned token was accepted",
@@ -174,9 +163,7 @@ class AuthBypassScanner(ScannerBase):
                         Colors.RED, verbose_only=True, verbose=self.verbose)
                 return
 
-    def _test_role_manipulation(self, url: str, findings: list) -> None:
-        """Test endpoints for role-based authorization bypass
-        via claim injection in JWTs or JSON body."""
+    def _test_role_manipulation(self, url: str) -> None:
         for claim in ROLE_MANIPULATION_CLAIMS:
             for payload_key in ("admin", "role", "is_admin"):
                 if payload_key in claim:
@@ -216,8 +203,7 @@ class AuthBypassScanner(ScannerBase):
                         Colors.RED, verbose_only=True, verbose=self.verbose)
                 return
 
-    def _test_header_bypass(self, url: str, findings: list) -> None:
-        """Test HTTP header-based access bypass."""
+    def _test_header_bypass(self, url: str) -> None:
         for header_name, header_val in HEADER_BYPASS_SET:
             resp = safe_get(self.session, url, self.timeout,
                             headers={header_name: header_val},
@@ -263,10 +249,9 @@ class AuthBypassScanner(ScannerBase):
                 continue
             log(f"  [AuthBypass] Testing {url[:70]}", Colors.CYAN,
                 verbose_only=True, verbose=self.verbose)
-            findings = []
-            self._test_null_token(url, findings)
-            self._test_jwt_none_algorithm(url, findings)
-            self._test_role_manipulation(url, findings)
-            self._test_header_bypass(url, findings)
+            self._test_null_token(url)
+            self._test_jwt_none_algorithm(url)
+            self._test_role_manipulation(url)
+            self._test_header_bypass(url)
 
         return self._get_findings()

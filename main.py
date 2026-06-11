@@ -36,7 +36,7 @@ def parse_args():
     parser.add_argument("--config", "-C", help="Path to YAML configuration file")
     parser.add_argument("--target", "-t", help="Target URL (e.g. https://example.com)")
     parser.add_argument("--modules", "-m", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization", "cors", "jwt", "cms", "tech_specific", "business_logic", "auth_bypass", "all"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization", "cors", "jwt", "cms", "tech_specific", "business_logic", "auth_bypass", "smuggling", "all"],
         default=["all"])
     parser.add_argument("--output", "-o", default="reports")
     parser.add_argument("--format", "-f", choices=["json", "html", "txt", "markdown-report", "hackerone", "bugcrowd", "chatgpt"], default="chatgpt")
@@ -61,7 +61,7 @@ def parse_args():
         help="Allow automatic OOB service discovery (contacts dnslog.cn / interactsh at startup). Off by default.")
     parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
     parser.add_argument("--disable-modules", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization", "cors", "jwt", "cms", "tech_specific", "business_logic", "auth_bypass"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization", "cors", "jwt", "cms", "tech_specific", "business_logic", "auth_bypass", "smuggling"],
         default=[], help="Disable specific modules when scanning all or default modules")
     parser.add_argument("--module-param", action="append", default=[],
         help="Override module settings using module.key=value")
@@ -161,8 +161,6 @@ def parse_args():
         help="GitHub token for code leak search")
     parser.add_argument("--waf-evasion", action="store_true",
         help="Enable WAF fingerprinting and payload evasion (encoding/fragmentation)")
-    parser.add_argument("--smuggling", action="store_true",
-        help="Enable HTTP request smuggling detection (CL.TE, TE.CL, TE.TE)")
     parser.add_argument("--business-logic", action="store_true",
         help="Enable business logic flaw testing (workflow bypass, race conditions, price manipulation)")
     parser.add_argument("--prioritize-submissions", action="store_true",
@@ -453,7 +451,7 @@ _SCAN_MODULES = frozenset({
     "exposed_files", "clickjacking", "http_methods", "insecure_forms",
     "subdomain_takeover", "graphql", "idor", "api",
     "rate_limiting", "openapi", "authorization", "cors", "jwt", "cms",
-    "tech_specific", "business_logic", "auth_bypass",
+    "tech_specific", "business_logic", "auth_bypass", "smuggling",
 })
 
 def _should_run_recon(config: dict, run_all: bool, disabled_modules: set) -> bool:

@@ -1209,6 +1209,8 @@ _VULN_ALIASES: Dict[str, str] = {
     "SSTI Detection": "Potential SSTI",
     "SSTI Validation": "Likely SSTI",
     "SSTI Exploitation": "Confirmed SSTI",
+    "Confirmed SSRF": "Server-Side Request Forgery (SSRF)",
+    "Confirmed SSRF (OOB)": "Server-Side Request Forgery (SSRF)",
 }
 
 STEALTH_USER_AGENTS: List[str] = [
@@ -1334,7 +1336,7 @@ def finding(
     url: str,
     severity: str,
     details: str,
-    evidence: str = "",
+    evidence: str | list[str] = "",
     confidence: Optional[str] = None,
     proof: Optional[List[str]] = None,
     validation_steps: Optional[List[str]] = None,
@@ -1434,12 +1436,6 @@ def finding(
     f.finding_state = FindingState.from_verification_stage(f.verification_stage).value
     f.confidence_label = ConfidenceLevel.from_score(f.confidence_score).value
 
-    # Set dynamically-accessed legacy fields
-    # NOTE: "proof" maps to "evidence" and "validation_steps" maps to "reproduction_steps"
-    # via _DICT_ATTR_MAP — do NOT set them here as they'd overwrite the constructor values.
-    # Instead, code reading f["proof"] or f["validation_steps"] will get evidence/reproduction_steps.
-    f["confidence"] = confidence
-
     for key in (
         "cvss_score",
         "cvss_vector",
@@ -1447,6 +1443,7 @@ def finding(
         "impact",
         "remediation",
         "references",
+        "cwe",
     ):
         if key in meta:
             f[key] = meta[key]
@@ -2885,6 +2882,22 @@ def try_default_credentials(
         except Exception as e:
             log(f"[!] Default-cred check failed: {e}", Colors.YELLOW)
             return None, None, None
+
+
+def inject_param(url: str, param: str, value: str) -> str:
+    """Replace or add a query parameter in a URL.
+
+    Returns the original URL unmodified on any parsing failure.
+    """
+    from urllib.parse import urlencode, urlunparse, parse_qs
+    try:
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        params[param] = [value]
+        new_query = urlencode(params, doseq=True)
+        return urlunparse(parsed._replace(query=new_query))
+    except Exception:
+        return url
 
 
 # ── Backward-compatible re-exports ──────────────────────────────────────

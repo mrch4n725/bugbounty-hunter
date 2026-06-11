@@ -739,6 +739,9 @@ class ReporterBase:
             return req
         url = finding.get("url", "")
         method = "POST" if finding.get("parameter") and "form" in finding.get("details", "").lower() else "GET"
+        cookies = finding.get("cookies", {})
+        if cookies:
+            return _build_curl(method, url, {}, cookies=cookies)
         return _build_curl(method, url, {})
 
     def _build_impact_narrative(self, finding: Dict[str, Any]) -> str:

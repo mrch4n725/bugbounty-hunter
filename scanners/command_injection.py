@@ -18,6 +18,7 @@ from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
     safe_cookies_dict,
+    inject_param,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 from models.finding import Finding
@@ -295,7 +296,7 @@ class CommandInjectionScanner(ScannerBase):
 
         if param.lower() in ARGUMENT_INJECTION_PARAMS:
             for arg_payload in ARGUMENT_INJECTION_PAYLOADS:
-                test_url = self._inject_param(url, param, arg_payload)
+                test_url = inject_param(url, param, arg_payload)
                 resp = safe_get(self.session, test_url, self.timeout)
                 if not resp:
                     continue
@@ -310,7 +311,7 @@ class CommandInjectionScanner(ScannerBase):
                     break
 
         for payload, expected in cmdi_payloads.get("unix", CMD_INJECTION_PAYLOADS.get("unix", [])):
-            test_url = self._inject_param(url, param, payload)
+            test_url = inject_param(url, param, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if not resp:
                 continue
@@ -341,7 +342,7 @@ class CommandInjectionScanner(ScannerBase):
         if is_windows_target:
             win_payloads = ["%26whoami%26", "%7Cwhoami", "^whoami^"]
             for win_payload in win_payloads:
-                test_url = self._inject_param(url, param, win_payload)
+                test_url = inject_param(url, param, win_payload)
                 resp = safe_get(self.session, test_url, self.timeout)
                 if not resp:
                     continue
@@ -354,7 +355,7 @@ class CommandInjectionScanner(ScannerBase):
 
         if not signals["output"]:
             for payload, expected in cmdi_payloads.get("windows", CMD_INJECTION_PAYLOADS.get("windows", [])):
-                test_url = self._inject_param(url, param, payload)
+                test_url = inject_param(url, param, payload)
                 resp = safe_get(self.session, test_url, self.timeout)
                 if not resp:
                     continue
@@ -377,7 +378,7 @@ class CommandInjectionScanner(ScannerBase):
             baseline_delay = time.time() - baseline_start
             baseline_ms = baseline_delay * 1000
             for payload, min_delay in cmdi_payloads.get("time_based", CMD_INJECTION_PAYLOADS.get("time_based", [])):
-                test_url = self._inject_param(url, param, payload)
+                test_url = inject_param(url, param, payload)
                 delays = []
                 time_resp = None
                 for _ in range(2):
@@ -409,7 +410,7 @@ class CommandInjectionScanner(ScannerBase):
                 if isinstance(payload_template, tuple):
                     payload_template = payload_template[0]
                 payload = payload_template.replace("{oob}", oob_payload_str)
-                test_url = self._inject_param(url, param, payload)
+                test_url = inject_param(url, param, payload)
                 safe_get(self.session, test_url, self.timeout, raise_for_status=False)
                 self.validation.register_oob("cmd_injection", payload, test_url)
                 self._oob_registrations.append(("cmd_injection", payload, test_url))
@@ -498,11 +499,4 @@ class CommandInjectionScanner(ScannerBase):
             log(f"  [CMD OOB] {url_str}", Colors.RED, verbose_only=True, verbose=self.verbose)
         return extra
 
-    @staticmethod
-    def _inject_param(url: str, param: str, value: str) -> str:
-        from urllib.parse import urlencode, urlunparse
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query, keep_blank_values=True)
-        params[param] = [value]
-        new_query = urlencode(params, doseq=True)
-        return urlunparse(parsed._replace(query=new_query))
+

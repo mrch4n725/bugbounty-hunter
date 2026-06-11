@@ -25,6 +25,7 @@ from modules.utils import (
     finding, log, Colors, _build_curl, safe_get, safe_post,
     VerificationStage,
     safe_cookies_dict,
+    inject_param,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
@@ -535,7 +536,7 @@ class SQLiScanner(ScannerBase):
             lower_baseline = baseline_resp.text.lower()
             baseline_sql_errors = {err for err in SQLI_ERRORS if err in lower_baseline}
         for payload in payloads.get("error_based", []):
-            test_url = self._inject_param(url, param, payload)
+            test_url = inject_param(url, param, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if not resp:
                 continue
@@ -555,8 +556,8 @@ class SQLiScanner(ScannerBase):
                 baseline_words = set(baseline.text.lower().split())
                 baseline_len = len(baseline.text)
                 for true_cond, false_cond in boolean_pairs:
-                    true_url = self._inject_param(url, param, f"{original_value} {true_cond}")
-                    false_url = self._inject_param(url, param, f"{original_value} {false_cond}")
+                    true_url = inject_param(url, param, f"{original_value} {true_cond}")
+                    false_url = inject_param(url, param, f"{original_value} {false_cond}")
                     true_resp = safe_get(self.session, true_url, self.timeout)
                     false_resp = safe_get(self.session, false_url, self.timeout)
                     if not (true_resp and false_resp):
@@ -596,7 +597,7 @@ class SQLiScanner(ScannerBase):
         baseline_ms = baseline_mean * 1000
         min_time_threshold = max(baseline_mean + 3 * baseline_stdev, 5.0)
         for payload in payloads.get("time_based", []):
-            test_url = self._inject_param(url, param, payload)
+            test_url = inject_param(url, param, payload)
             delays = []
             time_resp = None
             for _ in range(2):
@@ -619,7 +620,7 @@ class SQLiScanner(ScannerBase):
                 break
 
         for payload in payloads.get("union", []):
-            test_url = self._inject_param(url, param, payload)
+            test_url = inject_param(url, param, payload)
             resp = safe_get(self.session, test_url, self.timeout)
             if not resp:
                 continue
@@ -642,7 +643,7 @@ class SQLiScanner(ScannerBase):
             if oob:
                 for payload in payloads.get("oob", []):
                     formatted = payload.replace("{oob}", f"{oob.callback_token}.{oob_host}")
-                    test_url = self._inject_param(url, param, formatted)
+                    test_url = inject_param(url, param, formatted)
                     safe_get(self.session, test_url, self.timeout, raise_for_status=False)
                     oob.register_interaction("sqli", formatted, test_url)
                     time.sleep(1)
@@ -658,7 +659,7 @@ class SQLiScanner(ScannerBase):
             # (Cached vs non-cached can indicate server-side processing)
             probe_payloads = ["' OR 1=1--", "1 AND 1=1"]
             for probe in probe_payloads:
-                probe_url = self._inject_param(url, param, probe)
+                probe_url = inject_param(url, param, probe)
                 resp1 = safe_get(self.session, probe_url, self.timeout)
                 resp2 = safe_get(self.session, probe_url, self.timeout)
                 if resp1 and resp2:
@@ -680,13 +681,13 @@ class SQLiScanner(ScannerBase):
                     f"1 UNION SELECT '{marker}' INTO DUMPFILE '/tmp/bbh_{marker}'--",
                 ]
                 for bp in blind_payloads:
-                    pw_url = self._inject_param(url, param, bp)
+                    pw_url = inject_param(url, param, bp)
                     safe_get(self.session, pw_url, self.timeout, raise_for_status=False)
                     read_url = f"file:///tmp/bbh_{marker}"
                     try:
                         import requests as req
                         # Try reading via LFI or directory traversal
-                        read_test = self._inject_param(url, param, f"/etc/passwd")
+                        read_test = inject_param(url, param, f"/etc/passwd")
                         r = safe_get(self.session, read_test, self.timeout)
                         if r and marker in r.text:
                             signals["blind_file"] = True
@@ -856,12 +857,4 @@ class SQLiScanner(ScannerBase):
             validation_steps=[f"Signal: {s}" for s in evidence_parts],
         )
 
-    @staticmethod
-    def _inject_param(url: str, param: str, value: str) -> str:
-        from urllib.parse import urlencode
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query, keep_blank_values=True)
-        params[param] = [value]
-        new_query = urlencode(params, doseq=True)
-        from urllib.parse import urlunparse
-        return urlunparse(parsed._replace(query=new_query))
+

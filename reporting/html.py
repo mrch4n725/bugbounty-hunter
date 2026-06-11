@@ -267,8 +267,7 @@ class HTMLReporter(ReporterBase):
         - AuthorizationComparisonEvidence: side-by-side comparison
         - GraphQLSchemaEvidence: schema preview
         """
-        # Access f.evidence directly for Finding instances (f.get("evidence")
-        # returns a string due to the dict-compat shim). For plain dicts,
+        # Access f.evidence directly for Finding instances. For plain dicts,
         # fall back to f.get("evidence", [])
         evidence = (
             getattr(f, 'evidence', None)

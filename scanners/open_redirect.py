@@ -19,6 +19,7 @@ from modules.utils import (
     safe_get, finding, log, Colors, _build_curl,
     VerificationStage,
     safe_cookies_dict,
+    inject_param,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
@@ -72,18 +73,10 @@ class OpenRedirectScanner(ScannerBase):
         return targets
 
     @staticmethod
-    def _inject_param(url: str, param: str, value: str) -> str:
-        from urllib.parse import urlencode, urlunparse
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query, keep_blank_values=True)
-        params[param] = [value]
-        new_query = urlencode(params, doseq=True)
-        return urlunparse(parsed._replace(query=new_query))
-
     def detect(self, url: str, parameter: str) -> DetectionResult | None:
         for payload in OPEN_REDIRECT_PAYLOADS:
             try:
-                test_url = self._inject_param(url, parameter, payload)
+                test_url = inject_param(url, parameter, payload)
                 resp = safe_get(self.session, test_url, self.timeout, raise_for_status=False, allow_redirects=False)
                 if not resp:
                     continue

@@ -32,6 +32,7 @@ from modules.utils import (
     finding, log, Colors, _build_curl, safe_get, safe_post,
     VerificationStage,
     safe_cookies_dict,
+    inject_param,
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
@@ -570,12 +571,10 @@ class SSRFScanner(ScannerBase):
                         for ev in evidence_list:
                             self.evidence_engine.store(ev)
 
-                        parsed_for_fp = urlparse(url)
-                        ssrf_url = f"{parsed_for_fp.scheme}://{parsed_for_fp.netloc}"
-
                         f = finding(
                             vuln_type="Confirmed SSRF",
-                            url=ssrf_url,
+                            url=url,
+                            parameter=", ".join(vulnerable_params[:5]),
                             severity="critical",
                             details="; ".join(details_parts),
                             evidence=f"Signatures: {', '.join(list(all_matched_sigs)[:5])}",
@@ -611,14 +610,21 @@ class SSRFScanner(ScannerBase):
         oob_evidence_list = self.validation.poll_oob()
         for oob_ev in oob_evidence_list:
             callback_raw = oob_ev.raw_data or ""
-            payload_str = oob_ev.callback_host or ""
+            callback_host = oob_ev.callback_host or ""
+            callback_token = oob_ev.callback_token or ""
             url_str = ""
             for vt, pl, u in self._oob_registrations:
-                if payload_str and payload_str in pl:
+                if callback_token and callback_token in pl:
+                    url_str = u
+                    break
+                if callback_host and callback_host in pl:
                     url_str = u
                     break
             if not url_str:
-                url_str = self.base_url
+                for vt, pl, u in self._oob_registrations:
+                    if callback_raw and pl and pl.split("/")[-1] in callback_raw:
+                        url_str = u
+                        break
             if self.evidence_engine is not None:
                 self.evidence_engine.store(oob_ev)
             f = finding(
@@ -647,15 +653,8 @@ class SSRFScanner(ScannerBase):
 
     def _build_ssrf_url(self, url: str, parsed, original_params: dict, param: str, payload: str) -> str:
         if param in original_params:
-            return self._inject_param(url, param, payload)
+            return inject_param(url, param, payload)
         separator = "&" if parsed.query else "?"
         return f"{url}{separator}{urlencode({param: payload})}"
 
-    @staticmethod
-    def _inject_param(url: str, param: str, value: str) -> str:
-        from urllib.parse import urlunparse
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query, keep_blank_values=True)
-        params[param] = [value]
-        new_query = urlencode(params, doseq=True)
-        return urlunparse(parsed._replace(query=new_query))
+

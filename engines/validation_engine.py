@@ -9,6 +9,7 @@ from modules.utils import (
     SecretValidator,
     safe_get,
     safe_post,
+    inject_param,
 )
 from models.evidence import (
     EvidenceBase,
@@ -208,7 +209,7 @@ class ValidationEngine:
 
         # Baseline
         for _ in range(max(samples, 1)):
-            bl_url = _inject_param(url, param_name, baseline_payload)
+            bl_url = inject_param(url, param_name, baseline_payload)
             start = time.time()
             safe_get(session, bl_url, timeout=30, raise_for_status=False)
             elapsed = (time.time() - start) * 1000
@@ -216,7 +217,7 @@ class ValidationEngine:
 
         # Trigger
         for _ in range(max(samples, 1)):
-            tr_url = _inject_param(url, param_name, trigger_payload)
+            tr_url = inject_param(url, param_name, trigger_payload)
             start = time.time()
             safe_get(session, tr_url, timeout=30, raise_for_status=False)
             elapsed = (time.time() - start) * 1000
@@ -350,11 +351,4 @@ class ValidationEngine:
 
 # ── Utility ──────────────────────────────────────────────────────────────────
 
-def _inject_param(url: str, param: str, value: str) -> str:
-    """Replace or add a query parameter in a URL."""
-    from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
-    parsed = urlparse(url)
-    params = parse_qs(parsed.query, keep_blank_values=True)
-    params[param] = [value]
-    new_query = urlencode(params, doseq=True)
-    return urlunparse(parsed._replace(query=new_query))
+
