@@ -744,7 +744,51 @@ class ReporterBase:
             return _build_curl(method, url, {}, cookies=cookies)
         return _build_curl(method, url, {})
 
-    def _build_impact_narrative(self, finding: Dict[str, Any]) -> str:
+    def _humanize_title(self, f: Dict[str, Any]) -> str:
+        """Generate a natural-language title that describes the specific vulnerability instance."""
+        original = f.get("title") or f.get("details", "Untitled")
+        vuln_type = (f.get("vuln_type") or "").lower().replace(" ", "_")
+        url = f.get("url", "the affected endpoint")
+        param = f.get("param") or f.get("parameter", "")
+        path = __import__("urllib.parse", fromlist=["urlparse"]).urlparse(url).path or ""
+
+        type_templates = {
+            "xss": f"Stored cross-site scripting in {param or 'input field'} allows persistent script execution" if f.get("stored") else
+                   f"Blind cross-site scripting — payload executes in triage/admin browser context" if f.get("blind") else
+                   f"Reflected cross-site scripting via {param or path or 'URL parameter'} enables arbitrary script injection",
+            "stored_xss": f"Persistent XSS in {param or 'input field'} — injected script stored and served to all users",
+            "blind_xss": f"Blind XSS at {url} — payload triggers callback in privileged user's browser session",
+            "sqli": f"SQL injection in {param or path or 'parameter'} — database queries can be manipulated to extract or modify data",
+            "lfi": f"Local file inclusion via {param or 'path traversal'} enables reading arbitrary server files",
+            "ssrf": f"Server-side request forgery in {param or path} — application makes unauthorized internal network requests",
+            "xxe": f"XML external entity injection enables server-side file disclosure at {path or url}",
+            "ssti": f"Server-side template injection in {param or 'input'} — expression evaluation on the server",
+            "cmd_injection": f"Command injection in {param or 'parameter'} — arbitrary operating system commands can be executed",
+            "open_redirect": f"Open redirect in {param or 'redirect parameter'} — unvalidated URL redirect enables phishing attacks",
+            "csrf": f"Cross-site request forgery on {path} — state-changing actions can be performed without the user's consent",
+            "idor": f"Insecure direct object reference in {param or 'resource identifier'} — authenticated users can access another user's data",
+            "dirb": f"Sensitive directory exposed — {path} reveals internal application structure or configuration",
+            "sensitive": f"Sensitive data exposure in {path or url} — confidential information visible in application responses",
+            "clickjacking": f"Clickjacking on {url} — application can be framed by external attackers for UI overlay attacks",
+            "headers": f"Security headers missing on {path or url} — {f.get('details', 'multiple headers absent')}",
+            "graphql_introspection": f"GraphQL introspection enabled on {path or url} — full schema exposed to unauthenticated users",
+            "rate_limiting": f"Rate limiting bypass on {path or url} — unlimited authentication attempts possible",
+            "api_key_leak": f"API key disclosed in {path or url} — {param or 'credentials'} exposed in application source or responses",
+            "subdomain_takeover": f"Subdomain takeover at {url} — DNS record points to unclaimed external service",
+            "insecure_forms": f"Insecure form submission on {path} — data transmitted over unencrypted HTTP connection",
+            "http_methods": f"Permissive HTTP methods on {path or url} — unsafe methods enabled for resource modification",
+            "default_cred": f"Default credentials accepted on {path or url} — standard default username/password combination works",
+        }
+        for key, template in type_templates.items():
+            if key in vuln_type:
+                return template
+        # No template matched — build from parts
+        vuln_label = vuln_type.replace("_", " ").title()
+        param_piece = f" via {param}" if param else ""
+        url_piece = f" at {path or url}" if url and url != "the affected endpoint" else ""
+        return f"{vuln_label}{param_piece}{url_piece}"
+
+    def _build_impact_narrative(self, finding: Dict[str, Any], programme_intel: Any = None) -> str:
         what = finding.get("what_is_it") or finding.get("details", "")
         impact = finding.get("impact", "")
         sev = finding.get("severity", "info").lower()
@@ -754,9 +798,22 @@ class ReporterBase:
         if isinstance(evidence, list):
             evidence = " ".join(str(e) for e in evidence)
 
+        # Programme-level context for impact
+        programme_ctx = ""
+        if programme_intel:
+            pg = programme_intel
+            pg_name = getattr(pg, 'name', '') or getattr(pg, 'programme_name', '')
+            pg_bounty = getattr(pg, 'bounty_range', '') or getattr(pg, 'range', '')
+            if pg_name:
+                pg_pieces = [f"Target programme: **{pg_name}**"]
+                if pg_bounty:
+                    pg_pieces.append(f"Bounty range: {pg_bounty}")
+                programme_ctx = " | ".join(pg_pieces)
+
         if impact:
             try:
-                return impact.format(url=url, parameter=param, evidence=evidence)
+                base = impact.format(url=url, parameter=param, evidence=evidence)
+                return f"{programme_ctx}\n\n{base}" if programme_ctx else base
             except KeyError:
                 pass
 
@@ -769,32 +826,131 @@ class ReporterBase:
                 break
 
         param_str = f" via parameter `{param}`" if param else ""
-        biz_line = f" Business impact: {biz_impact}." if biz_impact else ""
-        ev_line = f" Evidence: {evidence[:120]}." if evidence else ""
+        biz_line = f"\n\n**Business impact:** {biz_impact}." if biz_impact else ""
+        ev_line = f"\n\n**Evidence:** {evidence[:120]}." if evidence else ""
 
-        templates = {
+        # Attack scenario narrative that reads like a human wrote it
+        scenario_map = {
             "critical": (
-                f"This vulnerability at `{url}`{param_str} poses a severe risk to "
-                f"confidentiality, integrity, and availability. Successful exploitation "
-                f"could lead to complete compromise of the application, including arbitrary "
-                f"code execution, data exfiltration, or full account takeover.{biz_line}{ev_line}"
+                f"An attacker can exploit this vulnerability at `{url}`{param_str} "
+                f"to compromise the confidentiality, integrity, and availability of the "
+                f"affected system. This is not a theoretical risk — the attack surface is "
+                f"directly reachable and exploitable without significant preconditions."
             ),
             "high": (
-                f"This vulnerability at `{url}`{param_str} can lead to significant "
-                f"data disclosure, privilege escalation, or partial system compromise. "
-                f"Immediate remediation is strongly recommended.{biz_line}{ev_line}"
+                f"This finding at `{url}`{param_str} represents a clear security risk "
+                f"that an attacker can leverage for data theft, privilege escalation, or "
+                f"unauthorized access. The vulnerability is reachable and the impact is "
+                f"material to the application's security posture."
             ),
             "medium": (
-                f"Exploitation of `{url}`{param_str} may lead to limited information "
-                f"disclosure, minor privilege escalation, or degraded security posture. "
-                f"Should be addressed in the next maintenance cycle.{biz_line}{ev_line}"
+                f"The vulnerability at `{url}`{param_str} may be exploitable under certain "
+                f"conditions, potentially leading to limited information disclosure or "
+                f"minor privilege escalation. While the immediate risk is moderate, it "
+                f"could serve as a stepping stone for more severe attacks."
             ),
             "low": (
-                f"Limited practical impact at `{url}`{param_str} under normal conditions. "
-                f"Risk is minimal but may be chained with other vulnerabilities.{ev_line}"
+                f"The issue at `{url}`{param_str} has limited practical impact under "
+                f"normal operating conditions. The risk is minimal but may be chained "
+                f"with other vulnerabilities to create a more significant attack path."
             ),
         }
-        return templates.get(sev, f"See details for impact information at `{url}`.{ev_line}")
+        scenario = scenario_map.get(sev, f"See details for impact information at `{url}`.")
+        scenario = f"{scenario}{biz_line}{ev_line}"
+
+        if programme_ctx:
+            return f"{programme_ctx}\n\n{scenario}"
+        return scenario
+
+    def _format_steps_to_reproduce(self, f: Dict[str, Any]) -> str:
+        """Format steps to reproduce as a natural-language walkthrough."""
+        steps = f.get("steps_to_reproduce") or f.get("validation_steps") or []
+        if not steps or (isinstance(steps, list) and not steps):
+            vuln_type = (f.get("vuln_type") or "").lower()
+            url = f.get("url", "the affected endpoint")
+            param = f.get("param") or f.get("parameter", "")
+            method = f.get("method", "GET")
+            template_steps = {
+                "xss": [
+                    f"Navigate to `{url}` and locate the input field or parameter that accepts user data.",
+                    f"Submit a payload containing `<script>alert(document.domain)</script>` in the {param or 'parameter'} value.",
+                    "Observe that the script executes in the browser, confirming the lack of output encoding." if not f.get("blind") else
+                    "Set up an external listener and submit a payload pointing to your callback URL. If a callback is received, the XSS is confirmed.",
+                ],
+                "sqli": [
+                    f"Send a request to `{url}` with a single quote (`'`) in the {param or 'parameter'} value.",
+                    "Observe a database error message in the response confirming SQL injection.",
+                    "Use a boolean-based or time-based payload to confirm data extraction is possible.",
+                ],
+                "idor": [
+                    f"Authenticate as User A and capture the {param or 'identifier'} of a resource belonging to User A.",
+                    f"Authenticate as User B and modify the {param or 'identifier'} parameter to reference User A's resource.",
+                    "If the server returns User A's data without authorization, the IDOR is confirmed.",
+                ],
+                "ssrf": [
+                    f"Submit a request to `{url}` with a URL pointing to an internal service (e.g., `http://169.254.169.254/`) in the {param or 'parameter'}.",
+                    "Monitor for callbacks or observe the response containing internal service data.",
+                    "If internal responses are reflected, the SSRF is confirmed.",
+                ],
+            }
+            for ttype, tsteps in template_steps.items():
+                if ttype in vuln_type:
+                    steps = tsteps
+                    break
+        if not steps:
+            steps = [
+                f"Send a {method} request to `{url}`" + (f" with a crafted {param} value" if param else "."),
+                "Observe the application's response to confirm the vulnerability.",
+            ]
+
+        if isinstance(steps, list):
+            return "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
+        return steps
+
+    def _build_remediation(self, finding: Union[Dict[str, Any], Finding]) -> str:
+        rem = finding.get("remediation") or finding.get("recommendation", "")
+        if rem:
+            return rem
+        vuln_type = (finding.get("title") or finding.get("details") or "").lower()
+        # Check REMEDIATION_MATRIX first
+        for key in REMEDIATION_MATRIX:
+            if key in vuln_type:
+                base = REMEDIATION_MATRIX[key]
+                return self._contextualize_remediation(base, finding)
+        finding_type = (finding.get("vuln_type") or "").lower()
+        for key in REMEDIATION_MATRIX:
+            if key in finding_type:
+                base = REMEDIATION_MATRIX[key]
+                return self._contextualize_remediation(base, finding)
+        url = finding.get("url", "the affected endpoint")
+        fallbacks = {
+            "critical": f"Immediately review and fix the root cause at `{url}`. "
+                        "Apply input validation, output encoding, proper authentication "
+                        "checks, and access controls. Conduct a focused security review "
+                        "of the affected component.",
+            "high": f"Review and fix the vulnerability at `{url}`. Apply appropriate security "
+                    "controls such as input sanitization, parameterized queries, "
+                    "or access control hardening.",
+            "medium": f"Review the affected functionality at `{url}` and apply standard security "
+                      "best practices including input validation and proper authorization checks.",
+        }
+        return fallbacks.get(finding.get("severity", "").lower(),
+                             f"Follow security best practices for `{url}`.")
+
+    def _contextualize_remediation(self, base: str, finding: Dict[str, Any]) -> str:
+        """Add context-specific remediation guidance based on the specific finding."""
+        url = finding.get("url", "")
+        param = finding.get("param") or finding.get("parameter", "")
+        method = finding.get("method", "GET")
+        specifics = []
+        if url:
+            specifics.append(f"Affected endpoint: `{url}`")
+        if param:
+            specifics.append(f"Vulnerable parameter: `{param}`")
+        if method:
+            specifics.append(f"HTTP method: {method}")
+        header = f"**Suggested Fix** — {' | '.join(specifics)}" if specifics else "**Suggested Fix**"
+        return f"{header}\n{base}"
 
     def _build_remediation(self, finding: Union[Dict[str, Any], Finding]) -> str:
         rem = finding.get("remediation") or finding.get("recommendation", "")

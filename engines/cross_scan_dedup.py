@@ -500,6 +500,8 @@ def is_likely_duplicate(
         same_domain = (domain == report_domain) or domain.endswith("." + report_domain) or report_domain.endswith("." + domain)
         if same_domain and report_weakness and cwe_name.lower() in report_weakness.lower():
             days_ago = (datetime.now(timezone.utc) - r_date).days
-            reason = f"{report_weakness} on {report_domain} was disclosed {days_ago} days ago"
+            report_id = getattr(r, "id", "") or ""
+            id_suffix = f" (H1 report #{report_id})" if report_id else ""
+            reason = f"{report_weakness} on {report_domain} was disclosed {days_ago} days ago{id_suffix}"
             return True, reason
     return False, ""

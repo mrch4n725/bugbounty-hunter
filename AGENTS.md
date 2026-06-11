@@ -295,6 +295,13 @@ Scanners with `validation_rate < 0.5` and `detected >= 2` are flagged for attent
 | `engines/investigation.py`         | Multi-strategy investigation | `InvestigationEngine` — real HTTP/OOB/browser probes, cross-account IDOR, differential auth, 20+ strategies |
 | `models/confidence.py`            | Confidence data model | `ConfidenceFactors`, `ConfidenceContribution`, `ConfidenceResult` |
 | `models/escalation.py`            | Escalation data model | `EscalationPath`, `EscalationResult` |
+| `engines/gql_auth_tester.py`      | Executes AuthInvestigationPlan objects against live GQL endpoints | `GraphQLAuthTester` — consumes plans from DiscoveryStore, sends GQL queries/mutations as attacker/owner roles, produces AuthorizationComparisonEvidence findings |
+| `engines/business_discovery.py`   | Proactive business workflow discovery from URL patterns, forms, redirect chains, and DiscoveryStore | `BusinessLogicDiscoveryEngine` — 5-phase pipeline with bounty yield weights per category |
+| `scanners/business_logic.py`      | Business logic flaw detection (6 testers) | `BusinessLogicScanner`, `WorkflowAnalyser`, `FlowBypassTester`, `RaceConditionTester`, `PriceManipulationTester`, `CheckoutLogicTester` — gift-card race, payment bypass, price consistency, invoice manipulation |
+| `modules/strategy.py`             | Intelligence-driven scan strategy generation | `ScanStrategy` dataclass, `build()` — saturation-aware, IDOR/XSS/GQL auto-prioritisation |
+| `modules/programme_intel.py`      | Unified programme intelligence (HackerOne + Bugcrowd) | `ProgrammeIntel`, `HackerOneClient`, `BugcrowdClient` — scope parsing, saturation, expected value |
+| `modules/idor_mode.py`            | Two-account IDOR scanning mode | 4-phase pipeline: harvest → compare → ownership validation → evidence |
+| `reporting/base.py` (human-readable methods) | Natural-language report generation | `_humanize_title()`, `_build_impact_narrative()` (programme-intel-aware), `_format_steps_to_reproduce()`, `_contextualize_remediation()` |
 
 ---
 
@@ -370,7 +377,7 @@ log("message", Colors.RED, verbose_only=True, verbose=self.verbose)
 - **No test framework dependency** (no pytest, no unittest) — tests are standalone Python scripts
 - Tests exercise all imports, enums, finding dedup, curl building, confidence mapping, reporter rendering, and module structure
 - Run with: `python3 tests/run.py`
-- Current test count: **359 tests** (all passing)
+- Current test count: **394 tests** (all passing)
 - `--dry-run` against real targets for integration: `python3 main.py --target https://example.com --dry-run --passive`
 - Multi-role auth: `python3 main.py --target https://example.com --role user_a --auth-header user_b:'Authorization:Bearer tok_b'`
 

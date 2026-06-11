@@ -54,13 +54,13 @@ class HackerOneReporter(ReporterBase):
 
     def _vuln_section(self, f: Any) -> str:
         sev = f.get("severity", "info").upper()
+        human_title = self._humanize_title(f)
         title = f.get("title") or f.get("details", "Untitled")
         component = f.get("component") or f.get("url", self.target)
         what = f.get("what_is_it") or f.get("details", "")
-        impact_narrative = self._build_impact_narrative(f)
-        steps = f.get("steps_to_reproduce") or f.get("validation_steps") or []
-        if isinstance(steps, list):
-            steps = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
+        programme_intel = self.config.get("programme_intel") or getattr(f, '_programme_intel', None)
+        impact_narrative = self._build_impact_narrative(f, programme_intel=programme_intel)
+        steps = self._format_steps_to_reproduce(f)
         evidence = (
             getattr(f, 'evidence', None)
             if not isinstance(f, dict)
@@ -176,7 +176,7 @@ class HackerOneReporter(ReporterBase):
         cvss_vector = self._get_cvss_vector(f)
         cvss_rating = self._severity_rating(cvss_score)
 
-        return f"""### {title}
+        return f"""### {human_title}
 
 **Severity:** {sev}
 **CVSS:** {cvss_score:.1f} ({cvss_rating})
@@ -211,7 +211,7 @@ class HackerOneReporter(ReporterBase):
 ```
 {screenshot_line}
 #### Steps to Reproduce
-{steps or "1. Send a request to the affected endpoint to reproduce the vulnerability."}
+{steps}
 
 #### Impact
 {impact_narrative}

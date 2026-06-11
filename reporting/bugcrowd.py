@@ -36,13 +36,13 @@ class BugcrowdReporter(ReporterBase):
 
         per_finding = []
         for i, f in enumerate(self.findings, 1):
+            human_title = self._humanize_title(f)
             title = f.get("title") or f.get("details", "Untitled")
             sev = f.get("severity", "info").upper()
             what = f.get("what_is_it") or f.get("details", "")
-            impact_narrative = self._build_impact_narrative(f)
-            steps = f.get("steps_to_reproduce") or f.get("validation_steps") or []
-            if isinstance(steps, list):
-                steps = "\n".join(f"{j+1}. {s}" for j, s in enumerate(steps))
+            programme_intel = self.config.get("programme_intel") or getattr(f, '_programme_intel', None)
+            impact_narrative = self._build_impact_narrative(f, programme_intel=programme_intel)
+            steps = self._format_steps_to_reproduce(f)
             remed = f.get("remediation") or f.get("recommendation", "")
             remed = remed or self._build_remediation(f)
             evidence = (
@@ -156,7 +156,7 @@ class BugcrowdReporter(ReporterBase):
             screenshot_line = f"\n**Screenshot:** {screenshot_path}\n" if screenshot_path and ReporterBase._validate_screenshot_path(screenshot_path) else ""
             response_excerpt = f.get("response_excerpt", "")
 
-            per_finding.append(f"""## Finding #{i}: {title}
+            per_finding.append(f"""## Finding #{i}: {human_title}
 
 | Field | Value |
 |-------|-------|
@@ -188,8 +188,8 @@ class BugcrowdReporter(ReporterBase):
 {self._build_curl_command(f)}
 ```
 {"### Response Excerpt\n```\n" + response_excerpt + "\n```\n" if response_excerpt else ""}{screenshot_line}
-### Steps to Reproduce
-{steps or "1. Send a request to the affected endpoint to reproduce the vulnerability."}
+    ### Steps to Reproduce
+{steps}
 
 ### Impact
 {impact_narrative}

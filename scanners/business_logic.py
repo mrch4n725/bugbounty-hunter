@@ -1,14 +1,15 @@
 """
 BusinessLogicScanner — standalone utility class for detecting business logic flaws.
 
-Does NOT extend ScannerBase. Provides four specialised testers that run against
+Does NOT extend ScannerBase. Provides six specialised testers that run against
 recon data and return finding dicts compatible with DeduplicationEngine.
 
 Testers:
-  - WorkflowAnalyser:   Build state graphs from multi-step flows
-  - FlowBypassTester:   Step skip, reorder, and repeat detection
-  - RaceConditionTester: Concurrent request race condition detection
-  - PriceManipulationTester: Negative quantity, price override, coupon stacking
+  - WorkflowAnalyser:           Build state graphs from multi-step flows
+  - FlowBypassTester:           Step skip, reorder, and repeat detection
+  - RaceConditionTester:        Concurrent request race condition detection
+  - PriceManipulationTester:    Negative quantity, price override, coupon stacking
+  - CheckoutLogicTester:        Gift-card race, payment bypass, price consistency, invoice manipulation
 """
 
 import itertools
@@ -90,6 +91,17 @@ class RaceResult:
     evidence: str = ""
     steps_to_reproduce: list[str] = field(default_factory=list)
     severity: str = "high"
+
+
+@dataclass
+class CheckoutResult:
+    url: str = ""
+    subtype: str = ""  # gift_card_race, payment_bypass, price_inconsistency, invoice_manipulation
+    vulnerable: bool = False
+    severity: str = "high"
+    details: str = ""
+    evidence: str = ""
+    steps_to_reproduce: list[str] = field(default_factory=list)
 
 
 # ── Flow keywords ─────────────────────────────────────────────────────────
@@ -719,6 +731,272 @@ class PriceManipulationTester:
         return vulnerable
 
 
+# ── CheckoutLogicTester ──────────────────────────────────────────────────
+
+
+class CheckoutLogicTester:
+    """Checkout-specific logic flaw detection.
+
+    Tests for:
+      - Gift card / credit balance race conditions
+      - Checkout payment step bypass
+      - Price consistency across multi-step checkout
+      - Invoice amount manipulation post-checkout
+    """
+
+    def __init__(self, session: Any, timeout: int = 10):
+        self.session = session
+        self.timeout = timeout
+
+    # ── Gift card / credit balance race ──────────────────────────────────
+
+    def test_gift_card_race(
+        self,
+        url: str,
+        form_data: dict | None = None,
+        session: Any | None = None,
+        concurrent_count: int = 10,
+    ) -> CheckoutResult:
+        """Redeem same gift-card/coupon code concurrently across threads."""
+        sess = session or self.session
+        card_fields = [k for k in (form_data or {})
+                       if any(w in k.lower() for w in ("gift", "card", "code", "voucher", "coupon"))]
+        if not card_fields:
+            return CheckoutResult(url=url, subtype="gift_card_race", vulnerable=False)
+
+        success_count = 0
+        errors = 0
+        lock = threading.Lock()
+
+        def redeem():
+            nonlocal success_count, errors
+            try:
+                resp = safe_post(sess, url, data=form_data or {}, timeout=self.timeout)
+                if resp and resp.status_code in (200, 201, 202):
+                    body = (resp.text or "").lower()
+                    ok_words = {"success", "applied", "redeemed", "credited", "confirmed", "balance"}
+                    if any(w in body for w in ok_words):
+                        with lock:
+                            success_count += 1
+            except Exception:
+                with lock:
+                    errors += 1
+
+        threads = []
+        for _ in range(concurrent_count):
+            t = threading.Thread(target=redeem, daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join()
+
+        vulnerable = success_count > 1
+        if not vulnerable:
+            return CheckoutResult(url=url, subtype="gift_card_race", vulnerable=False)
+
+        return CheckoutResult(
+            url=url,
+            subtype="gift_card_race",
+            vulnerable=True,
+            severity="critical",
+            details=(
+                "Gift card or coupon code was redeemed successfully "
+                + str(success_count) + " out of " + str(concurrent_count)
+                + " concurrent attempts — balance is not being deducted atomically"
+            ),
+            evidence=(
+                "Concurrent redeems: " + str(concurrent_count)
+                + " | Succeeded: " + str(success_count)
+                + " | Errors: " + str(errors)
+                + " | URL: " + url
+            ),
+            steps_to_reproduce=[
+                "Obtain a valid gift card or coupon code.",
+                "Send " + str(concurrent_count) + " concurrent POST requests to " + url
+                + " with the code in the request body.",
+                "Check how many requests succeed — if >1, the balance was consumed multiple times.",
+                "Implement atomic database-level locking or idempotency keys per code.",
+            ],
+        )
+
+    # ── Checkout payment step bypass ─────────────────────────────────────
+
+    def test_checkout_payment_bypass(
+        self,
+        checkout_urls: list[str],
+        graph: WorkflowGraph,
+        session: Any | None = None,
+    ) -> list[CheckoutResult]:
+        """Try accessing order confirmation without completing payment step."""
+        sess = session or self.session
+        results: list[CheckoutResult] = []
+
+        for flow in graph.checkout_flows:
+            if len(flow) < 2:
+                continue
+            payment_step = None
+            confirm_step = None
+            for url in flow:
+                lower = url.lower()
+                if any(w in lower for w in ("pay", "payment", "bill", "charge")):
+                    payment_step = url
+                if any(w in lower for w in ("confirm", "complete", "receipt", "success", "thank")):
+                    confirm_step = url
+            if payment_step and confirm_step:
+                try:
+                    resp = safe_get(sess, confirm_step, timeout=self.timeout, raise_for_status=False)
+                    if resp and resp.status_code in (200, 201, 202):
+                        body = (resp.text or "").lower()
+                        skip_words = {"order", "confirmed", "complete", "receipt", "thank you", "success"}
+                        if any(w in body for w in skip_words):
+                            results.append(CheckoutResult(
+                                url=confirm_step,
+                                subtype="payment_bypass",
+                                vulnerable=True,
+                                severity="critical",
+                                details=(
+                                    "Order confirmation page at " + confirm_step
+                                    + " is accessible without completing the payment step at "
+                                    + payment_step
+                                ),
+                                evidence=(
+                                    "Accessed confirmation URL directly: " + confirm_step
+                                    + " | HTTP " + str(resp.status_code)
+                                ),
+                                steps_to_reproduce=[
+                                    "Identify the checkout flow: payment → confirmation.",
+                                    "Send a GET request directly to " + confirm_step
+                                    + " without completing payment at " + payment_step + ".",
+                                    "If the confirmation page loads with order details, "
+                                    "the payment step is bypassable.",
+                                    "Implement server-side state validation that ensures "
+                                    "payment is completed before serving the confirmation page.",
+                                ],
+                            ))
+                except Exception:
+                    pass
+
+        return results
+
+    # ── Price consistency across checkout steps ──────────────────────────
+
+    def test_price_consistency(
+        self,
+        checkout_urls: list[str],
+        graph: WorkflowGraph,
+        session: Any | None = None,
+    ) -> list[CheckoutResult]:
+        """Detect price changes between cart and confirmation steps."""
+        sess = session or self.session
+        results: list[CheckoutResult] = []
+
+        price_pattern = re.compile(
+            r'(?:price|total|amount|subtotal|grand_total|cost|charge)[":\s]*([\d,]+\.?\d*)',
+            re.IGNORECASE,
+        )
+
+        for flow in graph.checkout_flows:
+            if len(flow) < 2:
+                continue
+            prices: dict[str, float] = {}
+            for url in flow:
+                try:
+                    resp = safe_get(sess, url, timeout=self.timeout, raise_for_status=False)
+                    if resp and resp.status_code == 200:
+                        matches = price_pattern.findall(resp.text or "")
+                        if matches:
+                            cleaned = matches[-1].replace(",", "")
+                            try:
+                                prices[url] = float(cleaned)
+                            except ValueError:
+                                pass
+                except Exception:
+                    pass
+
+            if len(prices) >= 2:
+                values = list(prices.values())
+                if max(values) != min(values):
+                    differing = [u for u, v in prices.items() if v != values[0]]
+                    results.append(CheckoutResult(
+                        url=differing[0] if differing else flow[-1],
+                        subtype="price_inconsistency",
+                        vulnerable=True,
+                        severity="high",
+                        details=(
+                            "Price changed across checkout steps: " + str(prices)
+                            + " — indicates possible client-side price computation"
+                        ),
+                        evidence="Prices per step: " + str(prices),
+                        steps_to_reproduce=[
+                            "Walk through the checkout flow step by step.",
+                            "Record the displayed price at each step.",
+                            "If the price differs between steps, the total may be "
+                            "computed client-side and can be manipulated.",
+                            "Ensure the final price is always computed server-side "
+                            "at the confirmation step.",
+                        ],
+                    ))
+
+        return results
+
+    # ── Invoice manipulation post-checkout ───────────────────────────────
+
+    def test_invoice_manipulation(
+        self,
+        urls: list[str],
+        session: Any | None = None,
+    ) -> list[CheckoutResult]:
+        """Check if invoice/order amounts can be modified after creation."""
+        sess = session or self.session
+        results: list[CheckoutResult] = []
+        invoice_pattern = re.compile(
+            r'(?:invoice|order|receipt|bill)/(\d+)',
+            re.IGNORECASE,
+        )
+
+        for url in urls:
+            match = invoice_pattern.search(url)
+            if not match:
+                continue
+            invoice_id = match.group(1)
+            price_override_fields = PriceManipulationTester.PRICE_FIELDS
+            for field in list(price_override_fields)[:5]:
+                payload = {field: "0", "invoice_id": invoice_id, "id": invoice_id}
+                try:
+                    resp = safe_post(sess, url, data=payload, timeout=self.timeout, raise_for_status=False)
+                    if resp and resp.status_code in (200, 201, 202):
+                        body = (resp.text or "").lower()
+                        if any(w in body for w in ("updated", "modified", "success", "changed", "adjusted")):
+                            results.append(CheckoutResult(
+                                url=url,
+                                subtype="invoice_manipulation",
+                                vulnerable=True,
+                                severity="critical",
+                                details=(
+                                    "Invoice " + invoice_id + " amount was modified "
+                                    "post-checkout via parameter " + field + "=0"
+                                ),
+                                evidence=(
+                                    "POST to " + url + " with {" + field + ": 0} "
+                                    "returned HTTP " + str(resp.status_code)
+                                ),
+                                steps_to_reproduce=[
+                                    "Complete a purchase and note the invoice/order ID.",
+                                    "Send a POST request to " + url
+                                    + " with the invoice ID and a modified price field.",
+                                    "If the server accepts the modification, "
+                                    "the invoice can be manipulated post-checkout.",
+                                    "Implement server-side finalisation of invoices "
+                                    "that prevents post-creation modification.",
+                                ],
+                            ))
+                            break
+                except Exception:
+                    pass
+
+        return results
+
+
 # ── BusinessLogicScanner ─────────────────────────────────────────────────
 
 
@@ -742,6 +1020,7 @@ class BusinessLogicScanner:
         self.flow_bypass = FlowBypassTester(self.session, self.timeout)
         self.race = RaceConditionTester(self.session, self.timeout)
         self.price = PriceManipulationTester(self.session, self.timeout)
+        self.checkout = CheckoutLogicTester(self.session, self.timeout)
 
     def run_all(
         self,
@@ -839,6 +1118,47 @@ class BusinessLogicScanner:
             except Exception:
                 pass
 
+        # ── 5. Checkout-specific tests ────────────────────────────────────
+        checkout_urls = [u for u in urls if any(kw in u.lower() for kw in _CHECKOUT_KEYWORDS)]
+
+        try:
+            # Gift card / credit balance race
+            for form in forms:
+                action = form.get("action", "")
+                if not action:
+                    continue
+                resolved = urljoin(urls[0] if urls else "", action) if not action.startswith("http") else action
+                form_data = {f.get("name", ""): f.get("value", "") for f in form.get("fields", []) if f.get("name")}
+                if form_data:
+                    result = self.checkout.test_gift_card_race(resolved, form_data, sess, concurrent_count)
+                    if result.vulnerable:
+                        f = self._checkout_finding(result)
+                        if f:
+                            findings.append(f)
+
+            # Payment step bypass
+            bypass_results = self.checkout.test_checkout_payment_bypass(checkout_urls, graph, sess)
+            for r in bypass_results:
+                f = self._checkout_finding(r)
+                if f:
+                    findings.append(f)
+
+            # Price consistency
+            consistency_results = self.checkout.test_price_consistency(checkout_urls, graph, sess)
+            for r in consistency_results:
+                f = self._checkout_finding(r)
+                if f:
+                    findings.append(f)
+
+            # Invoice manipulation
+            invoice_results = self.checkout.test_invoice_manipulation(urls, sess)
+            for r in invoice_results:
+                f = self._checkout_finding(r)
+                if f:
+                    findings.append(f)
+        except Exception:
+            pass
+
         return findings
 
     # ── Finding builders ─────────────────────────────────────────────────
@@ -892,6 +1212,30 @@ class BusinessLogicScanner:
         f["success_count"] = r.success_count
         f["concurrent_count"] = r.concurrent_count
         f["abuse_pattern"] = AbusePattern.RACE_CONDITION.value
+        return f.to_dict()
+
+    @staticmethod
+    def _checkout_finding(self, r: CheckoutResult) -> dict | None:
+        if not r or not r.url or not r.vulnerable:
+            return None
+        pattern_map = {
+            "gift_card_race": AbusePattern.RACE_CONDITION,
+            "payment_bypass": AbusePattern.STEP_SKIP,
+            "price_inconsistency": AbusePattern.PRICE_OVERRIDE,
+            "invoice_manipulation": AbusePattern.INVOICE_MANIPULATION,
+        }
+        f = finding(
+            vuln_type="Business Logic: " + r.subtype.replace("_", " ").title(),
+            url=r.url,
+            severity=r.severity,
+            details=r.details,
+            evidence=r.evidence,
+            steps_to_reproduce=r.steps_to_reproduce,
+            verification_stage="validated",
+        )
+        if f is None:
+            return None
+        f["abuse_pattern"] = pattern_map.get(r.subtype, AbusePattern.BILLING_PARAMETER_INJECTION).value
         return f.to_dict()
 
     @staticmethod

@@ -38,6 +38,7 @@
 - [Project Layout](#project-layout)
 - [Extending](#extending)
 - [FAQ](#faq)
+- [Revenue Strategy](#revenue-strategy)
 - [Disclaimer](#disclaimer)
 
 ---
@@ -746,6 +747,48 @@ Yes. Curl commands in reports mask sensitive headers (Authorization, Cookie, X-A
 
 **Q: Can I run this in CI?**  
 Yes. Use `--no-rich` for plain terminal output. Use `--format json` for machine-readable results. Exit code 0 = no critical/high findings; exit code 1 = findings present.
+
+---
+
+## Revenue Strategy
+
+BugBounty Hunter is built for bug bounty hunters who want to maximise their yield. Here is how the tool's features map to revenue:
+
+### High-Yield Vulnerability Classes
+
+| Vulnerability | Typical Bounty (H1/BC) | Why It Pays |
+|---|---|---|
+| **IDOR / Authorization** | $500–$5,000+ | Multi-account IDOR mode (`--mode idor`) with side-by-side evidence and cross-account replay discovers horizontal & vertical privilege escalation. These consistently pay above median across all programmes. |
+| **Business Logic** | $1,000–$10,000+ | Race conditions, price manipulation, coupon stacking, and workflow bypass are among the highest-paying findings. The scanner detects multi-step abuse patterns (step-skip, price-override, gift-card race) with `AbusePattern` classification. |
+| **SSRF** | $500–$4,000 | OOB-confirmed SSRF with internal-metadata access is a perennially high-value finding. The scanner includes cloud metadata probes, redirect DNS, protocol smuggling, and DNS timing signals. |
+| **GraphQL Auth Bypass** | $500–$3,000 | The GQL auth pipeline (relationship engine → ownership discovery → auth mapper → auth tester) finds cross-tenant and role-escalation vulnerabilities automatically. |
+| **SQL Injection** | $500–$3,000 | Multi-signal detection (error, boolean, time, OOB, second-order) with `EvidenceCompletenessValidator` ensures only well-evidenced SQLi findings are reported. |
+| **XSS (Reflected/Stored/DOM)** | $250–$1,500 | Browser-verified XSS with screenshots and DOM sink detection. The human-readable title generator produces submission-ready descriptions. |
+| **Subdomain Takeover** | $500–$2,000 | CNAME-based detection for unclaimed cloud resources — a high-confidence finding that is easy to reproduce and triage. |
+
+### Intelligent Target Selection
+
+The `--best-programme` flag selects the most lucrative programme by analysing HackerOne/Bugcrowd data:
+
+- **Saturation scoring** — avoids heavily tested programmes (saturation > 0.8)
+- **Expected value calculation** — factors bounty range × in-scope asset count × disclosure recency
+- **Recent disclosure analysis** — targets where specific vuln types (IDOR, XSS) were recently accepted
+- **Strategy generation** — `ScanStrategy` in `modules/strategy.py` auto-prioritises modules based on programme intelligence (e.g., 2 sessions + IDOR disclosures → prioritise IDOR/auth)
+
+### Yield-Optimised Report Output
+
+Reports are formatted for **rapid triage acceptance**:
+
+- **Human-readable titles** — `_humanize_title()` generates natural-language descriptions (e.g. "Reflected XSS in `q` allows script execution in victim's browser") instead of generic vuln class names
+- **Programme-contextualised impact** — `_build_impact_narrative()` includes target programme name and bounty range in the impact section
+- **Steps to reproduce** — `_format_steps_to_reproduce()` generates per-vuln-type reproduction walkthroughs tailored to the specific URL and parameter
+- **Suggested fix** — `_build_remediation()` with `_contextualize_remediation()` includes endpoint-specific guidance
+
+### Mode-Specific Revenue Paths
+
+- **`--mode idor`** — Two-session IDOR testing with 4-phase pipeline (harvest → compare → ownership validation → evidence) produces high-confidence ownership-violation findings that are immediately actionable
+- **`--best-programme`** — Automatically evaluates programmes across H1 and Bugcrowd, selects the one with highest expected value, and tunes modules to match its history
+- **`--list-programmes`** — Shows all available programmes with saturation, expected value, and recent disclosure stats
 
 ---
 
