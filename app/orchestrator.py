@@ -10,7 +10,8 @@ from modules.utils import (
     log, Colors, classify_endpoint, compute_endpoint_score,
     prioritize_findings, ScanProgress,
 )
-from models.finding import Finding
+from models.finding import Finding, FindingState
+from models.evidence import ResponseExcerptEvidence
 from engines.dedup import DeduplicationEngine
 
 
@@ -130,6 +131,34 @@ def _run_passive_scans(config, recon_data, run_all, disabled_modules, all_findin
         all_findings.extend(scanner._get_findings())
 
 
+def _exec_tech_specific(config: dict, recon_data: dict, session) -> list[dict]:
+    try:
+        from scanners.tech_specific import TechSpecificScannerRegistry
+        tech_registry = TechSpecificScannerRegistry()
+        detected_frameworks = recon_data.get("technology", {})
+        return tech_registry.scan_all(
+            base_urls=recon_data.get("urls", []),
+            detected_frameworks=detected_frameworks,
+            session=session,
+        )
+    except Exception as e:
+        log(f"[!] TECH_SPECIFIC error: {e}", Colors.YELLOW)
+        return []
+
+
+def _exec_business_logic(config: dict, recon_data: dict, session) -> list[dict]:
+    try:
+        from scanners.business_logic import BusinessLogicScanner
+        bl_scanner = BusinessLogicScanner(config, session=session, recon=recon_data)
+        return bl_scanner.run_all(
+            urls=recon_data.get("urls", []),
+            forms=recon_data.get("forms", []),
+        )
+    except Exception as e:
+        log(f"[!] BUSINESS_LOGIC error: {e}", Colors.YELLOW)
+        return []
+
+
 def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings, lock, container=None, capabilities=None):
     # ── TARGET_LEVEL: modules that run once per target, not per URL ──
     TARGET_LEVEL: set[str] = {
@@ -138,6 +167,8 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
         "http_methods", "authorization",
         "cors", "jwt", "cms",
         "rate_limiting",
+        "tech_specific", "business_logic",
+        "recon",
     }
 
     if config["passive"]:
@@ -176,12 +207,6 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
                             if content and len(content) > 100:
                                 pre_harvest_count += len(harvester.harvest(
                                     url=item.get("url", ""), response_text=str(content)[:2000]))
-            # Harvest from discovery store's existing URLs (previous scans)
-            for cat in ("numeric_id", "uuid", "email", "role"):
-                for rec in container.discovery_store.get_by_category(cat):
-                    src_url = rec.get("source_url", "")
-                    if src_url:
-                        pass  # Already stored — nothing to re-harvest
             if pre_harvest_count:
                 log(f"[+] Pre-scan harvest: {pre_harvest_count} objects from recon data",
                     Colors.GREEN, verbose_only=True, verbose=config.get("verbose", False))
@@ -206,6 +231,24 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
             log(f"[!] Pre-scan harvest failed: {e}", Colors.YELLOW,
                 verbose_only=True, verbose=config.get("verbose", False))
 
+    # ── GraphQL response URL injection (consume graphql_response signals) ──
+    if container and hasattr(container, 'discovery_store'):
+        try:
+            ds = container.discovery_store
+            gql_response_urls = ds.get_by_category("graphql_response")
+            gql_urls_added = 0
+            for rec in gql_response_urls:
+                gql_url = rec.get("value", "") or rec.get("source_url", "")
+                if gql_url and gql_url not in recon_data.get("urls", []):
+                    recon_data.setdefault("urls", []).append(gql_url)
+                    gql_urls_added += 1
+            if gql_urls_added:
+                log(f"[+] GQL response signals: {gql_urls_added} URL(s) injected into scan pool",
+                    Colors.GREEN, verbose_only=True, verbose=config.get("verbose", False))
+        except Exception as e:
+            log(f"[!] GQL URL injection failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
+
     # ── OOB Background Poller (Phase 3) ───────────────────────────────
     oob_poller = None
     if scanner.oob and scanner.oob.oob_host:
@@ -223,6 +266,8 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
         log(f"[*] OOB background poller started (interval={oob_poller.interval}s, max_duration={oob_poller.max_duration}s, max_polls={oob_poller.max_polls})", Colors.CYAN)
 
     # ── Step 1: Build module map (same keys as original _active_module_map) ──
+    _run_tech = lambda: _exec_tech_specific(config, recon_data, scanner.session)
+    _run_bl = lambda: _exec_business_logic(config, recon_data, scanner.session)
     module_map: dict[str, Any] = {
         "xss": scanner.scan_xss, "sqli": scanner.scan_sqli,
         "lfi": scanner.scan_lfi, "ssrf": scanner.scan_ssrf,
@@ -245,6 +290,9 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
         "cors": scanner.scan_cors,
         "jwt": scanner.scan_jwt,
         "cms": scanner.scan_cms_checks,
+        "tech_specific": _run_tech,
+        "business_logic": _run_bl,
+        "recon": lambda: [],
     }
     _api_scanner = ApiScanner(scanner.config, scanner.recon, container=container)
     module_map["api"] = _api_scanner.run_all
@@ -257,46 +305,6 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
     with ModuleProgress(config, "Running target-level modules") as mp:
         _collect_module_findings(target_modules, config, run_all, disabled_modules, all_findings_local, lock, prog=mp)
     config.setdefault("status", {})["modules_completed"] = list(target_modules.keys())
-
-    # ── Tech-Specific Scanner Registry (runs after target-level, before per-URL) ──
-    if not run_all or "tech_specific" not in disabled_modules:
-        try:
-            log("[*] Running tech-specific framework probes...", Colors.CYAN)
-            from scanners.tech_specific import TechSpecificScannerRegistry
-            tech_registry = TechSpecificScannerRegistry()
-            detected_frameworks = recon_data.get("technology", {})
-            tech_findings = tech_registry.scan_all(
-                base_urls=recon_data.get("urls", []),
-                detected_frameworks=detected_frameworks,
-                session=scanner.session,
-            )
-            if tech_findings:
-                log(f"[!] {len(tech_findings)} finding(s) from TECH_SPECIFIC", Colors.RED)
-                with lock:
-                    all_findings_local.extend(tech_findings)
-            else:
-                log("[+] TECH_SPECIFIC — nothing found", Colors.GREEN)
-        except Exception as e:
-            log(f"[!] TECH_SPECIFIC error: {e}", Colors.YELLOW)
-
-    # ── Business Logic Scanner ──────────────────────────────────────────────
-    if not run_all or "business_logic" not in disabled_modules:
-        try:
-            log("[*] Running business logic scanner...", Colors.CYAN)
-            from scanners.business_logic import BusinessLogicScanner
-            bl_scanner = BusinessLogicScanner(config, session=scanner.session, recon=recon_data)
-            bl_findings = bl_scanner.run_all(
-                urls=recon_data.get("urls", []),
-                forms=recon_data.get("forms", []),
-            )
-            if bl_findings:
-                log(f"[!] {len(bl_findings)} finding(s) from BUSINESS_LOGIC", Colors.RED)
-                with lock:
-                    all_findings_local.extend(bl_findings)
-            else:
-                log("[+] BUSINESS_LOGIC — nothing found", Colors.GREEN)
-        except Exception as e:
-            log(f"[!] BUSINESS_LOGIC error: {e}", Colors.YELLOW)
 
     # ── Consume html_comments: extract URLs and params, feed into URL pool ──
     html_comments = recon_data.get("html_comments", [])
@@ -340,8 +348,9 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
                         ownership_urls.append(pattern)
             recon_data.setdefault("_discovery_hints", {})["ownership_urls"] = ownership_urls
             recon_data.setdefault("_discovery_hints", {})["auth_patterns"] = ownership_urls
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"[!] Discovery hints population failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
 
     # ── Step 3: Score and sort URLs ──────────────────────────────────────
     urls = recon_data.get("urls", [])
@@ -416,8 +425,9 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
                 try:
                     from modules.utils import check_session_health
                     check_session_health(scanner.session, config, log)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log(f"[!] Session health check failed: {e}", Colors.YELLOW,
+                        verbose_only=True, verbose=config.get("verbose", False))
 
             if url in completed_urls:
                 prog.advance()
@@ -458,8 +468,9 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
                 }
                 with open(resume_file, "w") as f:
                     json.dump(state, f)
-            except Exception:
-                pass
+            except Exception as e:
+                log(f"[!] Scan state save failed: {e}", Colors.YELLOW,
+                    verbose_only=True, verbose=config.get("verbose", False))
 
             prog.advance(url, len(all_findings_local))
 
@@ -546,6 +557,90 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
                         Colors.CYAN, verbose_only=True, verbose=config.get("verbose", False))
         except Exception as e:
             log(f"[!] Object harvesting failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
+
+    # ── Discovery Artifact Findings (consume unused discovery signals) ─────────
+    if container and hasattr(container, 'discovery_store'):
+        try:
+            ds = container.discovery_store
+            seen_artifact_ips: set[str] = set()
+            for rec in ds.get_by_category("private_ip"):
+                ip_val = rec.get("value", "")
+                src_url = rec.get("source_url", "") or config.get("target", "")
+                if ip_val and ip_val not in seen_artifact_ips:
+                    seen_artifact_ips.add(ip_val)
+                    ip_finding = Finding(
+                        vuln_type="Internal IP Disclosure",
+                        url=src_url,
+                        severity="medium",
+                        details=f"Internal/private IP address disclosed: {ip_val}",
+                        evidence=f"Source: {src_url} — IP: {ip_val}",
+                        verification_stage="detected",
+                        confidence_score=40,
+                        response_excerpt=f"Private IP found: {ip_val}",
+                        reproduction_steps=[
+                            f"Request the URL {src_url}",
+                            "Observe the response contains a private/internal IP address",
+                            f"Private IP: {ip_val}",
+                        ],
+                    )
+                    ip_finding.finding_state = FindingState.from_verification_stage("detected").value
+                    ip_finding.evidence_strength = "moderate"
+                    ip_finding.false_positive_risk = "medium"
+                    ip_evidence = ResponseExcerptEvidence(
+                        excerpt=f"Private IP found: {ip_val}",
+                        context=f"Source URL: {src_url}",
+                        description=f"Internal IP {ip_val} disclosed in response from {src_url}",
+                    )
+                    ip_finding.evidence.append(ip_evidence)
+                    if evidence_engine is not None:
+                        evidence_engine.link_to_finding(ip_evidence, ip_finding.fingerprint)
+                    enriched.append(ip_finding)
+                    log(f"  [Disclosure] Internal IP: {ip_val} @ {src_url}",
+                        Colors.YELLOW, verbose_only=True, verbose=config.get("verbose", False))
+
+            seen_artifact_keys: set[str] = set()
+            for rec in ds.get_by_category("api_key"):
+                key_val = rec.get("value", "")
+                src_url = rec.get("source_url", "") or config.get("target", "")
+                if key_val and key_val not in seen_artifact_keys:
+                    seen_artifact_keys.add(key_val)
+                    key_finding = Finding(
+                        vuln_type="Exposed API Key",
+                        url=src_url,
+                        severity="high",
+                        details=f"API key or secret exposed in response body: {key_val[:20]}...",
+                        evidence=f"Source: {src_url} — Key snippet: {key_val[:30]}...",
+                        verification_stage="detected",
+                        confidence_score=40,
+                        response_excerpt=f"API key pattern found: {key_val[:40]}",
+                        reproduction_steps=[
+                            f"Request the URL {src_url}",
+                            "Inspect the response for API key / secret patterns",
+                            f"Key found (truncated): {key_val[:30]}...",
+                        ],
+                    )
+                    key_finding.finding_state = FindingState.from_verification_stage("detected").value
+                    key_finding.evidence_strength = "moderate"
+                    key_finding.false_positive_risk = "medium"
+                    key_evidence = ResponseExcerptEvidence(
+                        excerpt=f"API key pattern found: {key_val[:80]}",
+                        context=f"Source URL: {src_url}",
+                        description=f"API key/secret pattern disclosed in response from {src_url}",
+                    )
+                    key_finding.evidence.append(key_evidence)
+                    if evidence_engine is not None:
+                        evidence_engine.link_to_finding(key_evidence, key_finding.fingerprint)
+                    enriched.append(key_finding)
+                    log(f"  [Disclosure] API Key: {key_val[:20]}... @ {src_url}",
+                        Colors.YELLOW, verbose_only=True, verbose=config.get("verbose", False))
+
+            n_artifact = len(seen_artifact_ips) + len(seen_artifact_keys)
+            if n_artifact:
+                log(f"[+] Artifact findings: {n_artifact} disclosure(s) from discovery store",
+                    Colors.GREEN, verbose_only=True, verbose=config.get("verbose", False))
+        except Exception as e:
+            log(f"[!] Discovery artifact findings failed: {e}", Colors.YELLOW,
                 verbose_only=True, verbose=config.get("verbose", False))
 
     # ── Ownership Discovery (proactive ownership inference from all signals) ──
@@ -710,6 +805,36 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
                         Colors.RED)
                     with lock:
                         all_findings_local.extend(candidate_findings)
+
+                    # ── Candidate yield feedback (update yield_rank based on exploitation outcomes) ──
+                    if container and hasattr(container, 'discovery_store'):
+                        try:
+                            store = container.discovery_store
+                            for f in candidate_findings:
+                                wf_name = f.get("_from_candidate")
+                                if not wf_name:
+                                    continue
+                                for c in bl_candidates:
+                                    if c.workflow.name != wf_name:
+                                        continue
+                                    stage = f.get("verification_stage", "detected")
+                                    if stage in ("verified", "exploitable"):
+                                        boost = 0.3
+                                    elif stage == "validated":
+                                        boost = 0.2
+                                    else:
+                                        boost = 0.1
+                                    c.priority_score = min(1.0, c.priority_score + boost)
+                                    break
+                            for c in bl_candidates:
+                                store.record("candidate_yield", c.workflow.name,
+                                             source_url=c.abuse_url or "",
+                                             extra={"yield_rank": round(c.yield_rank, 3),
+                                                    "priority_score": round(c.priority_score, 3),
+                                                    "risk": round(c.risk_model.overall_risk, 3)})
+                        except Exception as e:
+                            log(f"[!] Candidate yield feedback failed: {e}", Colors.YELLOW,
+                                verbose_only=True, verbose=config.get("verbose", False))
         except Exception as e:
             log(f"[!] Candidate exploitation failed: {e}", Colors.YELLOW,
                 verbose_only=True, verbose=config.get("verbose", False))
@@ -817,7 +942,7 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
     if "consensus" not in disabled_engines and container:
         try:
             log("[*] Computing validation consensus...", Colors.CYAN)
-            consensus_engine = container.validation_consensus_engine.create_default()
+            consensus_engine = container.validation_consensus_engine
             consensus_for = 0
             for obj in updated:
                 result = consensus_engine.evaluate(obj)
@@ -898,8 +1023,9 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
                 log(f"[*] Payload intelligence: {stats['total_records']} records, "
                     f"{stats.get('unique_payloads', 0)} unique payloads across "
                     f"{len(stats.get('by_type', {}))} vuln types", Colors.CYAN)
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"[!] Payload intelligence stats failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
 
     # ── Outcome Feedback (historical outcomes check) ───────────────────────
     if container and hasattr(container, 'outcome_feedback_engine'):
@@ -964,5 +1090,6 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
             if report_path:
                 log(f"[+] Audit log saved: {report_path}", Colors.GREEN)
             auditor.close()
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"[!] Audit log save failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))

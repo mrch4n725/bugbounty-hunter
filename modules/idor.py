@@ -63,6 +63,26 @@ FORM_ID_FIELDS = [
 
 SEQUENTIAL_DELTAS = [-1, 1, -100, 100]
 
+# Cross-resource type ID substitution patterns
+# e.g. accessing /orders/123 with /user/123 or /api/v2/accounts/123
+CROSS_RESOURCE_PATTERNS = [
+    ("/users/{id}", "/orders/{id}"),
+    ("/users/{id}", "/api/v1/users/{id}"),
+    ("/api/v1/users/{id}", "/api/v2/users/{id}"),
+    ("/users/{id}/profile", "/users/{id}/settings"),
+    ("/accounts/{id}", "/orders?user_id={id}"),
+    ("/customers/{id}", "/invoices?customer={id}"),
+]
+
+# Mass assignment fields to test (fields that should be read-only)
+MASS_ASSIGNMENT_FIELDS = [
+    "owner_id", "user_id", "userId", "role", "roles", "admin",
+    "is_admin", "is_admin", "permissions", "group", "groups",
+    "account_type", "plan", "tier", "subscription",
+    "creator_id", "author_id", "created_by", "updated_by",
+    "locked", "locked_by", "deleted", "disabled",
+]
+
 # ── Scanner class ──────────────────────────────────────────────────────────────
 
 class IdorScanner(ScannerModuleBase):
@@ -643,6 +663,165 @@ class IdorScanner(ScannerModuleBase):
                 log(f"  [IDOR Owner] {test_url[:80]} — {default_role} vs {alt_role}",
                     Colors.RED, verbose_only=True, verbose=self.verbose)
 
+    # ── UUID prediction / enumeration ────────────────────────────────────
+
+    def scan_uuid_enumeration(self, findings: list[dict], candidates: list[dict]) -> None:
+        """For UUID-type ID candidates, try adjacent UUIDs by modifying
+        the last character group (e.g., ...-0001 → ...-0002) and checking
+        if the mutated resource is accessible.
+        
+        Real UUID prediction attacks exploit version-4 UUIDs' temporal
+        or sequential components. We test the most common patterns:
+        incrementing last group, flipping a character, and known
+        sequential patterns from poorly-implemented UUID generators.
+        """
+        import uuid as uuid_lib
+        for c in candidates:
+            if c["type"] != "uuid":
+                continue
+            val = c["value"]
+            # Try common UUID mutations:
+            mutations = []
+            try:
+                u = uuid_lib.UUID(val)
+                # Version-4 UUIDs: increment the clock_seq (last group)
+                groups = val.split("-")
+                if len(groups) == 5:
+                    # Increment last group
+                    last = groups[4]
+                    if last.isalnum():
+                        for delta in [1, 2, -1]:
+                            try:
+                                incremented = hex(int(last, 16) + delta)[2:].zfill(len(last))[:len(last)]
+                                mutated = "-".join(groups[:4] + [incremented])
+                                mutations.append(mutated)
+                            except (ValueError, OverflowError):
+                                continue
+                    # Flip a character in group 3-4
+                    for group_idx in [3, 4]:
+                        g = groups[group_idx]
+                        for char_pos in range(min(2, len(g))):
+                            for flip_char in "0123456789abcdef":
+                                if g[char_pos] != flip_char:
+                                    flipped = g[:char_pos] + flip_char + g[char_pos+1:]
+                                    mutated = list(groups)
+                                    mutated[group_idx] = flipped
+                                    mutations.append("-".join(mutated))
+            except (ValueError, AttributeError):
+                continue
+
+            for mutated_val in mutations[:5]:
+                self._replay_and_check(findings, c, val, mutated_val)
+
+    # ── Cross-resource type ID substitution ──────────────────────────────
+
+    def scan_cross_resource_idor(self, findings: list[dict], candidates: list[dict]) -> None:
+        """Test if a user ID from one resource type works on another.
+        
+        Example: if /users/123 returns user data, check if /orders?user_id=123
+        also works — order enumeration using the user ID discovered from
+        the user profile endpoint. Or substitute the user's numeric ID as
+        an admin_id or owner_id on different resource types.
+        """
+        for c in candidates:
+            if c["type"] not in ("numeric", "uuid", "email"):
+                continue
+            val = c["value"]
+            for pattern_from, pattern_to in CROSS_RESOURCE_PATTERNS:
+                # Check if candidate URL matches pattern_from
+                url = c["url"]
+                if val not in url:
+                    continue
+                if pattern_from.replace("{id}", val) not in url:
+                    continue
+                # Build cross-resource URL
+                cross_url = pattern_to.replace("{id}", val)
+                full_cross = urljoin(url, cross_url)
+                if not self._in_scope(full_cross):
+                    continue
+                resp = safe_get(self.session, full_cross, self.timeout,
+                                raise_for_status=False)
+                if resp and resp.status_code == 200 and len(resp.text) > 300:
+                    f_dict = finding(
+                        "IDOR - Cross-Resource Access",
+                        full_cross, "critical",
+                        f"User ID '{val}' from '{c['source']}' works on "
+                        f"a different resource type: {full_cross}",
+                        f"HTTP {resp.status_code} - {len(resp.text)} bytes",
+                        verification_stage="validated",
+                        parameter=c['param'],
+                        response_excerpt=resp.text[:500],
+                        steps_to_reproduce=[
+                            f"Get user ID {val} from {url}",
+                            f"Use the same ID on a different resource: {full_cross}",
+                            "Observe that the cross-resource access returns user data",
+                            "This confirms the user ID is predictable and cross-resource access is possible",
+                        ],
+                    )
+                    if f_dict:
+                        self._append_finding(findings, f_dict)
+                        log(f"  [IDOR Cross] {full_cross[:80]}", Colors.RED,
+                            verbose_only=True, verbose=self.verbose)
+
+    # ── Mass assignment testing ─────────────────────────────────────────
+
+    def scan_mass_assignment(self, findings: list[dict]) -> None:
+        """Test POST/PUT endpoints by sending read-only fields in the
+        request body to see if they are accepted (mass assignment).
+        
+        E.g., sending {"owner_id": "another_user_id", "admin": true}
+        in a profile update endpoint.
+        """
+        for form in self.recon.get("forms", []):
+            action = form.get("action", "")
+            method = form.get("method", "get").upper()
+            if method not in ("POST", "PUT", "PATCH"):
+                continue
+            if not action or not self._in_scope(action):
+                continue
+            fields = form.get("fields", [])
+            existing_names = {f.get("name", "") for f in fields if f.get("name")}
+            for ma_field in MASS_ASSIGNMENT_FIELDS:
+                if ma_field in existing_names:
+                    continue  # Already tested by normal form submission
+                for test_value in ["another_user", "true", "1", "admin"]:
+                    data = {}
+                    for f in fields:
+                        name = f.get("name", "")
+                        data[name] = f.get("value", "test") or "test"
+                    data[ma_field] = test_value
+                    resp = safe_post(self.session, action, data=data,
+                                     timeout=self.timeout,
+                                     raise_for_status=False)
+                    if resp and resp.status_code in (200, 201, 202):
+                        # Check if the mass assignment field affected the response
+                        marker = f'"{ma_field}"'
+                        if marker in (resp.text or ""):
+                            f_dict = finding(
+                                "IDOR - Mass Assignment",
+                                action, "high",
+                                f"Endpoint accepts mass-assignment field "
+                                f"'{ma_field}={test_value}' — read-only "
+                                f"field was accepted in POST body",
+                                f"Field '{ma_field}' accepted with value '{test_value}' "
+                                f"(HTTP {resp.status_code})",
+                                verification_stage="validated",
+                                parameter=ma_field,
+                                response_excerpt=(resp.text or "")[:500],
+                                steps_to_reproduce=[
+                                    f"Send POST to {action} with '{ma_field}={test_value}'",
+                                    f"Observe that the read-only field is accepted — "
+                                    f"HTTP {resp.status_code}",
+                                    "An attacker can escalate privileges by modifying ",
+                                    f"fields like {ma_field}",
+                                ],
+                            )
+                            if f_dict:
+                                self._append_finding(findings, f_dict)
+                                log(f"  [IDOR MassAssign] {ma_field}={test_value} @ {action[:80]}",
+                                    Colors.RED, verbose_only=True, verbose=self.verbose)
+                            break
+
     # ── Stateful IDOR: create-then-access (Phase 5) ──────────────────────
 
     def scan_stateful_idor(self, findings: list[dict]) -> None:
@@ -951,6 +1130,9 @@ class IdorScanner(ScannerModuleBase):
             self.scan_horizontal_privesc(findings, candidates)
             self.scan_sequential_enum(findings, candidates)
             self.scan_encoded_id_manipulation(findings, candidates)
+            self.scan_uuid_enumeration(findings, candidates)
+            self.scan_cross_resource_idor(findings, candidates)
+            self.scan_mass_assignment(findings)
             self.verify_ownership(findings, candidates)
             self.scan_stateful_idor(findings)
 

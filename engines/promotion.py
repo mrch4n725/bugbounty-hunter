@@ -1,3 +1,4 @@
+from models.evidence import EvidenceBase
 from models.finding import Finding, FindingState, ConfidenceLevel, calculate_confidence
 from engines.evidence_quality import EvidenceQualityEngine
 from engines.evidence_validator import EvidenceCompletenessValidator
@@ -49,7 +50,8 @@ class FindingPromotionEngine:
         agg_strength = EvidenceQualityEngine.aggregate_strength(quality_scores)
         n_evidence = len(quality_scores)
 
-        if score >= 61 and agg_strength in ("strong", "very_strong") and n_evidence >= 2:
+        has_typed_evidence = any(isinstance(ev, EvidenceBase) for ev in (finding.evidence or []))
+        if score >= 61 and agg_strength in ("strong", "very_strong") and n_evidence >= 2 and has_typed_evidence:
             return FindingState.VERIFIED
 
         try:

@@ -345,16 +345,24 @@ class HTMLReporter(ReporterBase):
                     violated = getattr(ev, 'ownership_violated', False)
                     orig_body = getattr(ev, 'original_body_excerpt', '')
                     tgt_body = getattr(ev, 'target_body_excerpt', '')
-                    e_orig = html.escape(orig_body[:200])
-                    e_tgt = html.escape(tgt_body[:200])
+                    e_orig = html.escape(orig_body[:2000])
+                    e_tgt = html.escape(tgt_body[:2000])
                     parts.append(
                         f'<details open><summary>{e_desc} {"✓ Violation" if violated else "No violation"}</summary>'
                         f'<div class="evidence">'
-                        f'<p><strong>User:</strong> {html.escape(orig_user)} → HTTP {orig_status}</p>'
-                        f'<p><strong>User:</strong> {html.escape(tgt_user)} → HTTP {tgt_status}</p>'
-                        f'<p><strong>Content different:</strong> {content_diff}</p>'
-                        f'<details><summary>Original response excerpt</summary><pre>{e_orig}</pre></details>'
-                        f'<details><summary>Target response excerpt</summary><pre>{e_tgt}</pre></details>'
+                        f'<p><strong>User:</strong> {html.escape(orig_user)} → HTTP {orig_status} | '
+                        f'<strong>User:</strong> {html.escape(tgt_user)} → HTTP {tgt_status} | '
+                        f'<strong>Content different:</strong> {content_diff}</p>'
+                        f'<div style="display:flex;gap:1rem;flex-wrap:wrap;">'
+                        f'<div style="flex:1;min-width:300px;">'
+                        f'<h4 style="margin:0 0 0.25rem">Original ({html.escape(orig_user)})</h4>'
+                        f'<pre style="background:#fdf6f6;border:1px solid #e0c0c0;border-radius:4px;padding:0.5rem;max-height:400px;overflow:auto;font-size:0.85rem;">{e_orig}</pre>'
+                        f'</div>'
+                        f'<div style="flex:1;min-width:300px;">'
+                        f'<h4 style="margin:0 0 0.25rem">Target ({html.escape(tgt_user)})</h4>'
+                        f'<pre style="background:#f6fdf6;border:1px solid #c0e0c0;border-radius:4px;padding:0.5rem;max-height:400px;overflow:auto;font-size:0.85rem;">{e_tgt}</pre>'
+                        f'</div>'
+                        f'</div>'
                         f'</div></details>'
                     )
                 elif ev_type == "GraphQLSchemaEvidence":

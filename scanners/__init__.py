@@ -24,6 +24,7 @@ from scanners.openapi import OpenAPIScanner
 from scanners.authorization import AuthorizationScanner
 from scanners.cors import CORSScanner
 from scanners.jwt import JWTScanner
+from scanners.auth_bypass import AuthBypassScanner
 
 __all__ = [
     "ScannerBase",
@@ -52,6 +53,7 @@ __all__ = [
     "AuthorizationScanner",
     "CORSScanner",
     "JWTScanner",
+    "AuthBypassScanner",
 ]
 
 

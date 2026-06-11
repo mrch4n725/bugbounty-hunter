@@ -20,7 +20,7 @@ from modules.scanner import VulnScanner
 from modules.api_scanner import ApiScanner
 from modules.reporter import Reporter
 from modules.js_intelligence import JSIntelligence
-from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, same_domain, finding, make_session, build_role_sessions, classify_endpoint, compute_endpoint_score, prioritize_findings, reset_seen_findings, _build_curl, set_mask_sensitive_default, ScanProgress, safe_cookies_dict
+from modules.utils import banner, log, Colors, ScopeEnforcer, safe_get, safe_post, same_domain, finding, make_session, build_role_sessions, reset_seen_findings, _build_curl, set_mask_sensitive_default, safe_cookies_dict, SecretValidator
 from models.finding import Finding
 from app.bootstrap import bootstrap, auto_upgrade_config, print_startup_summary
 from engines.history import correlate_findings
@@ -36,7 +36,7 @@ def parse_args():
     parser.add_argument("--config", "-C", help="Path to YAML configuration file")
     parser.add_argument("--target", "-t", help="Target URL (e.g. https://example.com)")
     parser.add_argument("--modules", "-m", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization", "cors", "jwt", "cms", "all"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization", "cors", "jwt", "cms", "tech_specific", "business_logic", "auth_bypass", "all"],
         default=["all"])
     parser.add_argument("--output", "-o", default="reports")
     parser.add_argument("--format", "-f", choices=["json", "html", "txt", "markdown-report", "hackerone", "bugcrowd", "chatgpt"], default="chatgpt")
@@ -61,7 +61,7 @@ def parse_args():
         help="Allow automatic OOB service discovery (contacts dnslog.cn / interactsh at startup). Off by default.")
     parser.add_argument("--wordlist", help="Optional directory fuzzing wordlist path")
     parser.add_argument("--disable-modules", nargs="+",
-        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization", "cors", "jwt", "cms"],
+        choices=["recon", "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection", "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive", "exposed_files", "clickjacking", "http_methods", "insecure_forms", "subdomain_takeover", "graphql", "idor", "js_secrets", "api", "rate_limiting", "openapi", "authorization", "cors", "jwt", "cms", "tech_specific", "business_logic", "auth_bypass"],
         default=[], help="Disable specific modules when scanning all or default modules")
     parser.add_argument("--module-param", action="append", default=[],
         help="Override module settings using module.key=value")
@@ -107,7 +107,8 @@ def parse_args():
         choices=["attack_chains", "investigation", "impact", "evidence_quality",
                  "scan_budget", "asset_graph", "promotion", "replay",
                  "duplicate_risk", "consensus", "metrics", "confidence",
-                 "impact_escalation"],
+                 "impact_escalation", "multi_account", "semantic_analyzer",
+                 "ownership", "submission_readiness"],
         help="Disable specific analysis engines")
     parser.add_argument("--rdc-noise", action="store_true",
         help="Reduce attack-chain noise by filtering same-root-cause / low-value chains.")
@@ -446,6 +447,15 @@ def _log_startup(config: dict) -> None:
     log("", Colors.CYAN)
 
 
+_SCAN_MODULES = frozenset({
+    "xss", "sqli", "lfi", "ssrf", "xxe", "ssti", "cmd_injection",
+    "blind_xss", "open_redirect", "headers", "csrf", "dirb", "sensitive",
+    "exposed_files", "clickjacking", "http_methods", "insecure_forms",
+    "subdomain_takeover", "graphql", "idor", "api",
+    "rate_limiting", "openapi", "authorization", "cors", "jwt", "cms",
+    "tech_specific", "business_logic", "auth_bypass",
+})
+
 def _should_run_recon(config: dict, run_all: bool, disabled_modules: set) -> bool:
     if "recon" in disabled_modules:
         return False
@@ -453,6 +463,7 @@ def _should_run_recon(config: dict, run_all: bool, disabled_modules: set) -> boo
         (run_all and "recon" not in disabled_modules)
         or "recon" in config["modules"]
         or "js_secrets" in config["modules"]
+        or bool(set(config["modules"]) & _SCAN_MODULES)
     )
 
 
@@ -611,7 +622,7 @@ def _start_autosave(config, recon_data, all_findings, all_findings_lock, js_data
     return stop_event, thread
 
 
-def _findings_to_finding(config, all_findings, recon_data, js_data):
+def _findings_to_finding(config, all_findings, recon_data=None, js_data=None):
     """Convert legacy dict findings to canonical Finding instances at the pipeline boundary."""
     converted = []
     for f in all_findings:
@@ -843,6 +854,7 @@ def run(config: dict) -> int:
     disabled_modules = set(config.get("disable_modules", []))
 
     # ── Passive Import (HAR / Burp XML / Charles) ───────────────────────────
+    recon_data: dict = {}
     passive_import_path = config.get("passive_import", "")
     if passive_import_path and os.path.isfile(passive_import_path):
         log(f"[*] Loading passive import: {passive_import_path}", Colors.CYAN)
@@ -863,7 +875,6 @@ def run(config: dict) -> int:
                 log(f"  [+] Imported {len(imported.get('urls', []))} URLs, "
                      f"{len(imported.get('forms', []))} forms, "
                      f"{len(imported.get('parameters', []))} params", Colors.GREEN)
-                # Pre-populate recon_data so recon step can skip active crawling
                 for key, val in imported.items():
                     if val:
                         if isinstance(val, list):
@@ -876,9 +887,16 @@ def run(config: dict) -> int:
         except Exception as e:
             log(f"[!] Passive import failed: {e}", Colors.YELLOW)
 
-    recon, recon_data = _run_recon_if_needed(
+    recon, fresh_data = _run_recon_if_needed(
         config, _should_run_recon(config, run_all, disabled_modules), container=container
     )
+    # Merge passive import data into fresh recon data (import URLs supplement, not replace)
+    for key in ("urls", "subdomains", "forms", "js_urls"):
+        imported_vals = recon_data.get(key, [])
+        if imported_vals:
+            existing = set(fresh_data.get(key, []))
+            fresh_data[key] = list(existing | set(imported_vals))
+    recon_data = fresh_data
 
     # ── External Intelligence Gathering (after recon, enriches recon_data) ──
     if not config.get("passive", False) and container and hasattr(container, 'external_intel'):
@@ -930,6 +948,7 @@ def run(config: dict) -> int:
                     existing.update(dcookies)
                     config["cookies"] = existing
                     config["_default_cred_finding"] = (duser, dpass)
+                    config["_default_cred_url"] = action_url
                     log(f"[!] Default credentials WORK on {action_url}: "
                         f"{duser}:{dpass} — session injected, "
                         f"finding will be reported", Colors.RED)
@@ -942,6 +961,8 @@ def run(config: dict) -> int:
     js_data: dict = {
         "secrets": [], "endpoints": [], "hidden_endpoints": [],
         "routes": [], "env_vars": [], "hardcoded_values": [],
+        "feature_flags": [], "suspicious_patterns": [],
+        "internal_apis": [], "graphql_endpoints": [],
     }
     js_urls = recon_data.get("js_urls", [])
     run_js = (
@@ -964,7 +985,8 @@ def run(config: dict) -> int:
             if resp is None or resp.status_code >= 400:
                 continue
             result = js_intel.analyze(resp.text, source_url=url)
-            for key in ("secrets", "endpoints", "hidden_endpoints", "routes", "env_vars", "hardcoded_values"):
+            for key in ("secrets", "endpoints", "hidden_endpoints", "routes", "env_vars", "hardcoded_values",
+                        "feature_flags", "suspicious_patterns", "internal_apis", "graphql_endpoints"):
                 js_data.setdefault(key, []).extend(result.get(key, []))
 
             # Generate findings from secrets found in this URL immediately
@@ -993,6 +1015,150 @@ def run(config: dict) -> int:
                 if f:
                     js_findings.append(f)
 
+            # Generate findings from tokens found in this URL
+            seen_tokens: set[str] = set()
+            for entry in result.get("tokens", []):
+                tok_type = entry.get("type", "Token")
+                tok_val = entry.get("value", "")[:60]
+                tok_key = f"{tok_type}:{tok_val}"
+                if tok_key in seen_tokens:
+                    continue
+                seen_tokens.add(tok_key)
+                tok_sev = "high"
+                tok_validated = False
+                for label, klass in [("AWS Access Key", "aws_access_key"),
+                                      ("GitHub Token", "github_token"),
+                                      ("Firebase API Key", "firebase_api_key")]:
+                    if tok_type.startswith(label):
+                        try:
+                            r = SecretValidator.validate(klass, tok_val.split()[0] if " " in tok_val else tok_val)
+                            if r.get("valid") is True:
+                                tok_validated = True
+                                tok_sev = "critical"
+                        except Exception:
+                            pass
+                        break
+                ft = finding(
+                    vuln_type=f"Exposed Token ({tok_type})",
+                    url=url,
+                    severity=tok_sev,
+                    details=f"Token/credential of type '{tok_type}' exposed in JS file",
+                    evidence=f"Type: {tok_type}, Value: {tok_val}... Source: {url}",
+                    verification_stage="verified" if tok_validated else "detected",
+                    request=_build_curl("GET", url, dict(js_session.headers), cookies=safe_cookies_dict(js_session.cookies)),
+                    response_excerpt=resp.text[:1000],
+                    steps_to_reproduce=[
+                        f"Fetch the JS file at {url}",
+                        f"Search the response for '{tok_type}' patterns",
+                        "Observe the exposed token/credential value",
+                    ],
+                )
+                if ft:
+                    js_findings.append(ft)
+
+            # Generate findings from hardcoded_values found in this URL
+            for entry in result.get("hardcoded_values", []):
+                hv_type = entry.get("type", "unknown")
+                hv_match = entry.get("match", "")[:80]
+                fhv = finding(
+                    vuln_type=f"Hardcoded Sensitive Value ({hv_type})",
+                    url=url,
+                    severity="medium" if hv_type in ("private_ip", "localhost_ref") else "high",
+                    details=f"Hardcoded sensitive value of type '{hv_type}' found in JS file",
+                    evidence=f"Match: {hv_match}... Source: {url}",
+                    verification_stage="detected",
+                    request=_build_curl("GET", url, dict(js_session.headers), cookies=safe_cookies_dict(js_session.cookies)),
+                    response_excerpt=resp.text[:1000],
+                    steps_to_reproduce=[
+                        f"Fetch the JS file at {url}",
+                        f"Search the response for '{hv_type}' patterns",
+                        "Observe the hardcoded sensitive value",
+                    ],
+                )
+                if fhv:
+                    js_findings.append(fhv)
+
+            # Generate findings from suspicious_patterns found in this URL
+            for entry in result.get("suspicious_patterns", []):
+                sp_type = entry.get("type", "unknown")
+                sp_match = entry.get("match", "")[:80]
+                fsp = finding(
+                    vuln_type=f"Suspicious Pattern ({sp_type})",
+                    url=url,
+                    severity="low",
+                    details=f"Suspicious pattern '{sp_type}' found in JS file",
+                    evidence=f"Match: {sp_match}... Source: {url}",
+                    verification_stage="detected",
+                    request=_build_curl("GET", url, dict(js_session.headers), cookies=safe_cookies_dict(js_session.cookies)),
+                    response_excerpt=resp.text[:1000],
+                    steps_to_reproduce=[
+                        f"Fetch the JS file at {url}",
+                        f"Search the response for '{sp_type}' patterns",
+                        "Observe the suspicious content",
+                    ],
+                )
+                if fsp:
+                    js_findings.append(fsp)
+
+            # Generate findings from feature_flags found in this URL
+            for entry in result.get("feature_flags", []):
+                ff_type = entry.get("type", "feature_flag")
+                ff_match = entry.get("match", "")[:80]
+                fff = finding(
+                    vuln_type="Feature Flag Exposure",
+                    url=url,
+                    severity="low",
+                    details="Feature flag / toggle reference found in JS file",
+                    evidence=f"Type: {ff_type}, Match: {ff_match}... Source: {url}",
+                    verification_stage="detected",
+                    request=_build_curl("GET", url, dict(js_session.headers), cookies=safe_cookies_dict(js_session.cookies)),
+                    response_excerpt=resp.text[:1000],
+                    steps_to_reproduce=[
+                        f"Fetch the JS file at {url}",
+                        "Search the response for feature flag / toggle patterns",
+                        "Observe the exposed feature flag",
+                    ],
+                )
+                if fff:
+                    js_findings.append(fff)
+
+            # Generate findings from env_vars found in this URL
+            for entry in result.get("env_vars", []):
+                ev_var = entry.get("variable", "unknown")
+                ev_ref = entry.get("reference", "process_env")
+                ev_match = entry.get("match", "")[:80]
+                fev = finding(
+                    vuln_type="Environment Variable Reference",
+                    url=url,
+                    severity="low",
+                    details=f"Environment variable '{ev_var}' referenced in JS file",
+                    evidence=f"Variable: {ev_var}, Reference: {ev_ref}, Match: {ev_match}... Source: {url}",
+                    verification_stage="detected",
+                    request=_build_curl("GET", url, dict(js_session.headers), cookies=safe_cookies_dict(js_session.cookies)),
+                    response_excerpt=resp.text[:1000],
+                    steps_to_reproduce=[
+                        f"Fetch the JS file at {url}",
+                        f"Search the response for '{ev_var}' environment variable references",
+                        "Observe the exposed env var reference",
+                    ],
+                )
+                if fev:
+                    js_findings.append(fev)
+
+            # Inject internal_apis URLs into scan pool (same-domain only)
+            for entry in result.get("internal_apis", []):
+                ia_url = entry.get("url", "")
+                if ia_url and same_domain(config["target"], ia_url):
+                    if ia_url not in recon_data["urls"]:
+                        recon_data["urls"].append(ia_url)
+
+            # Inject graphql_endpoints URLs into scan pool (same-domain only)
+            for entry in result.get("graphql_endpoints", []):
+                ge_url = entry.get("url", "")
+                if ge_url and same_domain(config["target"], ge_url):
+                    if ge_url not in recon_data["urls"]:
+                        recon_data["urls"].append(ge_url)
+
         # Add discovered same-domain URLs to scan target list
         for ep in js_data.get("endpoints", []):
             ep_url = ep.get("url", "")
@@ -1004,6 +1170,14 @@ def run(config: dict) -> int:
             if ep_url and same_domain(config["target"], ep_url):
                 if ep_url not in recon_data["urls"]:
                     recon_data["urls"].append(ep_url)
+
+        # Inject discovered route paths into scan target list
+        for entry in js_data.get("routes", []):
+            route_path = entry.get("route", "")
+            if route_path and route_path.startswith("/"):
+                full_url = config["target"].rstrip("/") + route_path
+                if same_domain(config["target"], full_url) and full_url not in recon_data["urls"]:
+                    recon_data["urls"].append(full_url)
 
         secret_count = len(js_data.get("secrets", []))
         endpoint_count = len(js_data.get("endpoints", [])) + len(js_data.get("hidden_endpoints", []))
@@ -1070,7 +1244,7 @@ def run(config: dict) -> int:
     )
 
     # Build role sessions for authz testing (consumed by scanners + MultiAccountDiscovery)
-    base_session = make_session(config) if hasattr(config, "get") else None
+    base_session = make_session(config)
     role_sessions = build_role_sessions(config, base_session=base_session)
     if len(role_sessions) >= 2:
         config["_role_sessions"] = role_sessions
@@ -1113,7 +1287,7 @@ def run(config: dict) -> int:
     if default_cred:
         duser, dpass = default_cred
         from modules.utils import finding
-        dc_url = login_url or config["target"]
+        dc_url = config.get("_default_cred_url", "") or config["target"]
         df = finding(
             vuln_type="Default Credentials",
             url=dc_url,
@@ -1270,15 +1444,18 @@ def run(config: dict) -> int:
                     Colors.YELLOW, verbose_only=True,
                     verbose=config.get("verbose", False))
 
-    # ── GQL Authorization Plan Investigation ─────────────────────────────
+    # ── GQL Authorization Plan Investigation (real HTTP probes) ─────────
     if "investigation" not in disabled_engines and container:
         if hasattr(container, 'discovery_store'):
             try:
+                from modules.utils import make_session
                 ds = container.discovery_store
                 plans = ds.get_by_category("gql_auth_plan")
                 if plans:
-                    log(f"[*] Investigating {len(plans)} GQL authorization plans...",
+                    log(f"[*] Investigating {len(plans)} GQL authorization plans with HTTP probes...",
                         Colors.CYAN)
+                    gql_session = make_session(config)
+                    gql_auth_findings: list[Finding] = []
                     investigated = 0
                     for plan in plans[:10]:
                         extra = plan.get("extra", {}) or {}
@@ -1294,14 +1471,82 @@ def run(config: dict) -> int:
                         target_url = extra.get("target_url", "") or plan.get("source_url", "")
                         plan_type = extra.get("plan_type", "unknown")
                         gql_op = extra.get("gql_operation", "")
-                        log(f"  [*] {plan_type}: {gql_op} @ {target_url or 'N/A'} "
+                        if not target_url:
+                            continue
+                        log(f"  [*] Probing {plan_type}: {gql_op} @ {target_url} "
                             f"(confidence={confidence:.2f})",
                             Colors.CYAN, verbose_only=True,
                             verbose=config.get("verbose", False))
+
+                        # Build a type-appropriate GQL query based on plan type
+                        is_mutation = any(kw in gql_op.lower() for kw in ("create", "update", "delete", "set", "add", "remove"))
+                        if is_mutation:
+                            if "role" in gql_op.lower() or plan_type == "role_escalation":
+                                query_str = f"mutation {{ {gql_op}(role: \"admin\") {{ __typename }} }}"
+                            else:
+                                query_str = f"mutation {{ {gql_op}(id: 1) {{ __typename }} }}"
+                        else:
+                            selection = "{ __typename }"
+                            if plan_type in ("cross_tenant", "ownership_violation"):
+                                selection = "{ __typename id }"
+                            query_str = f"{{ {gql_op} {selection} }}"
+                        gql_payload = {"query": query_str}
+                        headers = {"Content-Type": "application/json"}
+                        resp = safe_post(gql_session, target_url,
+                                         json=gql_payload, headers=headers,
+                                         timeout=config.get("timeout", 10))
+                        if resp is not None:
+                            status = resp.status_code
+                            resp_text = resp.text[:2000] if resp.text else ""
+                            data_signal = '"data"' in resp_text[:500] or '__typename' in resp_text[:500]
+                            error_signal = '"errors"' in resp_text[:500]
+                            if status == 200 and data_signal and not error_signal:
+                                gql_finding = Finding(
+                                    vuln_type=f"GQL Auth Bypass ({plan_type})",
+                                    url=target_url,
+                                    severity="high" if "cross_tenant" in plan_type or "ownership" in plan_type else "medium",
+                                    details=f"GQL authorization plan '{plan_type}' confirmed via probe. Operation: {gql_op}",
+                                    evidence=f"Query: {query_str} — Status: {status}",
+                                    verification_stage="validated",
+                                    confidence_score=60,
+                                    response_excerpt=resp_text[:500],
+                                    reproduction_steps=[
+                                        f"Send GQL query to {target_url}",
+                                        f"Operation: {gql_op}",
+                                        "Observe successful data return (200) with query results",
+                                    ],
+                                )
+                                gql_finding.finding_state = FindingState.from_verification_stage("validated").value
+                                gql_finding.evidence_strength = "moderate"
+                                gql_finding.false_positive_risk = "medium"
+                                gql_auth_findings.append(gql_finding)
+                                log(f"    [FOUND] GQL Auth Bypass ({plan_type}) @ {target_url}",
+                                    Colors.RED)
+                            elif status == 200 and error_signal:
+                                log(f"    [-] Query executed but returned errors (still accessible)",
+                                    Colors.YELLOW, verbose_only=True,
+                                    verbose=config.get("verbose", False))
+                            elif status in (401, 403):
+                                log(f"    [-] Protected (HTTP {status})",
+                                    Colors.YELLOW, verbose_only=True,
+                                    verbose=config.get("verbose", False))
+                            else:
+                                log(f"    [-] Unexpected HTTP {status}",
+                                    Colors.YELLOW, verbose_only=True,
+                                    verbose=config.get("verbose", False))
+                        else:
+                            log(f"    [!] No response from {target_url}",
+                                Colors.YELLOW, verbose_only=True,
+                                verbose=config.get("verbose", False))
                         investigated += 1
-                    if investigated:
-                        log(f"[+] {investigated} GQL auth plans queued for investigation",
-                            Colors.GREEN, verbose_only=True,
+
+                    if gql_auth_findings:
+                        log(f"[+] {len(gql_auth_findings)} GQL auth bypass(es) confirmed via probe",
+                            Colors.RED)
+                        all_findings.extend(gql_auth_findings)
+                    elif investigated:
+                        log(f"[-] {investigated} GQL auth plans probed — no bypass confirmed",
+                            Colors.YELLOW, verbose_only=True,
                             verbose=config.get("verbose", False))
             except Exception as e:
                 log(f"[!] GQL auth plan investigation failed: {e}", Colors.YELLOW,

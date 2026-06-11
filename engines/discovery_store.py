@@ -146,6 +146,37 @@ class DiscoveryStore:
             "categories": categories,
         }
 
+    def store(self, category: str, value: str, source_url: str = "",
+              extra: str | None = None) -> None:
+        """Alias for record() that accepts a JSON-serialized extra string."""
+        extra_dict = json.loads(extra) if extra else None
+        self.record(category, value, source_url=source_url, extra=extra_dict)
+
+    def get_by_fingerprint(self, fingerprint: str, category: str | None = None) -> dict[str, Any] | None:
+        """Return a single record by fingerprint, optionally filtered by category."""
+        with self._lock:
+            if category:
+                row = self._get_conn().execute("""
+                    SELECT category, value, source_url, extra, first_seen, last_seen, hit_count
+                    FROM discovered WHERE fingerprint = ? AND category = ?
+                """, (fingerprint, category)).fetchone()
+            else:
+                row = self._get_conn().execute("""
+                    SELECT category, value, source_url, extra, first_seen, last_seen, hit_count
+                    FROM discovered WHERE fingerprint = ?
+                """, (fingerprint,)).fetchone()
+        if not row:
+            return None
+        return {
+            "category": row[0],
+            "value": row[1],
+            "source_url": row[2],
+            "extra": json.loads(row[3]) if row[3] else {},
+            "first_seen": row[4],
+            "last_seen": row[5],
+            "hit_count": row[6],
+        }
+
     def close(self) -> None:
         with self._lock:
             if self._connection is not None:

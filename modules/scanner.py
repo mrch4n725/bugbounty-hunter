@@ -10,6 +10,7 @@ import time
 import re
 import hashlib
 import random
+import statistics
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
 from urllib.parse import urlparse, urlencode, parse_qs, urljoin, urlunparse
@@ -160,6 +161,10 @@ SQLI_ERRORS = [
     "sqlstate", "sql server", "pdo", "you have an error in your sql",
     "unexpected end of SQL command", "division by zero",
     "column count doesn't match", "unknown column",
+    "incorrect syntax near",
+    "warning: pg_", "pg_exec",
+    "unrecognized token", "mongoerror", "e11000",
+    "supplied argument is not a valid",
 ]
 
 DEFAULT_SQLI_PAYLOADS = {
@@ -1274,10 +1279,15 @@ class VulnScanner:
                         triggering_response = false_resp.text[:500]
                         break
 
-        # ── Time-based (baseline comparison) ─────────────────────────
-        baseline_start = time.time()
-        safe_get(self.session, url, 15, raise_for_status=False)
-        baseline_delay = time.time() - baseline_start
+        # ── Time-based (statistical baseline — mean + 3*stddev) ─────────
+        baseline_delays = []
+        for _ in range(5):
+            b_start = time.time()
+            safe_get(self.session, url, 15, raise_for_status=False)
+            baseline_delays.append(time.time() - b_start)
+        baseline_mean = statistics.mean(baseline_delays) if baseline_delays else 1.0
+        baseline_stdev = statistics.stdev(baseline_delays) if len(baseline_delays) > 1 else 0.5
+        min_time_threshold = max(baseline_mean + 3 * baseline_stdev, 5.0)
         for payload in payloads.get("time_based", []):
             test_url = self._inject_param(url, param, payload)
             delays = []
@@ -1287,9 +1297,9 @@ class VulnScanner:
                 time_resp = safe_get(self.session, test_url, 15, raise_for_status=False)
                 delays.append(time.time() - start)
             min_delay = min(delays)
-            if min_delay > baseline_delay + 4 and all(d > baseline_delay + 3 for d in delays):
+            if min_delay > min_time_threshold and all(d > max(baseline_mean + 3 * baseline_stdev, 4.0) for d in delays):
                 signals["time"] = True
-                evidence_parts.append(f"time:delays={delays}, baseline={baseline_delay:.2f}s")
+                evidence_parts.append(f"time:delays={delays}, baseline_mean={baseline_mean:.2f}s, baseline_stdev={baseline_stdev:.2f}s, threshold={min_time_threshold:.2f}s")
                 if time_resp:
                     triggering_response = time_resp.text[:500]
                 break
@@ -3032,6 +3042,12 @@ class VulnScanner:
     def scan_jwt(self, target_urls: list[str] | None = None) -> list[dict]:
         """Dispatch to JWTScanner (ScannerBase)."""
         if result := self._dispatch_to_scanner("jwt"):
+            return result
+        return []
+
+    def scan_auth_bypass(self, target_urls: list[str] | None = None) -> list[dict]:
+        """Dispatch to AuthBypassScanner (ScannerBase)."""
+        if result := self._dispatch_to_scanner("auth_bypass"):
             return result
         return []
 

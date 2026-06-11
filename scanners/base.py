@@ -113,20 +113,43 @@ class ScannerBase:
     def generate_reproduction(self, result=None) -> list[str]:
         url = getattr(result, "url", "") if result else ""
         ctx = getattr(result, "context", "") if result else ""
+        is_auth = self.config.get("cookies") or self.config.get("auth") or False
+        account_hint = ""
+        if is_auth:
+            auth_type = "cookie-based" if self.config.get("cookies") else "header-based"
+            account_hint = (
+                f"Requires {auth_type} authentication — use a valid session. "
+                "If the endpoint is public, no session is needed. "
+                "For IDOR testing, you need two different user accounts."
+            )
+        else:
+            account_hint = "No authentication required (public endpoint)."
+
+        curl_cmd = ""
+        cookies = self.config.get("cookies", {})
+        if cookies:
+            cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+            curl_cmd = f"curl -X GET --cookie '{cookie_str}' '{url}'"
+        else:
+            curl_cmd = f"curl -X GET '{url}'"
+
         if url and ctx:
             return [
-                f"curl -X GET '{url}'",
-                f"Observe: {ctx}",
+                curl_cmd,
+                f"Account context: {account_hint}",
+                f"Expected vs actual: {ctx}",
                 "Verify by inspecting the response for the expected vulnerability signal and assess impact based on accessible data or functionality",
             ]
         if url:
             return [
-                f"curl -X GET '{url}'",
+                curl_cmd,
+                f"Account context: {account_hint}",
                 "Inspect the response for anomalies or unexpected behavior",
                 "Assess impact based on what information or functionality is exposed",
             ]
         return [
             "curl -X GET <target-url>",
+            "Account context: use the same session/cookies as during the scan",
             "Inspect the response for the expected vulnerability signal",
             "Assess impact based on what an attacker could achieve by exploiting this finding",
         ]

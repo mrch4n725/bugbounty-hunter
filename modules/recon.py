@@ -83,6 +83,64 @@ class Recon:
         "format", "type", "view", "template", "include",
         "page", "file", "doc", "path", "load",
     ]
+
+    # Wordlist for hidden parameter fuzzing (surfaces undocumented params)
+    HIDDEN_PARAM_WORDLIST = [
+        "debug", "test", "admin", "source", "show", "mode", "dev",
+        "env", "config", "token", "secret", "key", "api_key", "api",
+        "action", "exec", "cmd", "command", "ajax", "format",
+        "type", "view", "template", "include", "page", "file",
+        "doc", "path", "load", "redirect", "return", "next",
+        "url", "uri", "dest", "target", "continue", "follow",
+        "callback", "jsonp", "data", "input", "output", "log",
+        "error", "warning", "info", "status", "check", "verify",
+        "validate", "confirm", "submit", "save", "update", "create",
+        "delete", "remove", "edit", "modify", "clone", "copy",
+        "export", "import", "download", "upload", "sync", "push",
+        "pull", "merge", "diff", "patch", "rollback", "revert",
+        "restore", "backup", "archive", "compress", "extract",
+        "search", "filter", "sort", "order", "group", "limit",
+        "offset", "count", "total", "page", "per_page", "cursor",
+        "since", "until", "before", "after", "from", "to",
+        "q", "query", "s", "search", "name", "title", "description",
+        "email", "username", "user", "password", "pass", "pwd",
+        "role", "group", "permission", "access", "allow", "deny",
+        "true", "false", "yes", "no", "enable", "disable", "enabled",
+        "disabled", "active", "inactive", "hidden", "visible",
+        "public", "private", "protected", "internal", "external",
+        "preview", "draft", "published", "archived", "deleted",
+        "owner", "creator", "author", "editor", "reviewer",
+        "all", "any", "none", "manage", "join", "leave",
+        "subscribe", "unsubscribe", "notify", "ignore",
+        "pin", "unpin", "lock", "unlock", "flag", "unflag",
+        "like", "unlike", "follow", "unfollow", "block", "unblock",
+        "report", "spam", "abuse", "violation",
+    ]
+
+    # HTTP headers that can be injection points for SSRF/access bypass
+    INJECTABLE_HEADERS = [
+        "X-Original-URL", "X-Rewrite-URL", "X-Custom-IP-Authorization",
+        "Forwarded", "True-Client-IP", "CF-Connecting-IP",
+        "X-Forwarded-For", "X-Real-IP", "X-Client-IP", "Client-IP",
+        "X-ProxyUser-IP", "X-Auth-Token", "X-Auth-User",
+        "X-Auth-Email", "X-Auth-Roles",
+    ]
+
+    # Prototype pollution payloads for JSON/URL parameters
+    PROTOTYPE_POLLUTION_PAYLOADS = [
+        {"__proto__[polluted]": "true"},
+        {"constructor[prototype][polluted]": "true"},
+        {"__proto__": {"polluted": "true"}},
+    ]
+
+    # Nested JSON paths to test for JSON injection (beyond flat key-value)
+    JSON_NESTED_PATHS = [
+        (["user", "id"], "1 OR 1=1"),
+        (["user", "role"], "admin"),
+        (["query", "filter"], "1=1"),
+        (["data", "attributes", "admin"], "true"),
+        (["nested", "param"], "test"),
+    ]
     
     def __init__(self, config, container=None):
         """
@@ -192,6 +250,19 @@ class Recon:
         # Active parameter fuzzing — discover hidden params on discovered URLs
         self._fuzz_parameters()
 
+        # Hidden parameter discovery via wordlist-based approach
+        if not self.config.get("passive"):
+            self._discover_hidden_parameters()
+
+        # Header injection point discovery
+        if not self.config.get("passive"):
+            self._header_injection_points = []
+            self._discover_header_injection_points()
+
+        # Prototype pollution testing on URL parameters
+        if not self.config.get("passive"):
+            self._test_prototype_pollution()
+
         return {
             'urls': sorted(list(self.urls)),
             'forms': self.forms,
@@ -203,6 +274,9 @@ class Recon:
             'technology': self.technology,
             'html_comments': self._html_comments,
             'fuzzed_params': dict(self._fuzzed_params),
+            'hidden_params': sorted(list(self.params)),
+            'header_injection_points': getattr(self, '_header_injection_points', []),
+            'prototype_pollution_params': [p for p in self.params if '__proto__' in p or 'constructor[' in p],
         }
 
     def _fingerprint_shell(self):
@@ -986,6 +1060,128 @@ class Recon:
                         for pm in param_matches:
                             with self.params_lock:
                                 self.params.add(pm)
+
+    def _discover_header_injection_points(self) -> None:
+        """Probe HEAD/GET requests with injectable HTTP headers and check
+        if they affect the response (application processes these headers).
+        
+        Adds discovered header-injection sources to recon data.
+        """
+        discovered = []
+        for url in list(self.urls)[:20]:
+            for header_name in self.INJECTABLE_HEADERS:
+                probe_val = f"bbh_{hashlib.md5(header_name.encode()).hexdigest()[:8]}"
+                headers = {header_name: probe_val}
+                try:
+                    baseline = safe_get(self.session, url, self.timeout,
+                                        raise_for_status=False)
+                    probed = safe_get(self.session, url, self.timeout,
+                                      headers=headers, raise_for_status=False)
+                    if baseline and probed:
+                        if (baseline.status_code != probed.status_code
+                                or probe_val in (probed.text or "")):
+                            discovered.append({"header": header_name, "url": url})
+                            log(f"  [Header Inj] {header_name} affects {url}",
+                                Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+                            break
+                except Exception:
+                    continue
+        if discovered:
+            self._header_injection_points = discovered
+
+    def _test_prototype_pollution(self) -> None:
+        """Test URL parameters for prototype pollution by appending
+        __proto__[polluted]=true and checking for behavioral change.
+        """
+        for url in list(self.urls)[:50]:
+            for pp_payload in self.PROTOTYPE_POLLUTION_PAYLOADS:
+                try:
+                    for key, val in pp_payload.items():
+                        sep = "&" if urlparse(url).query else "?"
+                        test_url = f"{url}{sep}{key}={val}"
+                        resp = safe_get(self.session, test_url, self.timeout,
+                                        raise_for_status=False)
+                        if resp and resp.status_code == 200:
+                            # Check if response content changed significantly
+                            base_resp = safe_get(self.session, url, self.timeout,
+                                                 raise_for_status=False)
+                            if base_resp and resp.text and base_resp.text:
+                                if len(resp.text) != len(base_resp.text):
+                                    self.params.add(key)
+                                    log(f"  [ProtoPoll] Possibly vulnerable: {test_url}",
+                                        Colors.YELLOW, verbose_only=True,
+                                        verbose=self.verbose)
+                                    break
+                except Exception:
+                    continue
+
+    def _discover_hidden_parameters(self) -> None:
+        """Wordlist-based hidden parameter fuzzing.
+        
+        Probes each discovered URL with common hidden parameter names
+        and checks if the response changes (status, content length, body hash).
+        This discovers undocumented parameters like ?debug=true, ?admin=1, etc.
+        """
+        discovered = 0
+        urls = list(self.urls)[:100]
+        if not urls:
+            return
+        wordlist = self.config.get("param_wordlist") or self.HIDDEN_PARAM_WORDLIST
+        log(f"[*] Fuzzing {len(urls)} URLs with {len(wordlist)} hidden params...",
+            Colors.CYAN, verbose_only=True, verbose=self.verbose)
+        for url in urls:
+            try:
+                baseline = safe_get(self.session, url, self.timeout,
+                                    raise_for_status=False)
+                if not baseline:
+                    continue
+                baseline_len = len(baseline.text) if baseline.text else 0
+                baseline_status = baseline.status_code
+                baseline_hash = hashlib.md5(
+                    (baseline.text or "").encode()).hexdigest()
+                for param_name in wordlist:
+                    if not param_name:
+                        continue
+                    for test_val in ["1", "true", ""]:
+                        sep = "&" if urlparse(url).query else "?"
+                        test_url = f"{url}{sep}{param_name}={test_val}"
+                        try:
+                            resp = safe_get(self.session, test_url, self.timeout,
+                                            raise_for_status=False)
+                            if not resp:
+                                continue
+                            resp_len = len(resp.text) if resp.text else 0
+                            resp_hash = hashlib.md5(
+                                (resp.text or "").encode()).hexdigest()
+                            signals = 0
+                            if resp.status_code != baseline_status:
+                                signals += 1
+                            if resp_hash != baseline_hash:
+                                signals += 1
+                            if baseline_len > 0:
+                                ratio = resp_len / baseline_len
+                                if ratio > 1.15 or ratio < 0.85:
+                                    signals += 1
+                            if param_name in (resp.text or "")[:2000]:
+                                signals += 1
+                            if signals >= 2:
+                                with self.urls_lock:
+                                    self.urls.add(test_url)
+                                    self.params.add(param_name)
+                                    self._fuzzed_params.setdefault(
+                                        url, []).append(param_name)
+                                discovered += 1
+                                log(f"  [Hidden Param] {param_name}={test_val} active on {url}",
+                                    Colors.GREEN, verbose_only=True,
+                                    verbose=self.verbose)
+                                break
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+        if discovered:
+            log(f"[+] Hidden parameter fuzzing discovered {discovered} active param(s)",
+                Colors.GREEN)
 
     def _fuzz_parameters(self) -> None:
         """Actively discover hidden URL parameters by fuzzing common param names.

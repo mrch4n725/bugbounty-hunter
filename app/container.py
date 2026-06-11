@@ -200,7 +200,7 @@ class ApplicationContainer:
     @property
     def validation_consensus_engine(self) -> ValidationConsensusEngine:
         if self._validation_consensus_engine is None:
-            self._validation_consensus_engine = ValidationConsensusEngine()
+            self._validation_consensus_engine = ValidationConsensusEngine.create_default()
         return self._validation_consensus_engine
 
     @property

