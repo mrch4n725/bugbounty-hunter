@@ -9,7 +9,7 @@ from urllib.parse import urljoin
 import requests
 
 
-BASE = "https://api.hackerone.com/v1"
+BASE = "https://api.hackerone.com/v1/"
 CACHE_DIR = os.path.expanduser("~/.bbh")
 CACHE_FILE = os.path.join(CACHE_DIR, "programme_cache.json")
 CACHE_TTL = 3600  # 1 hour

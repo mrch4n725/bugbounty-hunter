@@ -884,6 +884,11 @@ def run(config: dict) -> int:
     h1_username, h1_token = (h1_api_raw.split(":", 1) if ":" in h1_api_raw else ("", ""))
     bc_token = config.get("bc_token", "") or os.environ.get("BC_TOKEN", "")
     h1_strict = config.get("h1_strict", False)
+
+    if h1_api_raw and not programme_handle and not config.get("list_programmes") and not config.get("best_programme"):
+        log("[*] H1 API credentials provided but no programme selected.", Colors.CYAN)
+        log("    Add --programme <handle> to pull scope/intel, or --best-programme to auto-select.", Colors.CYAN)
+        log("    Run with --list-programmes to see available programmes.", Colors.CYAN)
     programme_platform = config.get("programme_platform", "hackerone")
 
     if programme_handle:
