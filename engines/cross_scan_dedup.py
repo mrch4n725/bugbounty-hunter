@@ -380,4 +380,126 @@ class CrossScanDatabase:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+        pass
+
+
+VULN_TYPE_TO_CWE: dict[str, str] = {
+    "xss": "Cross-site Scripting",
+    "xss reflected": "Cross-site Scripting",
+    "xss stored": "Cross-site Scripting",
+    "reflected xss": "Cross-site Scripting",
+    "stored xss": "Cross-site Scripting",
+    "dom xss": "Cross-site Scripting",
+    "blind xss": "Cross-site Scripting",
+    "sqli": "SQL Injection",
+    "sql injection": "SQL Injection",
+    "sql injection (error-based)": "SQL Injection",
+    "sql injection (blind)": "SQL Injection",
+    "sql injection (time-based)": "SQL Injection",
+    "ssrf": "Server-Side Request Forgery",
+    "server-side request forgery": "Server-Side Request Forgery",
+    "xxe": "XML External Entity (XXE) Injection",
+    "xml external entity": "XML External Entity (XXE) Injection",
+    "ssti": "Server-Side Template Injection",
+    "server-side template injection": "Server-Side Template Injection",
+    "lfi": "Local File Inclusion",
+    "local file inclusion": "Local File Inclusion",
+    "path traversal": "Local File Inclusion",
+    "command injection": "Command Injection",
+    "cmd injection": "Command Injection",
+    "cmdi": "Command Injection",
+    "open redirect": "Open Redirect",
+    "open_redirect": "Open Redirect",
+    "idor": "Insecure Direct Object Reference (IDOR)",
+    "insecure direct object reference": "Insecure Direct Object Reference (IDOR)",
+    "csrf": "Cross-Site Request Forgery (CSRF)",
+    "cross-site request forgery": "Cross-Site Request Forgery (CSRF)",
+    "jwt": "JSON Web Token (JWT)",
+    "cors": "Cross-Origin Resource Sharing (CORS)",
+    "api": "Broken Object Level Authorization",
+    "bola": "Broken Object Level Authorization",
+    "graphql": "GraphQL Injection",
+    "clickjacking": "Clickjacking",
+    "subdomain takeover": "Subdomain Takeover",
+    "subdomain_takeover": "Subdomain Takeover",
+    "rate limiting": "Rate Limiting",
+    "rate_limiting": "Rate Limiting",
+    "business logic": "Business Logic Error",
+    "business_logic": "Business Logic Error",
+    "auth bypass": "Authentication Bypass",
+    "auth_bypass": "Authentication Bypass",
+    "smuggling": "HTTP Request Smuggling",
+    "information disclosure": "Information Disclosure",
+    "sensitive data": "Sensitive Data Exposure",
+    "exposed files": "Sensitive Data Exposure",
+    "exposed_files": "Sensitive Data Exposure",
+    "default credentials": "Use of Default Credentials",
+    "default_credentials": "Use of Default Credentials",
+}
+
+
+def extract_domain(url: str) -> str:
+    from urllib.parse import urlparse
+    try:
+        if "://" not in url:
+            url = "//" + url
+        return urlparse(url).netloc.lower().split(":")[0]
+    except Exception:
+        return ""
+
+
+def is_likely_duplicate(
+    finding: dict | Any,
+    intel: Any,
+    days: int = 90,
+) -> tuple[bool, str]:
+    from datetime import datetime, timezone, timedelta
+    if hasattr(intel, "disclosed_reports"):
+        reports = intel.disclosed_reports
+    else:
+        reports = intel.get("disclosed_reports", [])
+    if not reports:
+        return False, ""
+    vuln_type = ""
+    if isinstance(finding, dict):
+        vuln_type = (finding.get("vuln_type") or finding.get("type") or "").lower()
+        finding_url = finding.get("url", "")
+    else:
+        vuln_type = (getattr(finding, "vuln_type", None) or "").lower()
+        finding_url = getattr(finding, "url", "")
+    domain = extract_domain(finding_url)
+    if not domain:
+        return False, ""
+    cwe_name = None
+    for key, val in VULN_TYPE_TO_CWE.items():
+        if key in vuln_type or vuln_type in key or vuln_type == key:
+            cwe_name = val
+            break
+    if not cwe_name:
+        return False, ""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    for r in reports:
+        if hasattr(r, "asset") and hasattr(r, "weakness"):
+            report_domain = extract_domain(r.asset)
+            report_weakness = r.weakness
+            try:
+                r_date = datetime.fromisoformat(r.disclosed_at.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                r_date = datetime.now(timezone.utc)
+        else:
+            report_domain = extract_domain(r.get("asset", ""))
+            report_weakness = r.get("weakness", "")
+            try:
+                r_date = datetime.fromisoformat(r.get("disclosed_at", "").replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                r_date = datetime.now(timezone.utc)
+        if r_date < cutoff:
+            continue
+        if not report_domain:
+            continue
+        same_domain = (domain == report_domain) or domain.endswith("." + report_domain) or report_domain.endswith("." + domain)
+        if same_domain and report_weakness and cwe_name.lower() in report_weakness.lower():
+            days_ago = (datetime.now(timezone.utc) - r_date).days
+            reason = f"{report_weakness} on {report_domain} was disclosed {days_ago} days ago"
+            return True, reason
+    return False, ""

@@ -53,7 +53,6 @@ HEADER_BYPASS_SET = [
     ("Client-IP", "127.0.0.1"),
     ("Forwarded", "for=127.0.0.1;by=127.0.0.1"),
     ("X-Auth-Token", "admin"),
-    ("Authorization", "Basic YWRtaW46YWRtaW4="),
 ]
 
 SENSITIVE_PATHS = [
@@ -101,69 +100,102 @@ class AuthBypassScanner(ScannerBase):
                 return True
         return False
 
-    def _test_null_token(self, url: str) -> None:
+    def _baseline(self, url: str) -> tuple[int, str]:
+        """Get baseline response (no special auth headers)."""
+        resp = safe_get(self.session, url, self.timeout,
+                        raise_for_status=False, allow_redirects=False)
+        if not resp:
+            return 0, ""
+        return resp.status_code, (resp.text or "")
+
+    def _body_differs(self, baseline_body: str, test_body: str) -> bool:
+        """Check if the test response body differs meaningfully from baseline."""
+        if not baseline_body and not test_body:
+            return False
+        if not baseline_body or not test_body:
+            return True
+        if len(baseline_body) < 50 and len(test_body) >= 100:
+            return True
+        if len(baseline_body) >= 100 and len(test_body) < 50:
+            return True
+        # Body content is substantially different
+        return abs(len(baseline_body) - len(test_body)) > len(baseline_body) * 0.3
+
+    def _test_null_token(self, url: str,
+                         baseline_status: int, baseline_body: str) -> None:
         auth_headers = ["Authorization", "X-Auth-Token", "X-API-Key", "Token"]
         for header in auth_headers:
             for token in NULL_TOKEN_VARIANTS:
-                alt_headers = {header: token}
                 resp = safe_get(self.session, url, self.timeout,
-                                headers=alt_headers, raise_for_status=False)
-                if resp and resp.status_code == 200:
-                    f_dict = finding(
-                        "Auth Bypass - Null/Empty Token",
-                        url, "critical",
-                        f"Endpoint accepted '{header}: {token[:50]}' "
-                        f"(HTTP {resp.status_code})",
-                        f"Header '{header}' with token '{token[:50]}' "
-                        f"returned HTTP {resp.status_code}",
-                        verification_stage="validated",
-                        parameter=header,
-                        response_excerpt=(resp.text or "")[:500],
-                        steps_to_reproduce=[
-                            f"Send request to {url} with {header}: {token[:40]}",
-                            f"Observe HTTP {resp.status_code} response — "
-                            "auth bypass confirmed",
-                            "This means any unauthenticated user can access "
-                            "this endpoint",
-                        ],
-                    )
-                    if f_dict:
-                        self._add_finding(f_dict)
-                        log(f"  [AuthBypass NullToken] {header}:{token[:20]} "
-                            f"@ {url[:60]}", Colors.RED,
-                            verbose_only=True, verbose=self.verbose)
-                    return
-
-    def _test_jwt_none_algorithm(self, url: str) -> None:
-        for jwt_body in JWT_NONE_ALG_PAYLOADS:
-            resp = safe_get(self.session, url, self.timeout,
-                            headers={"Authorization": f"Bearer {jwt_body}"},
-                            raise_for_status=False)
-            if resp and resp.status_code == 200:
+                                headers={header: token},
+                                raise_for_status=False)
+                if not resp or resp.status_code != 200:
+                    continue
+                body = resp.text or ""
+                if not self._body_differs(baseline_body, body):
+                    continue
                 f_dict = finding(
-                    "Auth Bypass - JWT alg: none",
+                    "Auth Bypass - Null/Empty Token",
                     url, "critical",
-                    "JWT endpoint accepted a token with 'alg: none' — "
-                    "signature is not verified",
-                    f"JWT header 'alg: none' accepted by {url} (HTTP {resp.status_code})",
+                    f"Protected endpoint accepted '{header}: {token[:50]}' "
+                    f"(HTTP {resp.status_code}, baseline was HTTP {baseline_status})",
+                    f"Header '{header}' with token '{token[:50]}' "
+                    f"returned HTTP 200 vs HTTP {baseline_status}",
                     verification_stage="validated",
-                    response_excerpt=(resp.text or "")[:500],
+                    parameter=header,
+                    response_excerpt=(body)[:500],
                     steps_to_reproduce=[
-                        f"Send request to {url} with Authorization: "
-                        f"Bearer {jwt_body[:60]}...",
-                        "This JWT has 'alg: none' — no signature required",
-                        f"Server returned HTTP {resp.status_code}, "
-                        "confirming the unsigned token was accepted",
-                        "An attacker can forge arbitrary user identities",
+                        f"Send request to {url} with no auth — got HTTP {baseline_status}",
+                        f"Send request to {url} with {header}: {token[:40]}",
+                        f"Observe HTTP 200 response — auth bypass confirmed",
+                        "This means any unauthenticated user can access "
+                        "this endpoint",
                     ],
                 )
                 if f_dict:
                     self._add_finding(f_dict)
-                    log(f"  [AuthBypass JWT alg:none] @ {url[:60]}",
-                        Colors.RED, verbose_only=True, verbose=self.verbose)
+                    log(f"  [AuthBypass NullToken] {header}:{token[:20]} "
+                        f"@ {url[:60]}", Colors.RED,
+                        verbose_only=True, verbose=self.verbose)
                 return
 
-    def _test_role_manipulation(self, url: str) -> None:
+    def _test_jwt_none_algorithm(self, url: str,
+                                 baseline_status: int, baseline_body: str) -> None:
+        for jwt_body in JWT_NONE_ALG_PAYLOADS:
+            resp = safe_get(self.session, url, self.timeout,
+                            headers={"Authorization": f"Bearer {jwt_body}"},
+                            raise_for_status=False)
+            if not resp or resp.status_code != 200:
+                continue
+            body = resp.text or ""
+            if not self._body_differs(baseline_body, body):
+                continue
+            f_dict = finding(
+                "Auth Bypass - JWT alg: none",
+                url, "critical",
+                "JWT endpoint accepted a token with 'alg: none' — "
+                "signature is not verified",
+                f"JWT header 'alg: none' accepted by {url} "
+                f"(HTTP {resp.status_code}, baseline HTTP {baseline_status})",
+                verification_stage="validated",
+                response_excerpt=(body)[:500],
+                steps_to_reproduce=[
+                    f"Send request to {url} with no auth — got HTTP {baseline_status}",
+                    f"Send request to {url} with Authorization: Bearer {jwt_body[:60]}...",
+                    "This JWT has 'alg: none' — no signature required",
+                    f"Server returned HTTP 200 (vs baseline HTTP {baseline_status}), "
+                    "confirming the unsigned token was accepted",
+                    "An attacker can forge arbitrary user identities",
+                ],
+            )
+            if f_dict:
+                self._add_finding(f_dict)
+                log(f"  [AuthBypass JWT alg:none] @ {url[:60]}",
+                    Colors.RED, verbose_only=True, verbose=self.verbose)
+            return
+
+    def _test_role_manipulation(self, url: str,
+                                baseline_status: int, baseline_body: str) -> None:
         for claim in ROLE_MANIPULATION_CLAIMS:
             for payload_key in ("admin", "role", "is_admin"):
                 if payload_key in claim:
@@ -177,61 +209,71 @@ class AuthBypassScanner(ScannerBase):
             resp = safe_get(self.session, url, self.timeout,
                             headers={"Authorization": f"Bearer {jwt}"},
                             raise_for_status=False)
-            if resp and resp.status_code == 200:
-                f_dict = finding(
-                    "Auth Bypass - Role Manipulation",
-                    url, "critical",
-                    f"JWT role claim manipulation succeeded: "
-                    f"{json.dumps(claim)} accepted by {url}",
-                    f"JWT with claims {json.dumps(claim)} accepted "
-                    f"(HTTP {resp.status_code})",
-                    verification_stage="validated",
-                    response_excerpt=(resp.text or "")[:500],
-                    steps_to_reproduce=[
-                        f"Create JWT with claims: {json.dumps(claim)}",
-                        f"Send to {url} with Authorization: "
-                        f"Bearer <jwt>",
-                        f"Server returned HTTP {resp.status_code}, "
-                        "confirming role escalation",
-                        "An attacker can escalate privileges by "
-                        "modifying JWT claims",
-                    ],
-                )
-                if f_dict:
-                    self._add_finding(f_dict)
-                    log(f"  [AuthBypass RoleManip] {url[:60]}",
-                        Colors.RED, verbose_only=True, verbose=self.verbose)
-                return
+            if not resp or resp.status_code != 200:
+                continue
+            body = resp.text or ""
+            if not self._body_differs(baseline_body, body):
+                continue
+            f_dict = finding(
+                "Auth Bypass - Role Manipulation",
+                url, "critical",
+                f"JWT role claim manipulation succeeded: "
+                f"{json.dumps(claim)} accepted by {url}",
+                f"JWT with claims {json.dumps(claim)} accepted "
+                f"(HTTP 200, baseline was HTTP {baseline_status})",
+                verification_stage="validated",
+                response_excerpt=(body)[:500],
+                steps_to_reproduce=[
+                    f"Send request to {url} with no auth — got HTTP {baseline_status}",
+                    f"Create JWT with claims: {json.dumps(claim)} and alg: HS256",
+                    f"Send to {url} with Authorization: Bearer <jwt>",
+                    f"Server returned HTTP 200 vs baseline HTTP {baseline_status}, "
+                    "confirming role escalation",
+                    "An attacker can escalate privileges by "
+                    "modifying JWT claims",
+                ],
+            )
+            if f_dict:
+                self._add_finding(f_dict)
+                log(f"  [AuthBypass RoleManip] {url[:60]}",
+                    Colors.RED, verbose_only=True, verbose=self.verbose)
+            return
 
-    def _test_header_bypass(self, url: str) -> None:
+    def _test_header_bypass(self, url: str,
+                            baseline_status: int, baseline_body: str) -> None:
         for header_name, header_val in HEADER_BYPASS_SET:
             resp = safe_get(self.session, url, self.timeout,
                             headers={header_name: header_val},
                             raise_for_status=False)
-            if resp and resp.status_code == 200:
-                f_dict = finding(
-                    "Auth Bypass - Header Injection",
-                    url, "high",
-                    f"Access bypass using '{header_name}: {header_val}' "
-                    f"(HTTP {resp.status_code})",
-                    f"Header '{header_name}: {header_val}' granted access "
-                    f"to {url}",
-                    verification_stage="validated",
-                    parameter=header_name,
-                    response_excerpt=(resp.text or "")[:500],
-                    steps_to_reproduce=[
-                        f"Send GET to {url} with header "
-                        f"'{header_name}: {header_val}'",
-                        f"Observe HTTP {resp.status_code} — access granted",
-                        "This header bypasses authentication/authorization",
-                    ],
-                )
-                if f_dict:
-                    self._add_finding(f_dict)
-                    log(f"  [AuthBypass Header] {header_name}: {header_val} "
-                        f"@ {url[:60]}", Colors.RED,
-                        verbose_only=True, verbose=self.verbose)
-                return
+            if not resp or resp.status_code != 200:
+                continue
+            body = resp.text or ""
+            if not self._body_differs(baseline_body, body):
+                continue
+            f_dict = finding(
+                "Auth Bypass - Header Injection",
+                url, "high",
+                f"Access bypass using '{header_name}: {header_val}' "
+                f"(HTTP 200, baseline was HTTP {baseline_status})",
+                f"Header '{header_name}: {header_val}' granted access "
+                f"to {url}",
+                verification_stage="validated",
+                parameter=header_name,
+                response_excerpt=(body)[:500],
+                steps_to_reproduce=[
+                    f"Send GET to {url} with no auth — got HTTP {baseline_status}",
+                    f"Send GET to {url} with header "
+                    f"'{header_name}: {header_val}'",
+                    f"Observe HTTP 200 — access bypassed via header injection",
+                    "This header bypasses authentication/authorization",
+                ],
+            )
+            if f_dict:
+                self._add_finding(f_dict)
+                log(f"  [AuthBypass Header] {header_name}: {header_val} "
+                    f"@ {url[:60]}", Colors.RED,
+                    verbose_only=True, verbose=self.verbose)
+            return
 
     def scan(self, target_urls: list[str] | None = None) -> list[Finding]:
         self._prepare_scan()
@@ -247,11 +289,14 @@ class AuthBypassScanner(ScannerBase):
                 continue
             if not self._is_protected(url):
                 continue
+            baseline_status, baseline_body = self._baseline(url)
+            if baseline_status in (200, 0):
+                continue
             log(f"  [AuthBypass] Testing {url[:70]}", Colors.CYAN,
                 verbose_only=True, verbose=self.verbose)
-            self._test_null_token(url)
-            self._test_jwt_none_algorithm(url)
-            self._test_role_manipulation(url)
-            self._test_header_bypass(url)
+            self._test_null_token(url, baseline_status, baseline_body)
+            self._test_jwt_none_algorithm(url, baseline_status, baseline_body)
+            self._test_role_manipulation(url, baseline_status, baseline_body)
+            self._test_header_bypass(url, baseline_status, baseline_body)
 
         return self._get_findings()

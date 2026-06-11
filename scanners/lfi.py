@@ -88,6 +88,18 @@ class LFIScanner(ScannerBase):
                 test_url = inject_param(url, parameter, payload)
                 resp = safe_get(self.session, test_url, self.timeout)
                 if resp:
+                    if self._is_waf_block(resp) and self.waf_fingerprint:
+                        _variants = self._evade_waf(payload, "lfi")
+                        for _v in _variants:
+                            if _v == payload:
+                                continue
+                            _ev_url = inject_param(url, parameter, _v)
+                            _r2 = safe_get(self.session, _ev_url, self.timeout)
+                            if _r2 and not self._is_waf_block(_r2):
+                                resp = _r2
+                                payload = _v
+                                test_url = _ev_url
+                                break
                     body = resp.text
                     if not body:
                         continue

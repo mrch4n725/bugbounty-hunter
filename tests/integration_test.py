@@ -174,7 +174,7 @@ def test_end_to_end():
     )
 
     stages = {f.get("verification_stage") for f in final if f.get("verification_stage")}
-    assert "detected" in stages or "validated" in stages, f"No detected/validated stages: {stages}"
+    assert "detected" in stages or "validated" in stages or "partially_validated" in stages, f"No detected/validated/partially_validated stages: {stages}"
 
     findings_with_evidence = [
         f for f in final

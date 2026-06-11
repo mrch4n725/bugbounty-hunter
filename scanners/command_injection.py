@@ -315,6 +315,18 @@ class CommandInjectionScanner(ScannerBase):
             resp = safe_get(self.session, test_url, self.timeout)
             if not resp:
                 continue
+            if self._is_waf_block(resp) and self.waf_fingerprint:
+                _variants = self._evade_waf(payload, "cmd_injection")
+                for _v in _variants:
+                    if _v == payload:
+                        continue
+                    _ev_url = inject_param(url, param, _v)
+                    _r2 = safe_get(self.session, _ev_url, self.timeout)
+                    if _r2 and not self._is_waf_block(_r2):
+                        resp = _r2
+                        payload = _v
+                        test_url = _ev_url
+                        break
             body = resp.text
             if expected and expected in body:
                 signals["output"] = True

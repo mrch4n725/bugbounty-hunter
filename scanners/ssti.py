@@ -126,6 +126,20 @@ class SSTIScanner(ScannerBase):
             for payload in POLYGLOT_PROBES:
                 test_url = inject_param(url, parameter, payload)
                 resp = safe_get(self.session, test_url, self.timeout)
+                if not resp:
+                    continue
+                if self._is_waf_block(resp) and self.waf_fingerprint:
+                    _variants = self._evade_waf(payload, "ssti")
+                    for _v in _variants:
+                        if _v == payload:
+                            continue
+                        _ev_url = inject_param(url, parameter, _v)
+                        _r2 = safe_get(self.session, _ev_url, self.timeout)
+                        if _r2 and not self._is_waf_block(_r2):
+                            resp = _r2
+                            payload = _v
+                            test_url = _ev_url
+                            break
                 if resp:
                     body = resp.text
                     if "7777777" in body or "49" in body:
@@ -145,6 +159,18 @@ class SSTIScanner(ScannerBase):
             resp = safe_get(self.session, test_url, self.timeout)
             if not resp:
                 continue
+            if self._is_waf_block(resp) and self.waf_fingerprint:
+                _variants = self._evade_waf(payload, "ssti")
+                for _v in _variants:
+                    if _v == payload:
+                        continue
+                    _ev_url = inject_param(url, parameter, _v)
+                    _r2 = safe_get(self.session, _ev_url, self.timeout)
+                    if _r2 and not self._is_waf_block(_r2):
+                        resp = _r2
+                        payload = _v
+                        test_url = _ev_url
+                        break
             body = resp.text
             arithmetic_possible = any(e in body for e in ["49", "14"])
             raw_payload_absent = payload not in body

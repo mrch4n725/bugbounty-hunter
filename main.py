@@ -187,6 +187,22 @@ def parse_args():
         help="Disable per-request audit log (SQLite)")
     parser.add_argument("--payload-db",
         help="Path to payload intelligence database (JSON)")
+
+    # ── HackerOne Integration ──────────────────────────────────────────────
+    parser.add_argument("--h1-username", default=None,
+        help="HackerOne username (or set H1_USERNAME env var)")
+    parser.add_argument("--h1-token", default=None,
+        help="HackerOne API token (or set H1_TOKEN env var)")
+    parser.add_argument("--list-programmes", action="store_true",
+        help="Print all accessible HackerOne programmes ranked by expected value and exit")
+    parser.add_argument("--programme", default=None,
+        help="HackerOne programme handle to pull scope and intel for this scan")
+    parser.add_argument("--scope-strict", action="store_true",
+        help="Abort if no programme intel available (prevents out-of-scope scanning)")
+    parser.add_argument("--skip-likely-duplicates", action="store_true",
+        help="Exclude likely duplicate findings from all report output")
+    parser.add_argument("--force", action="store_true",
+        help="Force scan despite high-saturation warning from programme intel")
     return parser.parse_args()
 
 
@@ -405,6 +421,13 @@ def build_config(args):
         "no_default_creds": getattr(args, "no_default_creds", False),
         "audit_log": getattr(args, "audit_log", True),
         "diff_scan": getattr(args, "diff_scan", ""),
+        "h1_username": getattr(args, "h1_username", None) or os.environ.get("H1_USERNAME", ""),
+        "h1_token": getattr(args, "h1_token", None) or os.environ.get("H1_TOKEN", ""),
+        "list_programmes": getattr(args, "list_programmes", False),
+        "programme": getattr(args, "programme", None),
+        "scope_strict": getattr(args, "scope_strict", False),
+        "skip_likely_duplicates": getattr(args, "skip_likely_duplicates", False),
+        "force": getattr(args, "force", False),
         "status": {
             "phase": "initialized",
             "findings_count": 0,
@@ -776,6 +799,32 @@ def main():
         print_scan_status(config, phase="pre-scan")
 
     set_mask_sensitive_default(not config.get("no_mask_curl", False))
+
+    # ── HackerOne: --list-programmes ──────────────────────────────────────
+    if config.get("list_programmes"):
+        h1_username = config.get("h1_username", "") or os.environ.get("H1_USERNAME", "")
+        h1_token = config.get("h1_token", "") or os.environ.get("H1_TOKEN", "")
+        if not h1_username or not h1_token:
+            print("Set H1_USERNAME and H1_TOKEN environment variables to use HackerOne integration")
+            sys.exit(1)
+        from modules.h1_client import HackerOneClient
+        client = HackerOneClient(username=h1_username, token=h1_token)
+        ranked = client.list_programmes_ranked()
+        if not ranked:
+            log("[!] No programmes found or API error", Colors.RED)
+            sys.exit(1)
+        print(f"{'Rank':<6} {'Handle':<28} {'Critical':<10} {'High':<10} {'Medium':<10} {'Assets':<8} {'Saturation':<12} {'Score':<10}")
+        print("-" * 94)
+        for idx, p in enumerate(ranked, 1):
+            crit = f"${p.max_payout_critical:,}" if p.max_payout_critical else "$0"
+            high = f"${p.max_payout_high:,}" if p.max_payout_high else "$0"
+            med = f"${p.max_payout_medium:,}" if p.max_payout_medium else "$0"
+            assets = len(p.in_scope)
+            sat = f"{p.saturation_score:.2f}"
+            score = f"{p.expected_value_score:.1f}"
+            print(f"{idx:<6} {p.handle:<28} {crit:<10} {high:<10} {med:<10} {assets:<8} {sat:<12} {score:<10}")
+        sys.exit(0)
+
     return run(config)
 
 
@@ -808,6 +857,88 @@ def run(config: dict) -> int:
 
     os.makedirs(config["output_dir"], exist_ok=True)
     _log_startup(config)
+
+    # ── HackerOne Programme Intel ─────────────────────────────────────────
+    programme_intel = None
+    programme_handle = config.get("programme", "")
+    h1_username = config.get("h1_username", "") or os.environ.get("H1_USERNAME", "")
+    h1_token = config.get("h1_token", "") or os.environ.get("H1_TOKEN", "")
+    scope_strict = config.get("scope_strict", False)
+    if programme_handle:
+        if not h1_username or not h1_token:
+            msg = "Set H1_USERNAME and H1_TOKEN environment variables to use HackerOne integration"
+            log(f"[!] {msg}", Colors.RED)
+            if scope_strict:
+                sys.exit(1)
+        else:
+            try:
+                from modules.h1_client import HackerOneClient
+                client = HackerOneClient(username=h1_username, token=h1_token)
+                programme_intel = client.build_programme_intel(programme_handle)
+            except Exception as e:
+                log(f"[!] HackerOne intel load failed: {e}", Colors.YELLOW)
+                if scope_strict:
+                    sys.exit(1)
+        if programme_intel is None and scope_strict:
+            log("[!] --scope-strict set but no programme intel available — aborting", Colors.RED)
+            sys.exit(1)
+        if programme_intel:
+            config["programme_intel"] = programme_intel
+            log(f"[H1] Programme: {programme_intel.name}", Colors.CYAN)
+            log(f"[H1] In-scope assets: {len(programme_intel.in_scope)}  |  "
+                f"Disclosed (90d): {len(programme_intel.disclosed_reports)}  |  "
+                f"Saturation: {programme_intel.saturation_score:.2f}", Colors.CYAN)
+            if programme_intel.offers_bounties:
+                log(f"[H1] Max payouts — Critical: ${programme_intel.max_payout_critical:,}  "
+                    f"High: ${programme_intel.max_payout_high:,}  "
+                    f"Medium: ${programme_intel.max_payout_medium:,}", Colors.CYAN)
+            weakness_counts: dict[str, int] = {}
+            for r in programme_intel.disclosed_reports:
+                w = r.weakness or "Unknown"
+                weakness_counts[w] = weakness_counts.get(w, 0) + 1
+            top_weaknesses = sorted(weakness_counts.items(), key=lambda x: -x[1])[:5]
+            if top_weaknesses:
+                weak_str = ", ".join(f"{w} ({c})" for w, c in top_weaknesses)
+                log(f"[H1] Recently disclosed weaknesses: {weak_str}", Colors.CYAN)
+            # ── Scope enforcement from programme data ─────────────────
+            scope_enforcer = config.get("scope_enforcer")
+            if scope_enforcer and hasattr(scope_enforcer, "load_from_programme_intel"):
+                scope_enforcer.load_from_programme_intel(programme_intel)
+
+            # ── Scan strategy from programme intel ─────────────────────
+            try:
+                from modules.strategy import build as build_strategy
+                force = config.get("force", False)
+                sessions_available = len(role_sessions) if config.get("_role_sessions") else 1
+                strategy = build_strategy(
+                    intel=programme_intel,
+                    sessions_available=sessions_available,
+                    time_budget=config.get("module_timeout", 120) // 2,
+                    requested_modules=config.get("modules", ["all"]),
+                    force=force,
+                )
+                config["scan_strategy"] = strategy
+                log(f"[Strategy] Mode: {strategy.primary_mode}", Colors.CYAN)
+                if strategy.priority_modules:
+                    log(f"[Strategy] Priority: {', '.join(strategy.priority_modules)}", Colors.CYAN)
+                if strategy.skip_modules:
+                    log(f"[Strategy] Skipping: {', '.join(strategy.skip_modules)}", Colors.CYAN)
+                for note in strategy.notes:
+                    log(f"[Strategy] {note}", Colors.CYAN)
+                log(f"[Strategy] Time budget: {strategy.time_budget_minutes} minutes", Colors.CYAN)
+                # Apply strategy to module selection
+                if strategy.skip_modules and not config.get("disable_modules"):
+                    config["disable_modules"] = strategy.skip_modules
+                elif strategy.skip_modules:
+                    existing = set(config.get("disable_modules", []))
+                    existing.update(strategy.skip_modules)
+                    config["disable_modules"] = list(existing)
+                if strategy.primary_mode != "full" and strategy.priority_modules:
+                    if "all" in config.get("modules", ["all"]):
+                        config["modules"] = ["all"]
+                        config["_strategy_priority"] = strategy.priority_modules
+            except Exception as e:
+                log(f"[!] Scan strategy failed: {e}", Colors.YELLOW)
 
     # ── Audit logger (default on, opt-out via --no-audit-log) ────────
     if config.get("audit_log", True) and container:
@@ -1242,7 +1373,26 @@ def run(config: dict) -> int:
     )
 
     # Build role sessions for authz testing (consumed by scanners + MultiAccountDiscovery)
+    # Apply footprint profile BEFORE making any sessions so rps override takes effect
+    if container and container.footprint_manager:
+        _fp_profile = container.footprint_manager.get_profile()
+        if _fp_profile:
+            config["rps"] = _fp_profile.rps
+            _fp_parts = []
+            if _fp_profile.user_agent_rotation:
+                _fp_parts.append("UA rotation")
+            if _fp_profile.delay_jitter > 0:
+                _fp_parts.append("jitter")
+            _fp_suffix = f", {', '.join(_fp_parts)}" if _fp_parts else ""
+            log(f"[*] Footprint profile: {_fp_profile.name} ({_fp_profile.rps} rps{_fp_suffix})", Colors.CYAN)
     base_session = make_session(config)
+    # Apply footprint UA rotation + header randomization to the base session
+    if container and container.footprint_manager:
+        _fp_profile = container.footprint_manager.get_profile()
+        if _fp_profile:
+            from urllib.parse import urlparse as _up
+            _target_domain = _up(config.get("target", "")).netloc.split(":")[0]
+            container.footprint_manager.apply_to_session(base_session, _fp_profile, _target_domain)
     role_sessions = build_role_sessions(config, base_session=base_session)
     if len(role_sessions) >= 2:
         config["_role_sessions"] = role_sessions
@@ -1446,7 +1596,6 @@ def run(config: dict) -> int:
     if "investigation" not in disabled_engines and container:
         if hasattr(container, 'discovery_store'):
             try:
-                from modules.utils import make_session
                 ds = container.discovery_store
                 plans = ds.get_by_category("gql_auth_plan")
                 if plans:
@@ -1668,6 +1817,43 @@ def run(config: dict) -> int:
         except Exception as e:
             log(f"[!] Metrics collection failed: {e}", Colors.YELLOW)
 
+    # ── HackerOne Duplicate Detection ────────────────────────────────────
+    programme_intel = config.get("programme_intel")
+    if programme_intel:
+        try:
+            from engines.cross_scan_dedup import is_likely_duplicate
+            dup_count = 0
+            for f in all_findings:
+                is_dup, reason = is_likely_duplicate(f, programme_intel)
+                if is_dup:
+                    dup_count += 1
+                    object.__setattr__(f, "likely_duplicate", True)
+                    object.__setattr__(f, "duplicate_reason", reason)
+            if dup_count:
+                log(f"[H1] {dup_count} finding(s) flagged as likely duplicates against disclosed reports",
+                    Colors.YELLOW)
+        except Exception as e:
+            log(f"[!] HackerOne duplicate detection failed: {e}", Colors.YELLOW)
+
+    # ── Filter likely duplicates if --skip-likely-duplicates ──────────────
+    if config.get("skip_likely_duplicates", False):
+        before = len(all_findings)
+        all_findings = [f for f in all_findings if not getattr(f, "likely_duplicate", False)]
+        skipped = before - len(all_findings)
+        if skipped:
+            log(f"[H1] Skipped {skipped} likely duplicate(s) from report (--skip-likely-duplicates)",
+                Colors.YELLOW)
+
+    # ── Report blocked out-of-scope requests ──────────────────────────────
+    scope_enforcer = config.get("scope_enforcer")
+    if scope_enforcer and hasattr(scope_enforcer, "get_blocked_count"):
+        blocked = scope_enforcer.get_blocked_count()
+        if blocked:
+            log(f"[Scope] {blocked} request(s) blocked (out of scope)", Colors.YELLOW)
+            blocked_urls = scope_enforcer.get_blocked_urls()
+            if blocked_urls:
+                config["_blocked_urls"] = blocked_urls
+
     if autosave_thread:
         stop_autosave.set()
         autosave_thread.join(timeout=2)
@@ -1677,7 +1863,21 @@ def run(config: dict) -> int:
         config.setdefault("status", {})["phase"] = "complete"
         print_scan_status(config, all_findings=all_findings, recon_data=recon_data, phase="complete")
 
-    return _write_report_and_summary(config, all_findings, recon_data, js_data=js_data, container=container)
+    exit_code = _write_report_and_summary(config, all_findings, recon_data, js_data=js_data, container=container)
+
+    # ── Per-finding export (--per-finding-export) ─────────────────────────
+    if config.get("per_finding_export"):
+        try:
+            from reporting.per_finding import PerFindingExporter
+            per_dir = os.path.join(config["output_dir"], "findings")
+            exporter = PerFindingExporter()
+            high_conf = [f for f in all_findings if (f.confidence_score or 0) >= 40]
+            paths = exporter.export_all(high_conf, per_dir)
+            log(f"[+] Per-finding export: {len(paths)} pages → {per_dir}", Colors.GREEN)
+        except Exception as e:
+            log(f"[!] Per-finding export failed: {e}", Colors.YELLOW)
+
+    return exit_code
 
 
 if __name__ == "__main__":

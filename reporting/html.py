@@ -106,6 +106,7 @@ class HTMLReporter(ReporterBase):
 
         cards_html = self._build_stat_cards_html(severity_counts, verification_breakdown)
         findings_cards = self._build_finding_cards_html(sorted_findings)
+        duplicates_section = self._create_duplicates_section_html(sorted_findings)
 
         sev_json = json.dumps(severity_counts)
         ver_json = json.dumps(verification_breakdown)
@@ -191,6 +192,7 @@ class HTMLReporter(ReporterBase):
             </div>
             <div id="findingsContainer">{findings_cards if sorted_findings else '<div class="empty-message">No vulnerabilities found.</div>'}</div>
         </section>
+        {duplicates_section}
         {subdomains_section}
         {urls_section}
         {js_section}
@@ -737,6 +739,56 @@ document.addEventListener('click', function(e) {
             f"Passive Mode: <strong>{self.config.get('passive')}</strong>",
         ])
         return f'<section><h2>Scan Configuration</h2><ul>{items}</ul></section>'
+
+    def _create_duplicates_section_html(self, findings: list) -> str:
+        dup_findings = []
+        for f in findings:
+            if isinstance(f, dict):
+                is_dup = f.get("likely_duplicate", False)
+                reason = f.get("duplicate_reason", "")
+            else:
+                is_dup = getattr(f, "likely_duplicate", False)
+                reason = getattr(f, "duplicate_reason", "")
+            if is_dup:
+                dup_findings.append((f, reason))
+        if not dup_findings:
+            return ""
+        rows = ""
+        for f, reason in dup_findings:
+            if isinstance(f, dict):
+                title = f.get("title", "")
+                url = f.get("url", "")
+                sev = f.get("severity", "info")
+            else:
+                title = f.title
+                url = f.url
+                sev = f.severity
+            sev_class = {"critical": "critical", "high": "high", "medium": "medium", "low": "low"}.get(sev.lower(), "info")
+            e_title = html.escape(title)
+            e_url = html.escape(url)
+            e_reason = html.escape(reason)
+            rows += f'''<div class="finding-card {sev_class}" style="border-left-color: #f1c40f;background:rgba(241,196,15,0.06)">
+                <div class="finding-header" style="cursor:default">
+                    <div class="finding-title" style="color:#f1c40f">⚠ {e_title}</div>
+                    <div class="finding-meta">
+                        <span class="sev-badge sev-{sev_class}">{sev.upper()}</span>
+                    </div>
+                </div>
+                <div class="finding-body" style="display:block">
+                    <div class="row"><strong>URL:</strong> <span class="url">{e_url}</span></div>
+                    <div class="row" style="background:rgba(241,196,15,0.08);padding:8px;border-radius:4px;margin-top:4px">
+                        <strong>Duplicate:</strong> {e_reason}
+                    </div>
+                </div>
+            </div>'''
+        return f'''<section>
+            <h2>⚠ Likely Duplicates ({len(dup_findings)})</h2>
+            <p style="color:var(--text2);font-size:.85em;margin-bottom:12px">
+                These findings match recently disclosed HackerOne reports from the same programme.
+                Review carefully before submitting to avoid duplicates.
+            </p>
+            {rows}
+        </section>'''
 
     def _create_js_section_html(self, js_data: dict) -> str:
         secrets = js_data.get("secrets", [])

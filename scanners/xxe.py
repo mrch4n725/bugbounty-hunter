@@ -113,6 +113,16 @@ class XXEScanner(ScannerBase):
                 resp = safe_post(self.session, url, payload, self.timeout, headers=headers)
                 if not resp:
                     continue
+                if self._is_waf_block(resp) and self.waf_fingerprint:
+                    _variants = self._evade_waf(payload, "xxe")
+                    for _v in _variants:
+                        if _v == payload:
+                            continue
+                        _r2 = safe_post(self.session, url, _v, self.timeout, headers=headers)
+                        if _r2 and not self._is_waf_block(_r2):
+                            resp = _r2
+                            payload = _v
+                            break
                 body = resp.text
                 for sig in XXE_SIGNATURES:
                     if sig in body:

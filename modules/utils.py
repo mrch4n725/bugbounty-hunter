@@ -1505,12 +1505,18 @@ class RateLimiter:
 
 
 class ScopeEnforcer:
-    """Load in-scope domains from a file and reject out-of-scope URLs."""
+    """Load in-scope domains from a file or programme intel and reject out-of-scope URLs."""
 
     def __init__(self, scope_file: str, output_dir: str):
         self._allowed: set = set()
+        self._wildcards: list[str] = []
+        self._exact_urls: set = set()
+        self._deny_wildcards: list[str] = []
+        self._deny_exact_urls: set = set()
         self._oob_path = os.path.join(output_dir, "out_of_scope.log")
         self._oob_lock = threading.Lock()
+        self._blocked_count = 0
+        self._blocked_urls: list[str] = []
         if scope_file:
             self._load(scope_file)
 
@@ -1526,20 +1532,100 @@ class ScopeEnforcer:
             log(f"[!] Scope file not found: {path}", Colors.RED)
             sys.exit(1)
 
+    def load_from_programme_intel(self, intel) -> None:
+        from modules.h1_client import ProgrammeIntel as PI
+        if not isinstance(intel, PI):
+            return
+        for asset in intel.in_scope:
+            identifier = asset.identifier.lower()
+            if identifier.startswith("*."):
+                self._wildcards.append(identifier[2:])
+            elif identifier.startswith("https://") or identifier.startswith("http://"):
+                self._exact_urls.add(identifier)
+            else:
+                self._allowed.add(identifier)
+        for asset in intel.out_of_scope:
+            identifier = asset.identifier.lower()
+            if identifier.startswith("*."):
+                self._deny_wildcards.append(identifier[2:])
+            elif identifier.startswith("https://") or identifier.startswith("http://"):
+                self._deny_exact_urls.add(identifier)
+            else:
+                if identifier not in self._allowed:
+                    self._deny_exact_urls.add(identifier)
+
+    @staticmethod
+    def _match_wildcard(host: str, suffix: str) -> bool:
+        parts = host.split(".")
+        suffix_parts = suffix.split(".")
+        wc_depth = suffix_parts.count("*")
+        if wc_depth == 0:
+            return host == suffix
+        suffix_no_wc = [p for p in suffix_parts if p != "*"]
+        if len(parts) < len(suffix_no_wc):
+            return False
+        if len(parts) != len(suffix_parts):
+            return False
+        for hp, sp in zip(parts, suffix_parts):
+            if sp != "*" and hp != sp:
+                return False
+        return True
+
+    def _wildcard_match(self, host: str, wildcards: list[str]) -> bool:
+        for suffix in wildcards:
+            if host.endswith("." + suffix):
+                parts = host.split(".")
+                suffix_parts = suffix.split(".")
+                if len(parts) == len(suffix_parts) + 1:
+                    return True
+        return False
+
     def check_url(self, url: str) -> bool:
-        if not self._allowed:
+        if not self._allowed and not self._wildcards and not self._exact_urls:
             return True
         try:
-            host = urlparse(url).netloc.lower().split(":")[0]
+            parsed = urlparse(url)
+            host = parsed.netloc.lower().split(":")[0]
+            full_url = url.rstrip("/").lower()
+            # Check deny first (explicit out-of-scope)
+            if full_url in self._deny_exact_urls:
+                self._blocked_count += 1
+                self._blocked_urls.append(url)
+                self._log_oob(url)
+                return False
+            if self._wildcard_match(host, self._deny_wildcards):
+                self._blocked_count += 1
+                self._blocked_urls.append(url)
+                self._log_oob(url)
+                return False
+            # Check allow
+            if host in self._allowed:
+                return True
             for allowed in self._allowed:
-                if host == allowed or host.endswith("." + allowed):
+                if host.endswith("." + allowed):
                     return True
                 if "/" in allowed and self._ip_in_cidr(host, allowed):
                     return True
+            if self._wildcard_match(host, self._wildcards):
+                return True
+            if full_url in self._exact_urls:
+                return True
         except Exception:
             pass
+        self._blocked_count += 1
+        self._blocked_urls.append(url)
         self._log_oob(url)
         return False
+
+    def get_blocked_count(self) -> int:
+        return self._blocked_count
+
+    def get_blocked_urls(self) -> list[str]:
+        return list(self._blocked_urls)
+
+    def reset_blocked_count(self):
+        self._blocked_count = 0
+        self._blocked_urls = []
 
     @staticmethod
     def _ip_in_cidr(host: str, cidr: str) -> bool:

