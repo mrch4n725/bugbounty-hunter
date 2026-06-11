@@ -171,6 +171,7 @@ class BugcrowdReporter(ReporterBase):
 | Confidence Reasons | {self._get_confidence_reasons_bc(f) or '—'} |
 | Duplicate Risk | {ReporterBase._format_duplicate_risk(f) or '—'} |
 | Consensus | {ReporterBase._format_consensus(f) or '—'} |
+| History | {ReporterBase._format_historical_outcome(f) or '—'} |
 | Submission Risk | {f.get('submission_risk_score', 0) if isinstance(f, dict) else getattr(f, 'submission_risk_score', 0)}/100 |
 | Submission Ready | {'✅ YES' if f.get('submission_ready', False) else '—'} |
 | Evidence Bundle | {f.get('evidence_bundle_strength', '—').replace('_', ' ').title() or '—'} |

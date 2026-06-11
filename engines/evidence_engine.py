@@ -194,6 +194,15 @@ class EvidenceEngine:
                     linked.add(self._fingerprint(ev))
             return [ev for fp, ev in self._fingerprints.items() if fp not in linked]
 
+    def close(self) -> None:
+        with self._lock:
+            if self._db_conn is not None:
+                try:
+                    self._db_conn.close()
+                except Exception:
+                    pass
+                self._db_conn = None
+
     def clear(self) -> None:
         with self._lock:
             self._store.clear()

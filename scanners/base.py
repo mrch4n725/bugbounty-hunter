@@ -287,6 +287,8 @@ class ScannerBase:
         from modules.utils import inject_param
         test_url = inject_param(url, param, payload)
         resp = safe_get(self.session, test_url, self.timeout, **kwargs)
+        if resp and self._is_baseline_anomalous(url, resp):
+            return None, payload
         if not resp or not self._is_waf_block(resp) or not self.waf_fingerprint:
             return resp, payload
         if self.verbose:
@@ -309,6 +311,16 @@ class ScannerBase:
                 bf.fingerprint(url)
             except Exception:
                 continue
+        self._baseline = bf
+
+    def _is_baseline_anomalous(self, url: str, resp) -> bool:
+        bf = getattr(self, "_baseline", None)
+        if bf is None:
+            return False
+        try:
+            return bf.is_anomalous(url, resp)
+        except Exception:
+            return False
 
     def _fingerprint_tech(self) -> None:
         tf = TechnologyFingerprinter(self.session, self.timeout)

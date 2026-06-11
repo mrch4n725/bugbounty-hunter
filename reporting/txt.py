@@ -91,6 +91,7 @@ class TXTReporter(ReporterBase):
                     f'    Confidence R: {self._get_confidence_reasons_txt(f)}',
                     f'    Duplicate   : {ReporterBase._format_duplicate_risk(f) or "—"}',
                     f'    Consensus   : {ReporterBase._format_consensus(f) or "—"}',
+                    f'    History     : {ReporterBase._format_historical_outcome(f) or "—"}',
                     f'    URL         : {f.get("url", "N/A")}',
                     f'    Parameter   : {f.get("parameter", "N/A")}',
                     f'    Details     : {f.get("details", "N/A")}',

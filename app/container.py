@@ -1,3 +1,4 @@
+import os
 import threading
 from typing import Any
 
@@ -140,6 +141,7 @@ class ApplicationContainer:
                 browser=self.browser_validator,
                 oob=self.oob_framework,
                 config=self.config,
+                discovery_store=self.discovery_store,
             )
         return self._investigation_engine
 
@@ -289,9 +291,11 @@ class ApplicationContainer:
     @property
     def cross_scan_database(self) -> CrossScanDatabase | None:
         if self._cross_scan_db is None:
-            db_path = self.config.get("cross_scan_db_path")
-            if db_path:
-                self._cross_scan_db = CrossScanDatabase(db_path)
+            db_path = self.config.get(
+                "cross_scan_db_path",
+                os.path.join(self.config.get("output_dir", self.config.get("output", "reports")), "cross_scan.db")
+            )
+            self._cross_scan_db = CrossScanDatabase({"cross_scan_db_path": db_path})
         return self._cross_scan_db
 
     @property
@@ -324,6 +328,11 @@ class ApplicationContainer:
         if self._oob_framework is not None:
             try:
                 self._oob_framework.clear()
+            except Exception:
+                pass
+        if self._evidence_engine is not None:
+            try:
+                self._evidence_engine.close()
             except Exception:
                 pass
         if self._discovery_store is not None:

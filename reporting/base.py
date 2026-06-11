@@ -701,7 +701,6 @@ class ReporterBase:
         return " | ".join(parts)
 
     @staticmethod
-    @staticmethod
     def _format_duplicate_risk(f: Any) -> str:
         dr = f.get("duplicate_risk", {}) if isinstance(f, dict) else getattr(f, "duplicate_risk", {})
         if not dr or not isinstance(dr, dict):
@@ -725,6 +724,17 @@ class ReporterBase:
         if not level:
             return ""
         return f"Consensus: {level} ({score}/100)"
+
+    @staticmethod
+    def _format_historical_outcome(f: Any) -> str:
+        was_fixed = f.get("_was_fixed", False) if isinstance(f, dict) else getattr(f, "_was_fixed", False)
+        history = f.get("_cross_scan_history", []) if isinstance(f, dict) else getattr(f, "_cross_scan_history", [])
+        parts = []
+        if was_fixed:
+            parts.append("Previously Fixed (regression)")
+        if history:
+            parts.append(f"Appeared in {len(history)} prior scan(s)")
+        return " | ".join(parts)
 
     @staticmethod
     def _compute_submission_risk_score(f: Any) -> int:

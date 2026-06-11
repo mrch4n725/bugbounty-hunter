@@ -119,6 +119,12 @@ class HackerOneClient:
     def __init__(self, username: str | None = None, token: str | None = None):
         self._username = username or os.environ.get("H1_USERNAME", "")
         self._token = token or os.environ.get("H1_TOKEN", "")
+        if not self._username or not self._token:
+            h1_api = os.environ.get("H1_API", "")
+            if ":" in h1_api:
+                parts = h1_api.split(":", 1)
+                self._username = self._username or parts[0]
+                self._token = self._token or parts[1]
         self._cache_path = CACHE_FILE
         self._session = requests.Session()
         self._session.auth = (self._username, self._token)

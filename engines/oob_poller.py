@@ -112,7 +112,11 @@ class OOBBackgroundPoller(threading.Thread):
                 # Exponential backoff: double interval, capped at max_interval
                 if self.backoff:
                     current_interval = min(current_interval * 2, self.max_interval)
-            except Exception:
+            except Exception as exc:
+                log(f"[OOB] Poll error: {exc}", Colors.YELLOW, verbose_only=True)
+                if self._poll_count >= 10:
+                    self._termination_reason = "too_many_errors"
+                    break
                 continue
 
         if self._termination_reason is None:

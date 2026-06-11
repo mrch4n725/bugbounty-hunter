@@ -2236,13 +2236,15 @@ def classify_endpoint(
     return modules
 
 
-def compute_endpoint_score(url: str, forms: list[dict], recon_data: dict) -> int:
+def compute_endpoint_score(url: str, forms: list[dict], recon_data: dict,
+                           discovery_store: Any = None) -> int:
     """Score a URL by signals present; higher = more attack surface.
 
     Args:
         url: The URL to score.
         forms: List of form dicts from recon_data.
         recon_data: Full recon data dict.
+        discovery_store: Optional DiscoveryStore to check ownership hints.
 
     Returns:
         An integer score (higher is more interesting).
@@ -2269,6 +2271,18 @@ def compute_endpoint_score(url: str, forms: list[dict], recon_data: dict) -> int
     if tech_signals:
         tech_bonus = min(len(tech_signals) * 20, 40)
         score += tech_bonus
+    if discovery_store is not None and hasattr(discovery_store, 'get_by_category'):
+        try:
+            hints = discovery_store.get_by_category("ownership_hint")
+            if hints:
+                for h in hints:
+                    val = h.get("value", "") if isinstance(h, dict) else getattr(h, "value", "")
+                    src = h.get("source_url", "") if isinstance(h, dict) else getattr(h, "source_url", "")
+                    if val and val in url:
+                        score += 30
+                        break
+        except Exception:
+            pass
     return score
 
 

@@ -878,6 +878,25 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
             log(f"[!] GQL auth intelligence failed: {e}", Colors.YELLOW,
                 verbose_only=True, verbose=config.get("verbose", False))
 
+    # ── GQL Auth Plan Execution ──────────────────────────────────────────
+    if container and hasattr(container, 'discovery_store'):
+        try:
+            store = container.discovery_store
+            plan_records = store.get_by_category("gql_auth_plan")
+            if plan_records:
+                from engines.gql_auth_tester import GraphQLAuthTester
+                role_sessions = config.get("_role_sessions", {})
+                if len(role_sessions) >= 2:
+                    tester = GraphQLAuthTester(config, role_sessions=role_sessions)
+                    gql_findings = tester.execute_plans(store=store)
+                    if gql_findings:
+                        log(f"[!] GQL auth tester: {len(gql_findings)} finding(s)", Colors.RED)
+                        with lock:
+                            all_findings.extend(gql_findings)
+        except Exception as e:
+            log(f"[!] GQL auth tester failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
+
     log("[*] Validating evidence completeness...", Colors.CYAN)
     evidence_completeness = getattr(container, 'evidence_completeness', None) if container else None
     if evidence_completeness is None:
@@ -1106,6 +1125,32 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
         all_findings.clear()
         all_findings.extend(updated)
 
+    # ── CrossScan persistence: record new scan + findings ───────────────
+    cross_scan_id_val = None
+    if container and hasattr(container, 'cross_scan_database'):
+        try:
+            csdb = container.cross_scan_database
+            if csdb is not None:
+                import uuid as _uuid
+                cross_scan_id_val = str(_uuid.uuid4())
+                target_url = config.get("target", "")
+                csdb.start_scan(cross_scan_id_val, target_url, config)
+                for f in all_findings:
+                    fp = getattr(f, "fingerprint", None) or ""
+                    if fp:
+                        history = csdb.get_scan_history(fp)
+                        if history:
+                            object.__setattr__(f, "_cross_scan_history", history)
+                        if csdb.is_fixed(fp):
+                            object.__setattr__(f, "_was_fixed", True)
+                regressed = csdb.record_findings(all_findings, cross_scan_id_val)
+                if regressed:
+                    log(f"[!] CrossScan: {len(regressed)} regression(s) detected",
+                        Colors.YELLOW)
+        except Exception as e:
+            log(f"[!] CrossScanDatabase failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
+
     # ── Evidence orphan detection ──
     if evidence_engine is not None:
         orphaned = evidence_engine.get_orphaned_evidence()
@@ -1117,6 +1162,16 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
         oob_poller.stop()
         reason = oob_poller.termination_reason or "stopped"
         log(f"[*] OOB background poller stopped: {reason} ({cbs} callback(s))", Colors.CYAN)
+
+    # ── CrossScan: end scan ─────────────────────────────────────────────
+    if cross_scan_id_val and container and hasattr(container, 'cross_scan_database'):
+        try:
+            csdb = container.cross_scan_database
+            if csdb is not None:
+                csdb.end_scan(cross_scan_id_val, len(all_findings))
+        except Exception as e:
+            log(f"[!] CrossScan end_scan failed: {e}", Colors.YELLOW,
+                verbose_only=True, verbose=config.get("verbose", False))
 
     # ── Audit log cleanup ──────────────────────────────────────────────────
     auditor = config.pop("_audit_logger", None)

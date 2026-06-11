@@ -1971,6 +1971,77 @@ check("h1_scope_exact_url_match",
 check("h1_scope_exact_url_no_match",
       not enforcer2.check_url("https://other.example.com/"))
 
+# ═══════════════════════════════════════════════════════════
+# 34. OutcomeFeedbackEngine
+# ═══════════════════════════════════════════════════════════
+section("34. OutcomeFeedbackEngine")
+from engines.outcome_feedback import OutcomeFeedbackEngine
+ofe = OutcomeFeedbackEngine(output_dir=tmpdir)
+ofe.record_outcome("fp1", "accepted", bounty=500)
+ofe.record_outcome("fp1", "bounty_paid", bounty=500)
+ofe.record_outcome("fp2", "rejected")
+stats = ofe.get_stats()
+check("ofe_stats_total", stats["total_records"] == 3)
+check("ofe_has_positive_outcome",
+      ofe.has_positive_outcome("fp1"))
+check("ofe_no_positive_outcome",
+      not ofe.has_positive_outcome("fp2"))
+
+# ═══════════════════════════════════════════════════════════
+# 35. CrossScanDatabase Basic Ops
+# ═══════════════════════════════════════════════════════════
+section("35. CrossScanDatabase Basic Ops")
+from engines.cross_scan_dedup import CrossScanDatabase
+csdb = CrossScanDatabase(config={"cross_scan_db_path": os.path.join(tmpdir, "cross_scan_test.db")})
+scan_id = "scan-001"
+csdb.start_scan(scan_id, "https://example.com", {})
+csdb.note_seen("fp-xss-1", {"fingerprint": "fp-xss-1", "vuln_type": "xss", "url": "https://example.com/xss", "severity": "high"})
+csdb.record_findings([{"fingerprint": "fp-xss-1", "vuln_type": "xss", "url": "https://example.com/xss", "severity": "high"}], scan_id)
+check("csdb_is_known", csdb.is_known("fp-xss-1"))
+check("csdb_not_known", not csdb.is_known("fp-nonexistent"))
+csdb.note_seen("fp-xss-1", {"fingerprint": "fp-xss-1"})
+csdb.end_scan(scan_id, 1)
+csdb.close()
+
+# ═══════════════════════════════════════════════════════════
+# 36. compute_endpoint_score with DiscoveryStore
+# ═══════════════════════════════════════════════════════════
+section("36. compute_endpoint_score with DiscoveryStore")
+from modules.utils import compute_endpoint_score
+score_no_store = compute_endpoint_score("https://ex.com/api/v1/users/123", forms=[], recon_data={})
+check("eps_baseline", score_no_store > 0)
+class FakeStore:
+    def get_by_category(self, cat):
+        if cat == "ownership_hint":
+            return [{"value": "123", "source_url": "https://ex.com/api/v1/users/123"}]
+        return []
+score_with_store = compute_endpoint_score("https://ex.com/api/v1/users/123", forms=[], recon_data={}, discovery_store=FakeStore())
+check("eps_with_ownership_boost", score_with_store > score_no_store)
+
+# ═══════════════════════════════════════════════════════════
+# 37. _format_historical_outcome
+# ═══════════════════════════════════════════════════════════
+section("37. _format_historical_outcome")
+from reporting.base import ReporterBase
+hist_finding = {"_was_fixed": True, "_cross_scan_history": ["scan-001", "scan-002"]}
+hist_text = ReporterBase._format_historical_outcome(hist_finding)
+check("hist_outcome_rendered", "Previously Fixed" in hist_text and "prior" in hist_text)
+hist_no_history = {}
+check("hist_outcome_empty", ReporterBase._format_historical_outcome(hist_no_history) == "")
+
+# ═══════════════════════════════════════════════════════════
+# 38. OOB Background Poller — error handling
+# ═══════════════════════════════════════════════════════════
+section("38. OOB Background Poller")
+from engines.oob_poller import OOBBackgroundPoller
+class FakeOOB:
+    oob_host = "test.oob.com"
+    def poll(self):
+        return []
+poller = OOBBackgroundPoller(FakeOOB(), lambda x: False, max_duration=0.5, max_polls=1, backoff=False)
+poller.run()
+check("oob_poller_no_crash", poller.termination_reason is not None)
+
 # Cleanup temp dir
 import shutil
 shutil.rmtree(tmpdir, ignore_errors=True)

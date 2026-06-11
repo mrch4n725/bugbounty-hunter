@@ -17,7 +17,6 @@ Success Criteria: Authorization findings are evidence-driven and submission-read
 """
 
 import re
-import threading
 import time
 from typing import Any
 from urllib.parse import urlparse, parse_qs
@@ -136,7 +135,6 @@ class AuthorizationEngine:
         self.timeout = config.get("timeout", 10)
         self.verbose = config.get("verbose", False)
         self.target = config.get("target", "").rstrip("/")
-        self._lock = threading.Lock()
 
     def test_endpoint(
         self,

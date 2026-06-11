@@ -292,12 +292,14 @@ class InvestigationEngine:
         oob: Any = None,
         session: requests.Session | None = None,
         config: dict[str, Any] | None = None,
+        discovery_store: Any = None,
     ):
         self.planner = planner or InvestigationPlanner(capabilities)
         self.browser = browser
         self.oob = oob
         self.session = session or requests.Session()
         self.config = config or {}
+        self.discovery_store = discovery_store
         self.results: dict[str, list[InvestigationResult]] = {}
         self._evidence_store: list[tuple] = []
 
@@ -606,6 +608,20 @@ class InvestigationEngine:
         other_roles = roles[1:]
         default_sess = role_sessions[default_role]
 
+        ownership_hints = []
+        store = getattr(self, 'discovery_store', None)
+        if store is not None and hasattr(store, 'get_by_category'):
+            try:
+                hints = store.get_by_category("ownership_hint")
+                if hints:
+                    for h in hints:
+                        val = h.get("value", "") if isinstance(h, dict) else getattr(h, "value", "")
+                        src = h.get("source_url", "") if isinstance(h, dict) else getattr(h, "source_url", "")
+                        if val and val in finding.url:
+                            ownership_hints.append(h)
+            except Exception:
+                pass
+
         try:
             resp_a = default_sess.get(finding.url, timeout=15, allow_redirects=False)
         except Exception:
@@ -727,8 +743,19 @@ class InvestigationEngine:
                         delta=CONFIDENCE_BOOST.get("error_sqli", 10),
                         next_strategy=next_s, evidence_fp=fp)
             if strategy == "boolean_sqli":
-                # Check for response size difference between true/false payloads
-                continue
+                body_len = len(resp.text or "")
+                if not hasattr(self, "_bool_sqli_sizes"):
+                    self._bool_sqli_sizes = []
+                self._bool_sqli_sizes.append(body_len)
+                if len(self._bool_sqli_sizes) == 2:
+                    diff = abs(self._bool_sqli_sizes[0] - self._bool_sqli_sizes[1])
+                    self._bool_sqli_sizes = []
+                    if diff > 200:
+                        if resp_ev:
+                            self._record_evidence(resp_ev, fp)
+                        return self._build_result(task, success=True,
+                            delta=CONFIDENCE_BOOST.get("boolean_sqli", 15),
+                            next_strategy=next_s, evidence_fp=fp)
         return self._build_result(task, success=False, delta=0, next_strategy=next_s, evidence_fp="")
 
     def _exec_lfi(self, task: InvestigationTask, finding: Finding) -> InvestigationResult:

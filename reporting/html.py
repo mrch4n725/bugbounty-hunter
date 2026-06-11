@@ -467,6 +467,14 @@ class HTMLReporter(ReporterBase):
         return f'<div class="row"><strong>Consensus:</strong> <span style="color:{color};font-weight:600">{level}</span> ({score}/100)</div>'
 
     @staticmethod
+    def _format_historical_outcome_html(f: Any) -> str:
+        from reporting.base import ReporterBase
+        text = ReporterBase._format_historical_outcome(f)
+        if not text:
+            return ""
+        return f'<div class="row"><strong>History:</strong> <span style="color:#e74c3c;font-weight:600">{text}</span></div>'
+
+    @staticmethod
     def _format_submission_risk_html(f: Any) -> str:
         from reporting.base import ReporterBase
         score = f.get("submission_risk_score", 0) if isinstance(f, dict) else getattr(f, "submission_risk_score", 0)
@@ -648,6 +656,7 @@ class HTMLReporter(ReporterBase):
                     {self._get_confidence_reasons_html(f)}
                     {self._format_duplicate_risk_html(f)}
                     {self._format_consensus_html(f)}
+                    {self._format_historical_outcome_html(f)}
                     {self._format_submission_risk_html(f)}
                     <div class="row"><strong>Impact:</strong> {e_impact}</div>
                     {self._get_structured_impact_html(f)}

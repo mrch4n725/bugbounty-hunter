@@ -75,6 +75,7 @@ class TechnologyFingerprinter:
         self.session = session
         self.timeout = timeout
         self.results: Dict[str, List[str]] = {}
+        self._per_url: Dict[str, Dict[str, List[str]]] = {}
         self._lock = threading.Lock()
 
     def fingerprint(self, url: str) -> Dict[str, List[str]]:
@@ -89,16 +90,26 @@ class TechnologyFingerprinter:
         headers = {k.lower(): v.lower() for k, v in resp.headers.items()}
         body = resp.text.lower()
 
+        url_results: Dict[str, List[str]] = {}
         with self._lock:
             for category, signatures in TECH_SIGNATURES.items():
                 if category not in self.results:
                     self.results[category] = []
+                if category not in url_results:
+                    url_results[category] = []
                 for sig in signatures:
                     detected = self._match_signature(sig, headers, body)
-                    if detected and sig["name"] not in self.results[category]:
-                        self.results[category].append(sig["name"])
+                    if detected:
+                        if sig["name"] not in self.results[category]:
+                            self.results[category].append(sig["name"])
+                        if sig["name"] not in url_results[category]:
+                            url_results[category].append(sig["name"])
+            self._per_url[url] = url_results
 
         return self.results
+
+    def per_url(self) -> Dict[str, Dict[str, List[str]]]:
+        return dict(self._per_url)
 
     def _match_signature(self, sig: Dict[str, Any], headers: Dict[str, str], body: str) -> bool:
         header_match = all(

@@ -576,7 +576,32 @@ Every scanner should adjust its behaviour based on available runtime capabilitie
 
 ---
 
-## 10. Git Workflow
+## 10. HackerOne Quick-Start
+
+The simplest way to run a HackerOne-aware scan:
+
+```bash
+# Full scan with H1 integration (scope enforcement, duplicate filtering, programme-aware strategy)
+python3 main.py --target https://target.com --format hackerone --programme example-program --h1-api user:token --h1-strict
+
+# Just generate a H1-format report (no API needed)
+python3 main.py --target https://target.com --format hackerone
+```
+
+### Simplified CLI flags
+
+| New flag | Replaces | What it does |
+|---|---|---|
+| `--h1-api <user:token>` | `--h1-username` + `--h1-token` | Single HackerOne credential flag. Also reads from `H1_API` env var. |
+| `--h1-strict` | `--scope-strict` + `--skip-likely-duplicates` | Enables scope enforcement, duplicate filtering, and programme-aware ScanStrategy. |
+| `--programme <handle>` | *(same)* | Programme handle for scope/intel. Works with or without `--h1-api`. |
+| `--format hackerone` | *(same)* | Generate HackerOne-compatible markdown report. |
+
+Without `--h1-api`, the scanner runs in standard mode without programme intelligence (no scope enforcement, no duplicate filtering, no bounty data).
+
+---
+
+## 11. Git Workflow
 
 - Branch: `main`
 - Commits use conventional commits: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`

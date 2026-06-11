@@ -191,10 +191,8 @@ def parse_args():
         help="Path to payload intelligence database (JSON)")
 
     # ── Programme Intelligence Integration ──────────────────────────────────
-    parser.add_argument("--h1-username", default=None,
-        help="HackerOne username (or set H1_USERNAME env var)")
-    parser.add_argument("--h1-token", default=None,
-        help="HackerOne API token (or set H1_TOKEN env var)")
+    parser.add_argument("--h1-api", default=None,
+        help="HackerOne API credentials as 'username:token' (or set H1_API env var)")
     parser.add_argument("--bc-token", default=None,
         help="Bugcrowd API token (or set BC_TOKEN env var)")
     parser.add_argument("--list-programmes", action="store_true",
@@ -203,10 +201,8 @@ def parse_args():
         help="Auto-select highest-scoring programme and set target to its top asset")
     parser.add_argument("--programme", default=None,
         help="Programme handle to pull scope and intel for this scan")
-    parser.add_argument("--scope-strict", action="store_true",
-        help="Abort if no programme intel available (prevents out-of-scope scanning)")
-    parser.add_argument("--skip-likely-duplicates", action="store_true",
-        help="Exclude likely duplicate findings from all report output")
+    parser.add_argument("--h1-strict", action="store_true",
+        help="H1 strict mode: enables scope enforcement, duplicate filtering, and programme-aware strategy")
     parser.add_argument("--force", action="store_true",
         help="Force scan despite high-saturation warning from programme intel")
 
@@ -436,14 +432,12 @@ def build_config(args):
         "no_default_creds": getattr(args, "no_default_creds", False),
         "audit_log": getattr(args, "audit_log", True),
         "diff_scan": getattr(args, "diff_scan", ""),
-        "h1_username": getattr(args, "h1_username", None) or os.environ.get("H1_USERNAME", ""),
-        "h1_token": getattr(args, "h1_token", None) or os.environ.get("H1_TOKEN", ""),
+        "h1_api": getattr(args, "h1_api", None) or os.environ.get("H1_API", ""),
         "bc_token": getattr(args, "bc_token", None) or os.environ.get("BC_TOKEN", ""),
         "list_programmes": getattr(args, "list_programmes", False),
         "best_programme": getattr(args, "best_programme", False),
         "programme": getattr(args, "programme", None),
-        "scope_strict": getattr(args, "scope_strict", False),
-        "skip_likely_duplicates": getattr(args, "skip_likely_duplicates", False),
+        "h1_strict": getattr(args, "h1_strict", False),
         "record_outcome": getattr(args, "record_outcome", False),
         "force": getattr(args, "force", False),
         "mode": getattr(args, "mode", None),
@@ -824,11 +818,11 @@ def main():
     # ── Programme Intelligence: --list-programmes / --best-programme ──────
     if config.get("list_programmes") or config.get("best_programme"):
         from modules.programme_intel import list_programmes_ranked, print_ranked_table
-        h1_username = config.get("h1_username", "") or os.environ.get("H1_USERNAME", "")
-        h1_token = config.get("h1_token", "") or os.environ.get("H1_TOKEN", "")
+        h1_api_raw = config.get("h1_api", "") or os.environ.get("H1_API", "")
+        h1_username, h1_token = (h1_api_raw.split(":", 1) if ":" in h1_api_raw else ("", ""))
         bc_token = config.get("bc_token", "") or os.environ.get("BC_TOKEN", "")
         if not h1_username and not h1_token and not bc_token:
-            print("Set H1_USERNAME/H1_TOKEN or BC_TOKEN environment variables to use programme intelligence")
+            print("Set H1_API (username:token) or BC_TOKEN env var to use programme intelligence")
             print("Without credentials, the scanner runs in standard mode without programme intel.")
             if config.get("list_programmes"):
                 sys.exit(1)
@@ -886,21 +880,21 @@ def run(config: dict) -> int:
     # ── Programme Intelligence ────────────────────────────────────────────
     programme_intel = None
     programme_handle = config.get("programme", "")
-    h1_username = config.get("h1_username", "") or os.environ.get("H1_USERNAME", "")
-    h1_token = config.get("h1_token", "") or os.environ.get("H1_TOKEN", "")
+    h1_api_raw = config.get("h1_api", "") or os.environ.get("H1_API", "")
+    h1_username, h1_token = (h1_api_raw.split(":", 1) if ":" in h1_api_raw else ("", ""))
     bc_token = config.get("bc_token", "") or os.environ.get("BC_TOKEN", "")
-    scope_strict = config.get("scope_strict", False)
+    h1_strict = config.get("h1_strict", False)
     programme_platform = config.get("programme_platform", "hackerone")
 
     if programme_handle:
         from modules.programme_intel import build_programme_intel as build_pi
         if programme_platform == "bugcrowd" and not bc_token:
             log("[!] Set BC_TOKEN environment variable to use Bugcrowd integration", Colors.RED)
-            if scope_strict:
+            if h1_strict:
                 sys.exit(1)
         elif programme_platform == "hackerone" and (not h1_username or not h1_token):
-            log("[!] Set H1_USERNAME and H1_TOKEN environment variables to use HackerOne integration", Colors.RED)
-            if scope_strict:
+            log("[!] Set H1_API (username:token) to use HackerOne integration", Colors.RED)
+            if h1_strict:
                 sys.exit(1)
         else:
             try:
@@ -913,10 +907,10 @@ def run(config: dict) -> int:
                 )
             except Exception as e:
                 log(f"[!] Programme intel load failed: {e}", Colors.YELLOW)
-                if scope_strict:
+                if h1_strict:
                     sys.exit(1)
-        if programme_intel is None and scope_strict:
-            log("[!] --scope-strict set but no programme intel available — aborting", Colors.RED)
+        if programme_intel is None and h1_strict:
+            log("[!] --h1-strict set but no programme intel available — aborting", Colors.RED)
             sys.exit(1)
         if programme_intel:
             config["programme_intel"] = programme_intel
@@ -1852,13 +1846,13 @@ def run(config: dict) -> int:
         except Exception as e:
             log(f"[!] HackerOne duplicate detection failed: {e}", Colors.YELLOW)
 
-    # ── Filter likely duplicates if --skip-likely-duplicates ──────────────
-    if config.get("skip_likely_duplicates", False):
+    # ── Filter likely duplicates if --h1-strict ──────────────────────────
+    if config.get("h1_strict", False):
         before = len(all_findings)
         all_findings = [f for f in all_findings if not getattr(f, "likely_duplicate", False)]
         skipped = before - len(all_findings)
         if skipped:
-            log(f"[H1] Skipped {skipped} likely duplicate(s) from report (--skip-likely-duplicates)",
+            log(f"[H1] Skipped {skipped} likely duplicate(s) from report (--h1-strict)",
                 Colors.YELLOW)
 
     # ── Report blocked out-of-scope requests ──────────────────────────────

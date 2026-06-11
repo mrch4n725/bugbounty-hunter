@@ -190,6 +190,7 @@ class HackerOneReporter(ReporterBase):
 **Evidence Bundle:** {f.get('evidence_bundle_strength', '—').replace('_', ' ').title() or '—'}
 **Duplicate Risk:** {ReporterBase._format_duplicate_risk(f) or '—'}
 **Consensus:** {ReporterBase._format_consensus(f) or '—'}
+**History:** {ReporterBase._format_historical_outcome(f) or '—'}
 **Submission Risk:** {f.get('submission_risk_score', 0) if isinstance(f, dict) else getattr(f, 'submission_risk_score', 0)}/100
 
 {ReporterBase._format_submission_risk_paragraph(f)}
