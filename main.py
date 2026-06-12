@@ -803,7 +803,7 @@ def main():
         log("[*] Auto mode: sensible defaults are now the default (rps=3, threads=5, autosave=60s, format=chatgpt)",
             Colors.CYAN)
 
-    if not args.target:
+    if not args.target and not getattr(args, 'best_programme', False):
         log("[!] Error: --target is required (or specify via --config file)", Colors.RED)
         sys.exit(1)
 
