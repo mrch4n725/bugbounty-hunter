@@ -375,7 +375,7 @@ def build_config(args):
             module_params.setdefault(module_name, {})[param_name] = _parse_param_value(value)
 
     return {
-        "target": args.target.rstrip("/"),
+        "target": args.target.rstrip("/") if args.target else None,
         "auto": getattr(args, "auto", False),
         "modules": args.modules,
         "disable_modules": args.disable_modules,
