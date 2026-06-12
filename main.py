@@ -438,6 +438,7 @@ def build_config(args):
         "list_programmes": getattr(args, "list_programmes", False),
         "best_programme": getattr(args, "best_programme", False),
         "programme": getattr(args, "programme", None),
+        "programme_platform": getattr(args, "programme_platform", None) or "hackerone",
         "h1_strict": getattr(args, "h1_strict", False),
         "record_outcome": getattr(args, "record_outcome", False),
         "force": getattr(args, "force", False),
@@ -803,7 +804,41 @@ def main():
         log("[*] Auto mode: sensible defaults are now the default (rps=3, threads=5, autosave=60s, format=chatgpt)",
             Colors.CYAN)
 
-    if not args.target and not getattr(args, 'best_programme', False):
+    # ── Programme Intelligence: --list-programmes / --best-programme ──────
+    # Must run BEFORE build_config since --best-programme auto-sets args.target
+    if getattr(args, 'list_programmes', False) or getattr(args, 'best_programme', False):
+        from modules.programme_intel import list_programmes_ranked, print_ranked_table
+        h1_api_raw = args.h1_api or os.environ.get("H1_API", "")
+        h1_username, h1_token = (h1_api_raw.split(":", 1) if ":" in h1_api_raw else ("", ""))
+        bc_token = args.bc_token or os.environ.get("BC_TOKEN", "")
+        if not h1_username and not h1_token and not bc_token:
+            print("Set H1_API (username:token) or BC_TOKEN env var to use programme intelligence")
+            print("Without credentials, the scanner runs in standard mode without programme intel.")
+            if getattr(args, 'list_programmes', False):
+                sys.exit(1)
+            if getattr(args, 'best_programme', False):
+                log("[!] --best-programme requires H1_API or BC_TOKEN credentials", Colors.RED)
+                sys.exit(1)
+        else:
+            ranked = list_programmes_ranked(h1_username=h1_username, h1_token=h1_token, bc_token=bc_token)
+            if not ranked:
+                log("[!] No programmes found or API error", Colors.RED)
+                sys.exit(1)
+            if getattr(args, 'list_programmes', False):
+                print_ranked_table(ranked)
+                sys.exit(0)
+            if getattr(args, 'best_programme', False):
+                best = ranked[0]
+                args.programme = best.handle
+                args.programme_platform = best.platform
+                log(f"[*] Best programme by expected value: {best.name} ({best.handle}, {best.platform})", Colors.GREEN)
+                if best.in_scope_assets:
+                    top_asset = best.in_scope_assets[0].identifier
+                    if not args.target:
+                        args.target = top_asset
+                        log(f"[*] Target set to top asset: {top_asset}", Colors.GREEN)
+
+    if not args.target:
         log("[!] Error: --target is required (or specify via --config file)", Colors.RED)
         sys.exit(1)
 
@@ -815,35 +850,6 @@ def main():
         print_scan_status(config, phase="pre-scan")
 
     set_mask_sensitive_default(not config.get("no_mask_curl", False))
-
-    # ── Programme Intelligence: --list-programmes / --best-programme ──────
-    if config.get("list_programmes") or config.get("best_programme"):
-        from modules.programme_intel import list_programmes_ranked, print_ranked_table
-        h1_api_raw = config.get("h1_api", "") or os.environ.get("H1_API", "")
-        h1_username, h1_token = (h1_api_raw.split(":", 1) if ":" in h1_api_raw else ("", ""))
-        bc_token = config.get("bc_token", "") or os.environ.get("BC_TOKEN", "")
-        if not h1_username and not h1_token and not bc_token:
-            print("Set H1_API (username:token) or BC_TOKEN env var to use programme intelligence")
-            print("Without credentials, the scanner runs in standard mode without programme intel.")
-            if config.get("list_programmes"):
-                sys.exit(1)
-        ranked = list_programmes_ranked(h1_username=h1_username, h1_token=h1_token, bc_token=bc_token)
-        if not ranked:
-            log("[!] No programmes found or API error", Colors.RED)
-            sys.exit(1)
-        if config.get("list_programmes"):
-            print_ranked_table(ranked)
-            sys.exit(0)
-        if config.get("best_programme"):
-            best = ranked[0]
-            config["programme"] = best.handle
-            config["programme_platform"] = best.platform
-            log(f"[*] Best programme by expected value: {best.name} ({best.handle}, {best.platform})", Colors.GREEN)
-            if best.in_scope_assets:
-                top_asset = best.in_scope_assets[0].identifier
-                if not config.get("target"):
-                    config["target"] = top_asset
-                    log(f"[*] Target set to top asset: {top_asset}", Colors.GREEN)
 
     return run(config)
 
