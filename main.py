@@ -9,6 +9,7 @@ import glob
 import json
 import sys
 import os
+import hashlib
 import threading
 import time
 import yaml
@@ -1579,6 +1580,22 @@ def run(config: dict) -> int:
                 )
                 if n_promoted:
                     log(f"[+] Investigation promoted {n_promoted} signals", Colors.GREEN)
+
+                # Persist investigation evidence to evidence_engine
+                if hasattr(container, 'evidence_engine') and container.evidence_engine:
+                    try:
+                        evidence_pairs = container.investigation_engine.collect_evidence()
+                        if evidence_pairs:
+                            ee = container.evidence_engine
+                            for ev, finding_fp in evidence_pairs:
+                                ev_fp = ee.store(ev)
+                                ee.link_to_finding(ev_fp, finding_fp)
+                            log(f"[+] Investigation evidence: {len(evidence_pairs)} items persisted",
+                                Colors.GREEN, verbose_only=True,
+                                verbose=config.get("verbose", False))
+                    except Exception as e2:
+                        log(f"[!] Investigation evidence persistence failed: {e2}", Colors.YELLOW,
+                            verbose_only=True, verbose=config.get("verbose", False))
         except Exception as e:
             log(f"[!] Investigation engine failed: {e}", Colors.YELLOW)
 
@@ -1725,7 +1742,7 @@ def run(config: dict) -> int:
                 for f in all_findings:
                     if (f.confidence_score or 0) >= 60 and f.verification_stage in ("validated", "verified", "exploitable"):
                         # Store confirmed endpoint as discovery resource
-                        fp = oh._fingerprint(f.url)
+                        fp = hashlib.sha256(f"confirmed_endpoint:{f.url}".encode()).hexdigest()
                         ds_link = ds.get_by_fingerprint(fp, "confirmed_endpoint")
                         if not ds_link:
                             ds.store(
@@ -1744,7 +1761,7 @@ def run(config: dict) -> int:
                         import re
                         ids_in_url = re.findall(r'/(\d{4,12})(?:/|$|[\?&#])', f.url)
                         for id_val in ids_in_url:
-                            id_fp = oh._fingerprint(f"resource:{id_val}")
+                            id_fp = hashlib.sha256(f"validated_resource:{id_val}".encode()).hexdigest()
                             existing = ds.get_by_fingerprint(id_fp, "validated_resource")
                             if not existing:
                                 ds.store(

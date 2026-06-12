@@ -99,6 +99,31 @@ class RelationshipGraph:
                 "role": extra.get("role", ""),
             })
 
+        # Confirmed endpoints from prior investigations — re-test known vuln URLs
+        for rec in self._store.get_by_category("confirmed_endpoint"):
+            source = rec.get("source_url", "") or rec.get("value", "")
+            pattern = self._url_to_pattern(source)
+            extra = rec.get("extra", {})
+            boundaries.setdefault(pattern, []).append({
+                "id_value": rec["value"],
+                "id_type": "confirmed_vuln",
+                "source_url": source,
+                "relationship_type": "confirmed_vulnerability",
+                "vuln_type": extra.get("vuln_type", ""),
+                "confidence": extra.get("confidence", 0),
+            })
+
+        # Validated resource IDs — known IDOR targets from prior findings
+        for rec in self._store.get_by_category("validated_resource"):
+            source = rec.get("source_url", "") or rec.get("value", "")
+            pattern = self._url_to_pattern(source)
+            boundaries.setdefault(pattern, []).append({
+                "id_value": rec["value"],
+                "id_type": "validated_id",
+                "source_url": source,
+                "relationship_type": "validated_resource",
+            })
+
         return boundaries
 
     def get_related_urls(self, id_value: str) -> list[str]:

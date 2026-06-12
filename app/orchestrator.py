@@ -888,7 +888,7 @@ def run_scans(config, recon_data, recon, run_all, disabled_modules, all_findings
                 role_sessions = config.get("_role_sessions", {})
                 if len(role_sessions) >= 2:
                     tester = GraphQLAuthTester(config, role_sessions=role_sessions)
-                    gql_findings = tester.execute_plans(store=store)
+                    gql_findings = tester.execute_from_store(store=store)
                     if gql_findings:
                         log(f"[!] GQL auth tester: {len(gql_findings)} finding(s)", Colors.RED)
                         with lock:
