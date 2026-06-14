@@ -198,8 +198,10 @@ def parse_args():
         help="Bugcrowd API token (or set BC_TOKEN env var)")
     parser.add_argument("--list-programmes", action="store_true",
         help="Print all accessible programmes ranked by expected value and exit")
-    parser.add_argument("--best-programme", action="store_true",
-        help="Auto-select highest-scoring programme and set target to its top asset")
+    parser.add_argument("--best-programme", nargs="?", const=1, type=int, default=0,
+        metavar="N",
+        help="Auto-select highest-scoring programme and set target to its best asset"
+             " (optionally scan top N assets, default: 1)")
     parser.add_argument("--programme", default=None,
         help="Programme handle to pull scope and intel for this scan")
     parser.add_argument("--h1-strict", action="store_true",
@@ -437,6 +439,7 @@ def build_config(args):
         "bc_token": getattr(args, "bc_token", None) or os.environ.get("BC_TOKEN", ""),
         "list_programmes": getattr(args, "list_programmes", False),
         "best_programme": getattr(args, "best_programme", False),
+        "_additional_targets": getattr(args, "_additional_targets", []),
         "programme": getattr(args, "programme", None),
         "programme_platform": getattr(args, "programme_platform", None) or "hackerone",
         "h1_strict": getattr(args, "h1_strict", False),
@@ -828,15 +831,29 @@ def main():
                 print_ranked_table(ranked)
                 sys.exit(0)
             if getattr(args, 'best_programme', False):
+                from engines.asset_prioritisation import AssetPrioritisationEngine
                 best = ranked[0]
                 args.programme = best.handle
                 args.programme_platform = best.platform
                 log(f"[*] Best programme by expected value: {best.name} ({best.handle}, {best.platform})", Colors.GREEN)
                 if best.in_scope_assets:
-                    top_asset = best.in_scope_assets[0].identifier
+                    engine = AssetPrioritisationEngine()
+                    scored = engine.prioritise(best)
+                    if not scored:
+                        log("[!] No eligible assets in best programme", Colors.RED)
+                        sys.exit(1)
+                    engine.print_ranking(scored, best.name)
+                    target_count = max(1, getattr(args, 'best_programme', 1) or 1)
                     if not args.target:
-                        args.target = top_asset
-                        log(f"[*] Target set to top asset: {top_asset}", Colors.GREEN)
+                        args.target = scored[0].identifier
+                        log(f"[*] Target set to top-ranked asset: {scored[0].identifier}", Colors.GREEN)
+                        log(f"    Score: {scored[0].score.composite:.4f} (type={scored[0].asset_type}, severity={scored[0].max_severity})", Colors.CYAN)
+                    if target_count > 1 and len(scored) > 1:
+                        extras = [sa.identifier for sa in scored[1:target_count]]
+                        log(f"[*] Additional targets queued for scanning ({len(extras)} more):", Colors.CYAN)
+                        for e in extras:
+                            log(f"    - {e}", Colors.CYAN)
+                        args._additional_targets = extras
 
     if not args.target:
         log("[!] Error: --target is required (or specify via --config file)", Colors.RED)
@@ -1049,6 +1066,15 @@ def run(config: dict) -> int:
             existing = set(fresh_data.get(key, []))
             fresh_data[key] = list(existing | set(imported_vals))
     recon_data = fresh_data
+
+    # Inject additional targets from --best-programme N into the URL pool
+    extra_targets = config.get("_additional_targets", [])
+    if extra_targets:
+        existing_urls = set(recon_data.get("urls", []))
+        new_urls = [u for u in extra_targets if u not in existing_urls]
+        if new_urls:
+            recon_data["urls"] = list(existing_urls) + new_urls
+            log(f"[*] Injected {len(new_urls)} additional asset(s) into scan URL pool", Colors.GREEN)
 
     # ── External Intelligence Gathering (after recon, enriches recon_data) ──
     if not config.get("passive", False) and container and hasattr(container, 'external_intel'):
